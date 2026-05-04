@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from typing import Any
 
 from tokenmon.storage import DB_DIR
@@ -41,3 +42,15 @@ def set_(key: str, value: Any) -> None:
     cfg = load()
     cfg[key] = value
     save(cfg)
+
+
+def get_user_salt() -> str:
+    """Per-install random salt used to make the daily Pokemon pick user-specific.
+    Generated and persisted on first call."""
+    cfg = load()
+    salt = cfg.get("user_salt")
+    if not salt:
+        salt = secrets.token_hex(16)
+        cfg["user_salt"] = salt
+        save(cfg)
+    return salt

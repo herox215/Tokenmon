@@ -297,10 +297,20 @@ def growth_rate_of(dex_id: int) -> str:
     return GROWTH_RATES.get(base, "medium_fast")
 
 
-def pick_for_today(today: date | None = None) -> int:
-    """Deterministic pick for the given calendar date (defaults to today)."""
+def pick_for_today(today: date | None = None, salt: str | None = None) -> int:
+    """Deterministic pick for the given calendar date.
+
+    Salts the hash with a per-install user_salt so two people running Tokenmon
+    on the same day see different Pokemon. The salt is loaded from config
+    (and generated on first call there) when not passed explicitly.
+    """
     today = today or date.today()
-    h = int(hashlib.sha256(today.isoformat().encode()).hexdigest(), 16)
+    if salt is None:
+        # Local import to avoid a circular import with tokenmon.config.
+        from tokenmon import config
+        salt = config.get_user_salt()
+    seed = f"{today.isoformat()}:{salt}".encode()
+    h = int(hashlib.sha256(seed).hexdigest(), 16)
     return _BASE_IDS[h % len(_BASE_IDS)]
 
 
