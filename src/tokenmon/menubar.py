@@ -170,14 +170,30 @@ class TokenmonApp(rumps.App):
     def __init__(self) -> None:
         super().__init__(name="Tokenmon", title=f"{EGG} 0", quit_button=None)
         self._proxy_up = True
-        self._pokemon_dex_id: int = pokemon.pick_for_today()
+        self._line_base_id: int = pokemon.pick_for_today()
         self._pokemon_picked_for: date = date.today()
+        # Current displayed dex_id (could be evolved form). Recomputed each refresh.
+        self._pokemon_dex_id: int = self._line_base_id
         self._pokemon_sprite: Path | None = pokemon.ensure_sprite(self._pokemon_dex_id)
         self._show_pokemon = bool(config.get("show_pokemon_in_menubar"))
         self._animator: SpriteAnimator | None = None
         self._sync_menubar_icon()
         self.menu = self._build_menu(Totals(), {}, proxy_up=True)
         self.refresh(None)
+
+    def _refresh_pokemon_state(self) -> None:
+        """Recompute current evolution stage based on line XP and reload sprite
+        if the displayed Pokemon has changed."""
+        try:
+            xp = query_pokemon_xp(self._line_base_id, TZ)
+        except Exception:
+            log.exception("failed to query line xp")
+            xp = 0
+        new_id = pokemon.current_stage_of(self._line_base_id, xp)
+        if new_id != self._pokemon_dex_id:
+            self._pokemon_dex_id = new_id
+            self._pokemon_sprite = pokemon.ensure_sprite(new_id)
+            self._sync_menubar_icon()
 
     def _statusbar_button(self):
         try:
@@ -219,8 +235,9 @@ class TokenmonApp(rumps.App):
     def _maybe_repick_for_new_day(self) -> None:
         today = date.today()
         if today != self._pokemon_picked_for:
-            self._pokemon_dex_id = pokemon.pick_for_today(today)
+            self._line_base_id = pokemon.pick_for_today(today)
             self._pokemon_picked_for = today
+            self._pokemon_dex_id = self._line_base_id  # _refresh_pokemon_state will evolve it
             self._pokemon_sprite = pokemon.ensure_sprite(self._pokemon_dex_id)
             self._sync_menubar_icon()
 
@@ -228,11 +245,11 @@ class TokenmonApp(rumps.App):
         dex_id = self._pokemon_dex_id
         label = f"#{dex_id:03d}  {pokemon.name_of(dex_id)}"
         try:
-            xp = query_pokemon_xp(dex_id, TZ)
+            xp = query_pokemon_xp(self._line_base_id, TZ)
         except Exception:
-            log.exception("failed to compute pokemon xp")
+            log.exception("failed to compute line xp")
             xp = 0
-        rate = pokemon.growth_rate_of(dex_id)
+        rate = pokemon.growth_rate_of(self._line_base_id)
         level, into, needed = pokemon.level_from_xp(xp, rate)
         item = rumps.MenuItem(label)
         view = _make_pokemon_view(self._pokemon_sprite, label, level, into, needed)
@@ -304,7 +321,8 @@ class TokenmonApp(rumps.App):
         )
 
     def reroll_pokemon(self, _sender) -> None:
-        self._pokemon_dex_id = pokemon.pick_random()
+        self._line_base_id = pokemon.pick_random()
+        self._pokemon_dex_id = self._line_base_id  # _refresh_pokemon_state will evolve it
         self._pokemon_sprite = pokemon.ensure_sprite(self._pokemon_dex_id)
         self._sync_menubar_icon()
         self.refresh(None)
@@ -323,6 +341,7 @@ class TokenmonApp(rumps.App):
 
     def refresh(self, _sender) -> None:
         self._maybe_repick_for_new_day()
+        self._refresh_pokemon_state()
         try:
             totals = query_today(TZ)
             by_model = query_today_by_model(TZ)
@@ -337,11 +356,11 @@ class TokenmonApp(rumps.App):
         sprite_active = self._show_pokemon and self._animator is not None
         if sprite_active and self._proxy_up:
             try:
-                xp = query_pokemon_xp(self._pokemon_dex_id, TZ)
+                xp = query_pokemon_xp(self._line_base_id, TZ)
             except Exception:
                 xp = 0
             level, _, _ = pokemon.level_from_xp(
-                xp, pokemon.growth_rate_of(self._pokemon_dex_id)
+                xp, pokemon.growth_rate_of(self._line_base_id)
             )
             level_text = "MAX" if level >= pokemon.MAX_LEVEL else f"Lv {level}"
             self.title = f" {level_text}"
