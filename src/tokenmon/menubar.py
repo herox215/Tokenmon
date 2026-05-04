@@ -26,7 +26,8 @@ from AppKit import (
 )
 from Foundation import NSMakeRect
 
-from tokenmon import pokemon, tokendex
+from tokenmon import config, pokemon, tokendex
+from tokenmon.menubar_sprite import SpriteAnimator
 from tokenmon.pricing import cost_for
 from tokenmon.proxy import HOST, PORT
 from tokenmon.storage import (
@@ -172,8 +173,48 @@ class TokenmonApp(rumps.App):
         self._pokemon_dex_id: int = pokemon.pick_for_today()
         self._pokemon_picked_for: date = date.today()
         self._pokemon_sprite: Path | None = pokemon.ensure_sprite(self._pokemon_dex_id)
+        self._show_pokemon = bool(config.get("show_pokemon_in_menubar"))
+        self._animator: SpriteAnimator | None = None
+        self._sync_menubar_icon()
         self.menu = self._build_menu(Totals(), {}, proxy_up=True)
         self.refresh(None)
+
+    def _statusbar_button(self):
+        try:
+            return self._nsapp.nsstatusitem.button()
+        except (AttributeError, Exception):
+            return None
+
+    def _set_menubar_image(self, img) -> None:
+        btn = self._statusbar_button()
+        if btn is not None:
+            btn.setImage_(img)
+
+    def _stop_animator(self) -> None:
+        if self._animator is not None:
+            self._animator.stop()
+            self._animator = None
+        self._set_menubar_image(None)
+
+    def _start_animator(self) -> None:
+        self._stop_animator()
+        if not self._show_pokemon or self._pokemon_sprite is None or not self._pokemon_sprite.exists():
+            return
+        try:
+            anim = SpriteAnimator.alloc().initWithGifPath_setter_(
+                str(self._pokemon_sprite), self._set_menubar_image
+            )
+            self._animator = anim
+        except Exception:
+            log.exception("failed to start sprite animator")
+            self._animator = None
+
+    def _sync_menubar_icon(self) -> None:
+        """Reconcile the title + image with the current state."""
+        if self._show_pokemon and self._pokemon_sprite is not None and self._pokemon_sprite.exists():
+            self._start_animator()
+        else:
+            self._stop_animator()
 
     def _maybe_repick_for_new_day(self) -> None:
         today = date.today()
@@ -181,6 +222,7 @@ class TokenmonApp(rumps.App):
             self._pokemon_dex_id = pokemon.pick_for_today(today)
             self._pokemon_picked_for = today
             self._pokemon_sprite = pokemon.ensure_sprite(self._pokemon_dex_id)
+            self._sync_menubar_icon()
 
     def _pokemon_menu_item(self) -> rumps.MenuItem:
         dex_id = self._pokemon_dex_id
@@ -202,6 +244,9 @@ class TokenmonApp(rumps.App):
         items.append(self._pokemon_menu_item())
         items.append(rumps.MenuItem("📖 Tokendex öffnen", callback=self.open_tokendex))
         items.append(rumps.MenuItem("🎲 Pokemon neu würfeln (debug)", callback=self.reroll_pokemon))
+        toggle = rumps.MenuItem("Pokemon im Menubar anzeigen", callback=self.toggle_menubar_pokemon)
+        toggle.state = 1 if self._show_pokemon else 0
+        items.append(toggle)
         items.append(None)
         if not proxy_up:
             items.append(rumps.MenuItem("⚠️  Proxy offline — Calls werden NICHT getrackt!"))
@@ -261,6 +306,13 @@ class TokenmonApp(rumps.App):
     def reroll_pokemon(self, _sender) -> None:
         self._pokemon_dex_id = pokemon.pick_random()
         self._pokemon_sprite = pokemon.ensure_sprite(self._pokemon_dex_id)
+        self._sync_menubar_icon()
+        self.refresh(None)
+
+    def toggle_menubar_pokemon(self, _sender) -> None:
+        self._show_pokemon = not self._show_pokemon
+        config.set_("show_pokemon_in_menubar", self._show_pokemon)
+        self._sync_menubar_icon()
         self.refresh(None)
 
     def open_tokendex(self, _sender) -> None:
@@ -278,9 +330,24 @@ class TokenmonApp(rumps.App):
             log.exception("failed to query usage")
             self.title = f"{EGG} ?"
             return
-        icon = EGG if self._proxy_up else EGG_DOWN
         active = totals.input_tokens + totals.output_tokens
-        self.title = f"{icon} {_fmt_tokens(active)}"
+        # When the sprite is showing, the title becomes the Pokemon's level so the
+        # status item reads "[sprite] Lv 7"; otherwise we fall back to the egg
+        # emoji + total tokens (or ⚠️ + tokens when the proxy is offline).
+        sprite_active = self._show_pokemon and self._animator is not None
+        if sprite_active and self._proxy_up:
+            try:
+                xp = query_pokemon_xp(self._pokemon_dex_id, TZ)
+            except Exception:
+                xp = 0
+            level, _, _ = pokemon.level_from_xp(
+                xp, pokemon.growth_rate_of(self._pokemon_dex_id)
+            )
+            level_text = "MAX" if level >= pokemon.MAX_LEVEL else f"Lv {level}"
+            self.title = f" {level_text}"
+        else:
+            icon = EGG if self._proxy_up else EGG_DOWN
+            self.title = f"{icon} {_fmt_tokens(active)}"
         self.menu.clear()
         for item in self._build_menu(totals, by_model, proxy_up=self._proxy_up):
             if item is None:
