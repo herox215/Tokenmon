@@ -1,31 +1,31 @@
-"""Reverse proxy in front of api.anthropic.com that records token usage.
+"""Generic provider-agnostic reverse proxy that records token usage.
 
-Listens on 127.0.0.1:8788. Forwards every /v1/* request transparently. For
-/v1/messages calls, parses the response (or SSE stream — see streaming
-support) and records the usage in SQLite.
+Each invocation is parameterised by a ProviderStrategy (Anthropic, OpenRouter,
+…) plus a port. The default invocation — `python -m tokenmon.proxy` — runs the
+Anthropic strategy on 127.0.0.1:8788 to preserve the original behaviour.
 """
 
 from __future__ import annotations
 
-import json
+import argparse
 import logging
-import os
 import time
-from pathlib import Path
-from typing import Any
+from typing import AsyncIterator
 
 import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from tokenmon.storage import DB_DIR, Usage, init_db, insert_usage
+from tokenmon.providers import ProviderStrategy, load as load_provider
+from tokenmon.providers.anthropic import AnthropicStrategy
+from tokenmon.storage import DB_DIR, init_db, insert_usage
 
-UPSTREAM = "https://api.anthropic.com"
+# Backwards-compat constants for the menubar's health check.
 HOST = "127.0.0.1"
-PORT = 8788
+PORT = AnthropicStrategy.default_port  # 8788
 
 # Headers that must NOT be forwarded — either hop-by-hop, or we let httpx set them.
 HOP_BY_HOP = {
@@ -36,141 +36,178 @@ STRIP_FROM_REQUEST = HOP_BY_HOP | {"host", "content-length", "accept-encoding"}
 STRIP_FROM_RESPONSE = HOP_BY_HOP | {"content-encoding", "content-length"}
 
 LOG_PATH = DB_DIR / "proxy.log"
-log = logging.getLogger("tokenmon.proxy")
-
-START_TIME = time.monotonic()
-REQUEST_COUNT = 0
-
-_client: httpx.AsyncClient | None = None
 
 
-def _client_get() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        _client = httpx.AsyncClient(
-            base_url=UPSTREAM,
-            http2=True,
-            timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0),
-        )
-    return _client
+class ProxyServer:
+    """One forwarding proxy bound to a single ProviderStrategy + port."""
 
+    def __init__(self, strategy: ProviderStrategy, host: str = HOST,
+                 port: int | None = None) -> None:
+        self.strategy = strategy
+        self.host = host
+        self.port = int(port) if port is not None else strategy.default_port
+        self._client: httpx.AsyncClient | None = None
+        self._start_time = time.monotonic()
+        self._request_count = 0
+        self.log = logging.getLogger(f"tokenmon.proxy.{strategy.name}")
 
-def _filter_request_headers(headers: list[tuple[bytes, bytes]]) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for k, v in headers:
-        name = k.decode("latin-1").lower()
-        if name in STRIP_FROM_REQUEST:
-            continue
-        out[name] = v.decode("latin-1")
-    return out
+    def _client_get(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                base_url=self.strategy.upstream_url,
+                http2=True,
+                timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0),
+            )
+        return self._client
 
+    @staticmethod
+    def _filter_request_headers(headers: list[tuple[bytes, bytes]]) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for k, v in headers:
+            name = k.decode("latin-1").lower()
+            if name in STRIP_FROM_REQUEST:
+                continue
+            out[name] = v.decode("latin-1")
+        return out
 
-def _filter_response_headers(headers: httpx.Headers) -> list[tuple[str, str]]:
-    return [(k, v) for k, v in headers.items() if k.lower() not in STRIP_FROM_RESPONSE]
+    @staticmethod
+    def _filter_response_headers(headers: httpx.Headers) -> list[tuple[str, str]]:
+        return [(k, v) for k, v in headers.items() if k.lower() not in STRIP_FROM_RESPONSE]
 
+    async def healthz(self, _: Request) -> JSONResponse:
+        return JSONResponse({
+            "ok": True,
+            "provider": self.strategy.name,
+            "upstream": self.strategy.upstream_url,
+            "uptime_s": round(time.monotonic() - self._start_time, 1),
+            "request_count": self._request_count,
+        })
 
-def _extract_usage(payload: dict[str, Any], model_hint: str | None) -> Usage | None:
-    """Pull a Usage out of a non-streaming /v1/messages response body."""
-    usage = payload.get("usage")
-    if not isinstance(usage, dict):
-        return None
-    return Usage(
-        model=payload.get("model") or model_hint or "unknown",
-        input_tokens=int(usage.get("input_tokens", 0) or 0),
-        output_tokens=int(usage.get("output_tokens", 0) or 0),
-        cache_read_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
-        cache_creation_tokens=int(usage.get("cache_creation_input_tokens", 0) or 0),
-        stop_reason=payload.get("stop_reason"),
-        request_id=payload.get("id"),
-    )
+    async def proxy(self, request: Request) -> Response:
+        self._request_count += 1
 
+        body = await request.body()
+        upstream_path = request.url.path
+        if request.url.query:
+            upstream_path = f"{upstream_path}?{request.url.query}"
 
-def _request_wants_stream(body: bytes) -> bool:
-    if not body:
-        return False
-    try:
-        data = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
-        return False
-    return bool(data.get("stream"))
+        headers = self._filter_request_headers(list(request.scope["headers"]))
+        is_usage = self.strategy.is_usage_endpoint(request.method, request.url.path)
+        wants_stream = is_usage and self.strategy.request_wants_streaming(body)
 
+        if wants_stream:
+            body = self.strategy.maybe_inject_streaming_options(body)
+            return await self._proxy_streaming(request, body, headers, upstream_path)
 
-def _request_model(body: bytes) -> str | None:
-    if not body:
-        return None
-    try:
-        return json.loads(body).get("model")
-    except (ValueError, UnicodeDecodeError):
-        return None
-
-
-async def healthz(_: Request) -> JSONResponse:
-    return JSONResponse({
-        "ok": True,
-        "uptime_s": round(time.monotonic() - START_TIME, 1),
-        "request_count": REQUEST_COUNT,
-    })
-
-
-async def proxy(request: Request) -> Response:
-    global REQUEST_COUNT
-    REQUEST_COUNT += 1
-
-    body = await request.body()
-    upstream_path = request.url.path
-    if request.url.query:
-        upstream_path = f"{upstream_path}?{request.url.query}"
-
-    headers = _filter_request_headers(list(request.scope["headers"]))
-    is_messages = request.url.path == "/v1/messages" and request.method == "POST"
-    wants_stream = is_messages and _request_wants_stream(body)
-
-    if wants_stream:
-        # Streaming path is implemented in proxy_stream.py (next task).
-        from tokenmon.proxy_stream import stream_messages
-        return await stream_messages(request, body, headers)
-
-    started = time.monotonic()
-    try:
-        upstream_resp = await _client_get().request(
-            request.method,
-            upstream_path,
-            headers=headers,
-            content=body,
-        )
-    except httpx.RequestError as exc:
-        log.warning("upstream error: %s", exc)
-        return JSONResponse({"error": {"type": "upstream_error", "message": str(exc)}}, status_code=502)
-
-    duration_ms = int((time.monotonic() - started) * 1000)
-    response_body = upstream_resp.content
-
-    if is_messages and upstream_resp.status_code == 200:
+        started = time.monotonic()
         try:
-            payload = json.loads(response_body)
-            usage = _extract_usage(payload, _request_model(body))
-            if usage is not None:
-                usage.duration_ms = duration_ms
+            resp = await self._client_get().request(
+                request.method, upstream_path, headers=headers, content=body,
+            )
+        except httpx.RequestError as exc:
+            self.log.warning("upstream error: %s", exc)
+            return JSONResponse(
+                {"error": {"type": "upstream_error", "message": str(exc)}},
+                status_code=502,
+            )
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+        response_body = resp.content
+
+        if is_usage and resp.status_code == 200:
+            try:
+                model_hint = self.strategy.extract_model_from_request(body)
+                usage = self.strategy.extract_usage_from_response(response_body, model_hint)
+                if usage is not None:
+                    usage.duration_ms = duration_ms
+                    insert_usage(usage)
+            except Exception:
+                self.log.exception("failed to record usage")
+
+        return Response(
+            content=response_body,
+            status_code=resp.status_code,
+            headers=dict(self._filter_response_headers(resp.headers)),
+            media_type=resp.headers.get("content-type"),
+        )
+
+    async def _proxy_streaming(
+        self, request: Request, body: bytes, headers: dict[str, str], upstream_path: str
+    ) -> StreamingResponse:
+        client = self._client_get()
+        started = time.monotonic()
+        accum = self.strategy.make_streaming_accumulator(
+            self.strategy.extract_model_from_request(body)
+        )
+
+        upstream_req = client.build_request(
+            request.method, upstream_path, headers=headers, content=body,
+        )
+        upstream_resp = await client.send(upstream_req, stream=True)
+
+        recorded = False
+
+        def record(override_stop: str | None = None) -> None:
+            nonlocal recorded
+            if recorded:
+                return
+            recorded = True
+            try:
+                usage = accum.to_usage(override_stop=override_stop)
+            except Exception:
+                self.log.exception("accumulator to_usage failed")
+                return
+            if usage is None:
+                return
+            usage.duration_ms = int((time.monotonic() - started) * 1000)
+            try:
                 insert_usage(usage)
-        except Exception:
-            log.exception("failed to record usage")
+            except Exception:
+                self.log.exception("failed to write streaming usage")
 
-    return Response(
-        content=response_body,
-        status_code=upstream_resp.status_code,
-        headers=dict(_filter_response_headers(upstream_resp.headers)),
-        media_type=upstream_resp.headers.get("content-type"),
-    )
+        async def body_iter() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in upstream_resp.aiter_raw():
+                    yield chunk
+                    try:
+                        accum.feed(chunk)
+                    except Exception:
+                        self.log.exception("accumulator feed failed")
+            except (httpx.RequestError, GeneratorExit, ConnectionError) as exc:
+                self.log.info("stream interrupted: %s", type(exc).__name__)
+                record(override_stop="cancelled")
+                raise
+            finally:
+                await upstream_resp.aclose()
+                record()
 
+        return StreamingResponse(
+            body_iter(),
+            status_code=upstream_resp.status_code,
+            headers=dict(self._filter_response_headers(upstream_resp.headers)),
+            media_type=upstream_resp.headers.get("content-type"),
+        )
 
-def build_app() -> Starlette:
-    return Starlette(
-        debug=False,
-        routes=[
-            Route("/healthz", healthz, methods=["GET"]),
-            Route("/{path:path}", proxy, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]),
-        ],
-    )
+    def build_app(self) -> Starlette:
+        return Starlette(
+            debug=False,
+            routes=[
+                Route("/healthz", self.healthz, methods=["GET"]),
+                Route(
+                    "/{path:path}", self.proxy,
+                    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+                ),
+            ],
+        )
+
+    def run(self) -> None:
+        uvicorn.run(
+            self.build_app(),
+            host=self.host,
+            port=self.port,
+            log_level="warning",
+            access_log=False,
+        )
 
 
 def _setup_logging() -> None:
@@ -183,16 +220,27 @@ def _setup_logging() -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Tokenmon provider-aware proxy")
+    parser.add_argument(
+        "--provider", default="anthropic",
+        help="Provider strategy name (anthropic, openrouter, ...)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=None,
+        help="Loopback port (defaults to the strategy's default_port)",
+    )
+    parser.add_argument("--host", default=HOST)
+    args = parser.parse_args()
+
     _setup_logging()
     init_db()
-    log.info("tokenmon proxy starting on %s:%d -> %s", HOST, PORT, UPSTREAM)
-    uvicorn.run(
-        build_app(),
-        host=HOST,
-        port=PORT,
-        log_level="warning",
-        access_log=False,
+    strategy = load_provider(args.provider)
+    server = ProxyServer(strategy, host=args.host, port=args.port)
+    server.log.info(
+        "tokenmon proxy starting on %s:%d -> %s",
+        server.host, server.port, strategy.upstream_url,
     )
+    server.run()
 
 
 if __name__ == "__main__":

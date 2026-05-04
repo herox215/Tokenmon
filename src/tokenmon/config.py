@@ -18,6 +18,10 @@ _DEFAULTS: dict[str, Any] = {
     "show_overlay": False,
     "overlay_corner": "bottom-right",
     "overlay_size": 128,
+    # Provider strategies the user has installed proxies for. Each becomes its
+    # own LaunchAgent at com.tokenmon.proxy.{name} listening on the strategy's
+    # default port.
+    "proxy_providers": ["anthropic"],
 }
 
 

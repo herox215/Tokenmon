@@ -53,15 +53,22 @@ def cost_for(
     output_tokens: int = 0,
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
-) -> float:
-    """Return cost in USD for one request's usage. Returns 0.0 for unknown models."""
+) -> tuple[float, bool]:
+    """Return (cost_in_usd, has_pricing) for one request's usage. When the
+    model isn't in the pricing table, returns (0.0, False) so callers can
+    surface a coverage percentage instead of silently undercounting cost."""
     price = _resolve(model)
     if price is None:
         log.warning("no pricing for model %s — counted as $0", model)
-        return 0.0
-    return (
+        return 0.0, False
+    cost = (
         input_tokens * price.input
         + output_tokens * price.output
         + cache_read_tokens * price.cache_read
         + cache_creation_tokens * price.cache_write
     ) / 1_000_000
+    return cost, True
+
+
+def has_pricing(model: str) -> bool:
+    return _resolve(model) is not None

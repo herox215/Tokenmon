@@ -44,13 +44,26 @@ REFRESH_INTERVAL_SEC = 30
 HEALTH_INTERVAL_SEC = 10
 ACTIVITY_POLL_INTERVAL_SEC = 5
 LEVEL_UP_TITLE_DISPLAY_SEC = 5.0
-HEALTH_URL = f"http://{HOST}:{PORT}/healthz"
-PROXY_LAUNCHD_LABEL = "com.tokenmon.proxy"
 TZ = "Europe/Berlin"
 EGG = "🥚"
 EGG_DOWN = "⚠️"
 
 log = logging.getLogger("tokenmon.menubar")
+
+
+def _active_provider_endpoints() -> list[tuple[str, str]]:
+    """Return [(provider_name, health_url), ...] for everything that
+    proxy_providers config currently lists."""
+    from tokenmon.providers import load as load_provider
+    out: list[tuple[str, str]] = []
+    for name in (config.get("proxy_providers") or ["anthropic"]):
+        try:
+            strategy = load_provider(name)
+        except ValueError:
+            log.warning("unknown provider in config: %s", name)
+            continue
+        out.append((name, f"http://{HOST}:{strategy.default_port}/healthz"))
+    return out
 
 
 def _fmt_tokens(n: int) -> str:
@@ -72,12 +85,22 @@ def _fmt_usd(amount: float) -> str:
     return f"${amount:.2f}"
 
 
-def _proxy_healthy(timeout: float = 1.0) -> bool:
+def _ping(url: str, timeout: float = 1.0) -> bool:
     try:
-        with urlopen(HEALTH_URL, timeout=timeout) as r:
+        with urlopen(url, timeout=timeout) as r:
             return r.status == 200
     except (URLError, TimeoutError, OSError):
         return False
+
+
+def _proxy_health() -> tuple[bool, list[str]]:
+    """Returns (all_up, down_providers). all_up = True even when the list of
+    configured providers is empty (nothing to fail)."""
+    down: list[str] = []
+    for name, url in _active_provider_endpoints():
+        if not _ping(url):
+            down.append(name)
+    return (len(down) == 0), down
 
 
 from tokenmon.tokendex import _XPBarView  # ObjC class — defined once, imported here
@@ -156,18 +179,26 @@ def _make_pokemon_view(
     return container
 
 
-def _restart_proxy_via_launchctl() -> tuple[bool, str]:
-    """Returns (ok, message)."""
-    try:
-        result = subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{__import__('os').getuid()}/{PROXY_LAUNCHD_LABEL}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            return True, "Proxy neugestartet"
-        return False, result.stderr.strip() or f"exit {result.returncode}"
-    except (subprocess.SubprocessError, OSError) as exc:
-        return False, str(exc)
+def _restart_proxies_via_launchctl() -> tuple[bool, str]:
+    """Restart every configured provider's proxy via launchctl. Returns
+    (all_ok, message)."""
+    import os as _os
+    from tokenmon.launchd import proxy_label
+    failures: list[str] = []
+    for name in (config.get("proxy_providers") or ["anthropic"]):
+        label = proxy_label(name)
+        try:
+            result = subprocess.run(
+                ["launchctl", "kickstart", "-k", f"gui/{_os.getuid()}/{label}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                failures.append(f"{name}: {result.stderr.strip() or f'exit {result.returncode}'}")
+        except (subprocess.SubprocessError, OSError) as exc:
+            failures.append(f"{name}: {exc}")
+    if not failures:
+        return True, "Proxies neugestartet"
+    return False, "; ".join(failures)
 
 
 class TokenmonApp(rumps.App):
@@ -390,10 +421,12 @@ class TokenmonApp(rumps.App):
             None,
         ])
         total_cost = 0.0
+        priced_tokens = 0
+        all_tokens = 0
         if by_model:
             items.append(rumps.MenuItem("Pro Modell:"))
             for model, t in by_model.items():
-                cost = cost_for(
+                cost, has_price = cost_for(
                     model,
                     input_tokens=t.input_tokens,
                     output_tokens=t.output_tokens,
@@ -401,13 +434,26 @@ class TokenmonApp(rumps.App):
                     cache_creation_tokens=t.cache_creation_tokens,
                 )
                 total_cost += cost
+                model_tokens = (
+                    t.input_tokens + t.output_tokens
+                    + t.cache_read_tokens + t.cache_creation_tokens
+                )
+                all_tokens += model_tokens
+                if has_price:
+                    priced_tokens += model_tokens
+                visible_tokens = t.input_tokens + t.output_tokens
+                cost_str = _fmt_usd(cost) if has_price else "?"
                 items.append(
                     rumps.MenuItem(
-                        f"  {model}: {_fmt_tokens(t.input_tokens + t.output_tokens)} ({_fmt_usd(cost)})"
+                        f"  {model}: {_fmt_tokens(visible_tokens)} ({cost_str})"
                     )
                 )
             items.append(None)
-            items.append(rumps.MenuItem(f"Geschätzte Kosten: {_fmt_usd(total_cost)}"))
+            cost_line = f"Geschätzte Kosten: {_fmt_usd(total_cost)}"
+            if all_tokens > 0 and priced_tokens < all_tokens:
+                coverage = priced_tokens / all_tokens
+                cost_line += f"  ({coverage:.0%} Preisabdeckung)"
+            items.append(rumps.MenuItem(cost_line))
             items.append(None)
         items.append(rumps.MenuItem("Aktualisieren", callback=self.refresh))
         items.append(rumps.MenuItem("Beenden", callback=rumps.quit_application))
@@ -419,7 +465,7 @@ class TokenmonApp(rumps.App):
 
     @rumps.timer(HEALTH_INTERVAL_SEC)
     def health_check(self, _sender) -> None:
-        up = _proxy_healthy()
+        up, _down = _proxy_health()
         if up != self._proxy_up:
             self._proxy_up = up
             self.refresh(None)
@@ -435,7 +481,7 @@ class TokenmonApp(rumps.App):
             self.refresh(None)
 
     def restart_proxy(self, _sender) -> None:
-        ok, msg = _restart_proxy_via_launchctl()
+        ok, msg = _restart_proxies_via_launchctl()
         rumps.notification(
             title="Tokenmon",
             subtitle="Proxy-Restart" if ok else "Proxy-Restart fehlgeschlagen",
