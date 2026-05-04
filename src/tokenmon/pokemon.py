@@ -97,6 +97,7 @@ ALL_NAMES: dict[int, str] = {
     131: "Lapras",
     132: "Ditto",
     133: "Eevee",     134: "Vaporeon",
+    135: "Jolteon",   136: "Flareon",
     137: "Porygon",
     138: "Omanyte",   139: "Omastar",
     140: "Kabuto",    141: "Kabutops",

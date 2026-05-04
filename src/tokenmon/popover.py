@@ -261,6 +261,37 @@ class _BoxBackHandler(NSObject):
         self._popover._show_pane(PANE_BOX)
 
 
+class _PokedexEntryHandler(NSObject):
+    """Click target for a caught Pokedex row — opens the species detail pane."""
+
+    def initWithPopover_dexId_(self, popover, dex_id):  # noqa: N802
+        self = objc.super(_PokedexEntryHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        self._dex_id = int(dex_id)
+        return self
+
+    def entryClicked_(self, _sender):  # noqa: N802
+        self._popover._pokedex_selected_dex = self._dex_id
+        self._popover._show_pane(PANE_TOKENDEX)
+
+
+class _PokedexBackHandler(NSObject):
+    """← Back from Pokedex detail to the species list."""
+
+    def initWithPopover_(self, popover):  # noqa: N802
+        self = objc.super(_PokedexBackHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        return self
+
+    def backClicked_(self, _sender):  # noqa: N802
+        self._popover._pokedex_selected_dex = None
+        self._popover._show_pane(PANE_TOKENDEX)
+
+
 class _SetActiveHandler(NSObject):
     """Box-detail "Set as active" button — pins the active Pokemon and re-renders."""
 
@@ -427,6 +458,9 @@ class TokenmonPopover(NSObject):
 
         # Box pane state — None means show grid, an int id means show detail.
         self._box_selected_id: int | None = None
+        self._pokedex_selected_dex: int | None = None
+        self._pokedex_handlers: list = []
+        self._pokedex_back_handler: _PokedexBackHandler | None = None
         # Strong references to handlers so they aren't garbage-collected
         # while the buttons that target them are alive.
         self._box_handlers: list[NSObject] = []
@@ -542,6 +576,8 @@ class TokenmonPopover(NSObject):
         self._set_active_handler = None
         self._ball_button_handlers = []
         self._run_away_handler = None
+        self._pokedex_handlers = []
+        self._pokedex_back_handler = None
         # Cancel any pending reveal timer if we're transitioning panes manually.
         if self._reveal_timer is not None:
             try:
@@ -863,7 +899,15 @@ class TokenmonPopover(NSObject):
             ))
             return view
 
+        # The row's species_dex_id IS the current form (evolution mutates the
+        # row in place via box.maybe_evolve), so no derive-on-render needed.
         species = row.species_dex_id
+        try:
+            xp = query_xp_for_pokemon(row.id)
+        except Exception:
+            xp = 0
+        rate = pokemon.growth_rate_of(species)
+        level, into, needed = pokemon.level_from_xp(xp, rate)
 
         # "Active: …" header, top of pane.
         header_y = POPOVER_HEIGHT - 28
@@ -896,14 +940,6 @@ class TokenmonPopover(NSObject):
             font=NSFont.boldSystemFontOfSize_(18),
             align=NSTextAlignmentCenter,
         ))
-
-        # Active-Pokemon XP: tokens trained against this specific row.
-        try:
-            xp = query_xp_for_pokemon(row.id)
-        except Exception:
-            xp = 0
-        rate = pokemon.growth_rate_of(species)
-        level, into, needed = pokemon.level_from_xp(xp, rate)
 
         lvl_y = name_y - 28
         lvl_text = "Lv MAX" if level >= pokemon.MAX_LEVEL else f"Lv {level}"
@@ -959,12 +995,34 @@ class TokenmonPopover(NSObject):
     # =========================================================================
 
     def _build_pane_tokendex(self) -> NSView:
+        # Detail-view branch when the user clicked a caught entry.
+        if self._pokedex_selected_dex is not None:
+            return self._build_pane_pokedex_detail(self._pokedex_selected_dex)
         view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
 
+        # Pull caught species from the box and seen species from encounters.
+        from tokenmon.storage import list_distinct_encounter_species
+        try:
+            box_rows = list_pokemon()
+        except Exception:
+            log.exception("list_pokemon failed")
+            box_rows = []
+        try:
+            seen_set = list_distinct_encounter_species()
+        except Exception:
+            log.exception("list_distinct_encounter_species failed")
+            seen_set = set()
+        caught_set: set[int] = {p.species_dex_id for p in box_rows}
+
+        # Walk the canonical 151 Gen-1 ids in dex order. ALL_NAMES covers them.
+        all_ids = sorted(pokemon.ALL_NAMES.keys())
+
         # Header
+        caught_n = sum(1 for i in all_ids if i in caught_set)
+        seen_n = sum(1 for i in all_ids if i in seen_set and i not in caught_set)
         view.addSubview_(_label(
             NSMakeRect(16, POPOVER_HEIGHT - 32, CONTENT_WIDTH - 32, 22),
-            "Pokedex",
+            f"Pokedex   ·   {caught_n} caught   ·   {seen_n} seen",
             font=NSFont.boldSystemFontOfSize_(15),
         ))
 
@@ -976,117 +1034,115 @@ class TokenmonPopover(NSObject):
         scroll.setAutohidesScrollers_(True)
         scroll.setBorderType_(0)
 
-        # Aggregate species-counts from the box.
-        try:
-            box_rows = list_pokemon()
-        except Exception:
-            log.exception("list_pokemon failed")
-            box_rows = []
-
-        # Group by species_dex_id; remember each instance for level computation.
-        by_species: dict[int, list] = {}
-        for p in box_rows:
-            by_species.setdefault(p.species_dex_id, []).append(p)
-
-        # Per species: count + (highest_level, instance_for_sprite). Use the
-        # per-instance trained-XP attribution (query_xp_for_pokemon) — same as
-        # everywhere else — so this view doesn't double-count tokens that
-        # were trained against a different Pokemon caught on the same day.
-        species_summaries: list[dict] = []
-        for species_id, instances in by_species.items():
-            best_level = 0
-            best_instance = instances[0]
-            for inst in instances:
-                try:
-                    inst_xp = query_xp_for_pokemon(inst.id)
-                except Exception:
-                    inst_xp = 0
-                rate = pokemon.growth_rate_of(species_id)
-                lvl, _, _ = pokemon.level_from_xp(inst_xp, rate)
-                if lvl > best_level:
-                    best_level = lvl
-                    best_instance = inst
-            species_summaries.append({
-                "species_id": species_id,
-                "count": len(instances),
-                "best_level": best_level,
-                "best_instance": best_instance,
-            })
-
-        # Sort: highest level first, then by count, then by dex id.
-        species_summaries.sort(
-            key=lambda s: (-s["best_level"], -s["count"], s["species_id"])
-        )
-
-        row_h = 60
-        row_width = CONTENT_WIDTH - 16  # leave room for scrollbar
-        content_h = max(row_h * len(species_summaries), scroll_h)
+        row_h = 44
+        row_width = CONTENT_WIDTH - 16
+        content_h = max(row_h * len(all_ids), scroll_h)
         content = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, row_width, content_h))
 
-        if not species_summaries:
-            content.addSubview_(_label(
-                NSMakeRect(16, content_h / 2 - 10, row_width - 32, 20),
-                "No Pokemon caught yet.",
-                color=NSColor.secondaryLabelColor(),
-                align=NSTextAlignmentCenter,
+        for i, dex_id in enumerate(all_ids):
+            y = content_h - (i + 1) * row_h
+            if dex_id in caught_set:
+                state = "caught"
+            elif dex_id in seen_set:
+                state = "seen"
+            else:
+                state = "unknown"
+            content.addSubview_(self._build_pokedex_row(
+                NSMakeRect(0, y, row_width, row_h - 4), dex_id, state,
             ))
-        else:
-            for i, s in enumerate(species_summaries):
-                y = content_h - (i + 1) * row_h
-                row_view = self._build_pokedex_row(
-                    NSMakeRect(0, y, row_width, row_h - 4), s,
-                )
-                content.addSubview_(row_view)
 
         scroll.setDocumentView_(content)
+        # Scroll to the top (#001) by default.
         scroll.contentView().scrollToPoint_((0, max(0, content_h - scroll_h)))
         view.addSubview_(scroll)
 
         return view
 
-    def _build_pokedex_row(self, frame, summary: dict) -> NSView:
-        """One species row in the new Pokedex pane: sprite + name + count + level."""
-        row = NSView.alloc().initWithFrame_(frame)
+    def _build_pokedex_row(self, frame, dex_id: int, state: str) -> NSView:
+        """One Pokedex entry: dex#, sprite (or silhouette), name (or ???).
+
+        state ∈ {"caught", "seen", "unknown"}. Caught shows the full coloured
+        animated sprite + the species name; clicking opens the species
+        detail pane. Seen shows a white silhouette + "Seen". Unknown shows
+        a faint "?" + "???"."""
+        # When caught, wrap the row contents in an NSButton so the whole row
+        # is clickable. Otherwise a plain NSView (no interaction).
         height = frame.size.height
         width = frame.size.width
+        sprite_size = 28
 
-        species_id = summary["species_id"]
-        count = summary["count"]
-        best_level = summary["best_level"]
-        best_instance = summary["best_instance"]
+        if state == "caught":
+            row = NSButton.alloc().initWithFrame_(frame)
+            row.setTitle_("")
+            row.setBordered_(False)
+            row.setBezelStyle_(NSBezelStyleRegularSquare)
+            handler = _PokedexEntryHandler.alloc().initWithPopover_dexId_(self, dex_id)
+            self._pokedex_handlers.append(handler)
+            row.setTarget_(handler)
+            row.setAction_(b"entryClicked:")
+        else:
+            row = NSView.alloc().initWithFrame_(frame)
 
-        # Sprite (32×32) of the highest-level instance's species. We use the
-        # species sprite — instances within the same species share a sprite.
-        sprite_size = 32
-        iv = _crisp_image_view(
-            NSMakeRect(12, (height - sprite_size) / 2, sprite_size, sprite_size)
-        )
-        sp = pokemon.ensure_sprite(species_id)
-        if sp is not None and sp.exists():
-            img = NSImage.alloc().initWithContentsOfFile_(str(sp))
-            if img is not None:
-                iv.setImage_(img)
-        row.addSubview_(iv)
-        self._animated_image_views.append(iv)
+        sprite_x = 16
+        sprite_y = (height - sprite_size) / 2
 
-        text_x = 12 + sprite_size + 12
+        if state == "caught":
+            iv = _crisp_image_view(
+                NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size)
+            )
+            sp = pokemon.ensure_sprite(dex_id)
+            if sp is not None and sp.exists():
+                img = NSImage.alloc().initWithContentsOfFile_(str(sp))
+                if img is not None:
+                    iv.setImage_(img)
+            row.addSubview_(iv)
+            self._animated_image_views.append(iv)
+        elif state == "seen":
+            # Silhouette: load sprite, render through _silhouette_image with
+            # a neutral grey so unknown-but-encountered species look distinct
+            # from the still-totally-unknown ones.
+            from tokenmon.overlay import _silhouette_image
+            iv = _crisp_image_view(
+                NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size)
+            )
+            sp = pokemon.ensure_sprite(dex_id)
+            if sp is not None and sp.exists():
+                img = NSImage.alloc().initWithContentsOfFile_(str(sp))
+                if img is not None:
+                    sil = _silhouette_image(
+                        img, NSColor.colorWithCalibratedWhite_alpha_(0.55, 1.0)
+                    )
+                    iv.setImage_(sil)
+                    iv.setAnimates_(False)
+            row.addSubview_(iv)
+        else:
+            # Unknown: a faint "?" mark in place of any sprite.
+            row.addSubview_(_label(
+                NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size),
+                "?",
+                font=NSFont.boldSystemFontOfSize_(18),
+                color=NSColor.tertiaryLabelColor(),
+                align=NSTextAlignmentCenter,
+            ))
+
+        text_x = sprite_x + sprite_size + 12
         text_w = width - text_x - 16
 
-        name_y = height - 26
-        row.addSubview_(_label(
-            NSMakeRect(text_x, name_y, text_w, 18),
-            f"#{species_id:03d}  {pokemon.name_of(species_id)}",
-            font=NSFont.boldSystemFontOfSize_(13),
-        ))
+        if state == "caught":
+            label_text = f"#{dex_id:03d}  {pokemon.name_of(dex_id)}"
+            color = NSColor.labelColor()
+        elif state == "seen":
+            label_text = f"#{dex_id:03d}  Seen"
+            color = NSColor.secondaryLabelColor()
+        else:
+            label_text = f"#{dex_id:03d}  ???"
+            color = NSColor.tertiaryLabelColor()
 
-        sub_y = name_y - 18
-        badge = f"× {count}" if count > 1 else "Owned"
-        lvl_text = "Lv MAX" if best_level >= pokemon.MAX_LEVEL else f"Lv {best_level}"
         row.addSubview_(_label(
-            NSMakeRect(text_x, sub_y, text_w, 16),
-            f"{badge}    {lvl_text}",
-            font=NSFont.systemFontOfSize_(11),
-            color=NSColor.secondaryLabelColor(),
+            NSMakeRect(text_x, (height - 18) / 2, text_w, 18),
+            label_text,
+            font=NSFont.systemFontOfSize_(13),
+            color=color,
         ))
 
         return row
@@ -1094,6 +1150,88 @@ class TokenmonPopover(NSObject):
     # =========================================================================
     # Pane: Box (grid of caught Pokemon + per-id detail view)
     # =========================================================================
+
+    def _build_pane_pokedex_detail(self, dex_id: int) -> NSView:
+        """Detail view for a caught species: big animated sprite + name +
+        genus + flavour text from PokeAPI."""
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
+
+        # Back button.
+        self._pokedex_back_handler = _PokedexBackHandler.alloc().initWithPopover_(self)
+        back = NSButton.alloc().initWithFrame_(
+            NSMakeRect(8, POPOVER_HEIGHT - 32, 80, 24)
+        )
+        back.setTitle_("← Back")
+        back.setBezelStyle_(1)  # NSBezelStyleRounded
+        back.setTarget_(self._pokedex_back_handler)
+        back.setAction_(b"backClicked:")
+        view.addSubview_(back)
+
+        # Big animated sprite, top-centred.
+        sprite_size = 128
+        sprite_x = (CONTENT_WIDTH - sprite_size) // 2
+        sprite_y = POPOVER_HEIGHT - 36 - sprite_size
+        iv = _crisp_image_view(NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size))
+        sp = pokemon.ensure_sprite(dex_id)
+        if sp is not None and sp.exists():
+            img = NSImage.alloc().initWithContentsOfFile_(str(sp))
+            if img is not None:
+                iv.setImage_(img)
+        view.addSubview_(iv)
+        self._animated_image_views.append(iv)
+
+        # Name (#NNN  Name) under the sprite.
+        name = pokemon.name_of(dex_id)
+        name_y = sprite_y - 30
+        view.addSubview_(_label(
+            NSMakeRect(0, name_y, CONTENT_WIDTH, 24),
+            f"#{dex_id:03d}  {name}",
+            font=NSFont.boldSystemFontOfSize_(16),
+            align=NSTextAlignmentCenter,
+        ))
+
+        # Fetch species info (cached lazily). On miss, show a friendly fallback.
+        try:
+            from tokenmon.pokedex_remote import get_species_info
+            info = get_species_info(dex_id)
+        except Exception:
+            log.exception("get_species_info failed")
+            info = None
+
+        genus = (info or {}).get("genus") or ""
+        description = (info or {}).get("description") or ""
+
+        # Genus line.
+        genus_y = name_y - 22
+        view.addSubview_(_label(
+            NSMakeRect(0, genus_y, CONTENT_WIDTH, 18),
+            genus or "—",
+            font=NSFont.systemFontOfSize_(12),
+            color=NSColor.secondaryLabelColor(),
+            align=NSTextAlignmentCenter,
+        ))
+
+        # Description block — multi-line wrapped text field.
+        desc_y_top = genus_y - 12
+        desc_h = desc_y_top - 16
+        desc_field = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(20, 16, CONTENT_WIDTH - 40, desc_h)
+        )
+        desc_field.setStringValue_(description or "(No description available — try again later.)")
+        desc_field.setBezeled_(False)
+        desc_field.setDrawsBackground_(False)
+        desc_field.setEditable_(False)
+        desc_field.setSelectable_(True)
+        desc_field.setFont_(NSFont.systemFontOfSize_(12))
+        desc_field.setTextColor_(NSColor.labelColor())
+        desc_field.setLineBreakMode_(0)  # NSLineBreakByWordWrapping
+        try:
+            desc_field.cell().setWraps_(True)
+        except Exception:
+            pass
+        view.addSubview_(desc_field)
+
+        return view
 
     def _build_pane_box(self) -> NSView:
         if self._box_selected_id is None:
@@ -1161,7 +1299,8 @@ class TokenmonPopover(NSObject):
                 if btn.layer() is not None:
                     btn.layer().setMagnificationFilter_("nearest")
                     btn.layer().setMinificationFilter_("nearest")
-                # Sprite as the button image.
+                # species_dex_id reflects the CURRENT form (evolution mutates
+                # the row in place), so just read it directly.
                 sp = pokemon.ensure_sprite(p.species_dex_id)
                 if sp is not None and sp.exists():
                     img = NSImage.alloc().initWithContentsOfFile_(str(sp))
@@ -1213,7 +1352,14 @@ class TokenmonPopover(NSObject):
             ))
             return view
 
+        # Row's species_dex_id is the current form (evolution mutates in place).
         species = p.species_dex_id
+        try:
+            xp = query_xp_for_pokemon(p.id)
+        except Exception:
+            xp = 0
+        rate = pokemon.growth_rate_of(species)
+        level, into, needed = pokemon.level_from_xp(xp, rate)
 
         # 2-column layout: left = big sprite, right = labels.
         sprite_size = 128
@@ -1239,14 +1385,6 @@ class TokenmonPopover(NSObject):
             font=NSFont.boldSystemFontOfSize_(15),
         ))
         y_cursor -= 26
-
-        # Per-Pokemon XP — tokens that were trained against THIS specific row.
-        try:
-            xp = query_xp_for_pokemon(p.id)
-        except Exception:
-            xp = 0
-        rate = pokemon.growth_rate_of(species)
-        level, into, needed = pokemon.level_from_xp(xp, rate)
 
         lvl_text = "Lv MAX" if level >= pokemon.MAX_LEVEL else f"Lv {level}"
         view.addSubview_(_label(

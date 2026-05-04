@@ -293,19 +293,20 @@ class TokenmonApp(rumps.App):
         self.refresh(None)
 
     def _refresh_pokemon_state(self) -> None:
-        """The menubar icon mirrors the user's ACTIVE Pokemon — which defaults
-        to today's caught Pokemon but the user can pin any owned Pokemon as
-        active via the Box detail pane. Per-instance XP comes from
-        query_xp_for_pokemon(active.id) so evolution still triggers as the
-        active accumulates training XP."""
+        """The menubar icon mirrors the user's ACTIVE Pokemon. When the
+        active's trained XP crosses an evolution threshold, box.maybe_evolve
+        mutates its species_dex_id in the DB — the row literally becomes the
+        evolved Pokemon, matching real Pokemon-game semantics."""
         try:
             active = box.get_active_pokemon()
         except Exception:
             log.exception("get_active_pokemon failed")
             active = None
-        if active is not None and active.species_dex_id != self._line_base_id:
-            # Active Pokemon changed (user switched it via the Box detail pane).
-            # Re-anchor everything before the evolution check below runs.
+        if active is None:
+            return
+
+        # User switched active to a different row.
+        if active.species_dex_id != self._line_base_id:
             self._line_base_id = active.species_dex_id
             self._pokemon_dex_id = active.species_dex_id
             self._pokemon_sprite = pokemon.ensure_sprite(active.species_dex_id)
@@ -314,24 +315,25 @@ class TokenmonApp(rumps.App):
             self._sync_overlay()
             return
 
+        # Try to evolve the active Pokemon if its XP says it's due.
         try:
-            if active is not None:
-                xp = query_xp_for_pokemon(active.id)
-            else:
-                xp = query_xp_for_date(date.today(), TZ)
+            new_id = box.maybe_evolve(active.id)
         except Exception:
-            log.exception("failed to query active xp")
-            xp = 0
-        new_id = pokemon.current_stage_of(self._line_base_id, xp)
-        if new_id == self._pokemon_dex_id:
+            log.exception("maybe_evolve failed")
+            new_id = None
+        if new_id is None:
             return
+
         old_id = self._pokemon_dex_id
         self._pokemon_dex_id = new_id
+        self._line_base_id = new_id
         self._pokemon_sprite = pokemon.ensure_sprite(new_id)
         self._sync_menubar_icon()
         self._sync_overlay()
 
-        chain = pokemon.evolution_chain(self._line_base_id)
+        # Evolution always implies a forward step — fire notification + animation.
+        base = pokemon.line_of(new_id)
+        chain = pokemon.evolution_chain(base)
         if old_id in chain and new_id in chain and chain.index(new_id) > chain.index(old_id):
             # Real in-line evolution. Fire notification + animation, and sync the
             # level cache so the level-up animation doesn't also fire.

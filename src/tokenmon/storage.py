@@ -429,6 +429,29 @@ def get_pokemon_by_id(pokemon_id: int, path: Path = DB_PATH) -> Pokemon | None:
     return _row_to_pokemon(row) if row else None
 
 
+def list_distinct_encounter_species(path: Path = DB_PATH) -> set[int]:
+    """Returns the set of species_dex_id values that appear in the encounters
+    table — used by the Pokedex to mark species you've SEEN (encountered but
+    haven't necessarily caught)."""
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT species_dex_id FROM encounters"
+        ).fetchall()
+    return {int(row[0]) for row in rows}
+
+
+def update_pokemon_species(pokemon_id: int, new_species_dex_id: int,
+                            path: Path = DB_PATH) -> None:
+    """Mutate a Pokemon row's species_dex_id in place. Used when an instance
+    evolves so the row reflects its new form (instead of always showing the
+    base species and deriving the displayed form at render time)."""
+    with _connect(path) as conn:
+        conn.execute(
+            "UPDATE pokemon SET species_dex_id = ? WHERE id = ?",
+            (int(new_species_dex_id), int(pokemon_id)),
+        )
+
+
 def list_pokemon(path: Path = DB_PATH) -> list[Pokemon]:
     """Sorted by caught_date desc (newest first)."""
     with _connect(path) as conn:

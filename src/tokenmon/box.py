@@ -28,6 +28,8 @@ from tokenmon.storage import (
     get_pokemon_by_id,
     get_pokemon_for_date,
     insert_pokemon,
+    query_xp_for_pokemon,
+    update_pokemon_species,
 )
 
 TZ = ZoneInfo("Europe/Berlin")
@@ -159,6 +161,37 @@ def add_caught_pokemon(
         except sqlite3.IntegrityError:
             # UNIQUE(caught_date) collision — back off one day and retry.
             target = target - timedelta(days=1)
+
+
+def maybe_evolve(pokemon_id: int, path: Path = DB_PATH) -> int | None:
+    """If the Pokemon's trained XP has crossed an evolution threshold, mutate
+    its species_dex_id to the new form in the DB and return the new species
+    id. Returns None when nothing changed.
+
+    Pokemon-game semantics: a Bulbasaur trained past Lv 16 *becomes* Ivysaur —
+    the row's species permanently advances; the original Bulbasaur is gone.
+    Nature and characteristic carry over (those are inherited traits).
+    """
+    row = get_pokemon_by_id(pokemon_id, path=path)
+    if row is None:
+        return None
+    try:
+        xp = query_xp_for_pokemon(pokemon_id, path=path)
+    except Exception:
+        return None
+    base = pokemon.line_of(row.species_dex_id)
+    new_species = pokemon.current_stage_of(base, xp)
+    if new_species == row.species_dex_id:
+        return None
+    chain = pokemon.evolution_chain(base)
+    try:
+        # Defensive: only allow forward evolution; never devolve.
+        if chain.index(new_species) <= chain.index(row.species_dex_id):
+            return None
+    except ValueError:
+        return None
+    update_pokemon_species(pokemon_id, new_species, path=path)
+    return new_species
 
 
 def migrate_legacy_days(path: Path = DB_PATH) -> int:
