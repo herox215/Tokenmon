@@ -114,6 +114,11 @@ class _RowView(NSView):
         )
         self._image_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
         self._image_view.setAnimates_(True)
+        # Crisp pixel-art scaling so the BW sprites don't blur.
+        self._image_view.setWantsLayer_(True)
+        if self._image_view.layer() is not None:
+            self._image_view.layer().setMagnificationFilter_("nearest")
+            self._image_view.layer().setMinificationFilter_("nearest")
         self.addSubview_(self._image_view)
 
         text_x = sprite_size + 24

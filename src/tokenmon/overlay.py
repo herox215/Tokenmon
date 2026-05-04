@@ -226,6 +226,11 @@ class PokemonOverlay:
         img_view = NSImageView.alloc().initWithFrame_(rect)
         img_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
         img_view.setAnimates_(True)
+        # Crisp pixel-art scaling — sprites stay sharp when scaled to 128×128.
+        img_view.setWantsLayer_(True)
+        if img_view.layer() is not None:
+            img_view.layer().setMagnificationFilter_("nearest")
+            img_view.layer().setMinificationFilter_("nearest")
         win.setContentView_(img_view)
 
         self._window = win

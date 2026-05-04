@@ -15,21 +15,28 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
+import objc
 import rumps
 from AppKit import (
     NSColor,
+    NSEventMaskLeftMouseUp,
+    NSEventMaskRightMouseUp,
+    NSEventTypeRightMouseDown,
+    NSEventTypeRightMouseUp,
     NSFont,
     NSImage,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
     NSTextField,
+    NSTimer,
     NSView,
 )
-from Foundation import NSMakeRect
+from Foundation import NSMakeRect, NSObject
 
 from tokenmon import config, pokemon, tokendex
 from tokenmon.menubar_sprite import SpriteAnimator
 from tokenmon.overlay import PokemonOverlay
+from tokenmon.popover import TokenmonPopover
 from tokenmon.pricing import cost_for
 from tokenmon.proxy import HOST, PORT
 from tokenmon.storage import (
@@ -48,6 +55,46 @@ EGG = "🥚"
 EGG_DOWN = "⚠️"
 
 log = logging.getLogger("tokenmon.menubar")
+
+
+class _ButtonWireHandler(NSObject):
+    """One-shot NSTimer target that wires the status-bar button to our popover.
+    Has to fire AFTER applicationDidFinishLaunching, since rumps installs its
+    own NSMenu on the status item there. Scheduling a 0.1 s timer from
+    __init__ guarantees we run after launch finishes."""
+
+    def initWithApp_(self, app):  # noqa: N802
+        self = objc.super(_ButtonWireHandler, self).init()
+        if self is None:
+            return None
+        self._app = app
+        return self
+
+    def wire_(self, _timer):  # noqa: N802
+        try:
+            btn = self._app._statusbar_button()
+            if btn is None or self._app._popover is None:
+                return
+            try:
+                self._app._nsapp.nsstatusitem.setMenu_(None)
+            except Exception:
+                log.exception("setMenu_(None) failed")
+            # Receive both left and right mouse-up events so the popover can
+            # be shown on left-click and a fallback context menu on right.
+            try:
+                btn.cell().sendActionOn_(
+                    NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp
+                )
+            except Exception:
+                log.exception("sendActionOn_ failed")
+            btn.setTarget_(self._app._popover)
+            # IMPORTANT: the popover's buttonClicked_ must be decorated with
+            # @objc.IBAction. Without that, pyobjc's auto-bridged selector
+            # registers OK (respondsToSelector_ returns True) and performClick_
+            # works, but real mouse events don't dispatch through it.
+            btn.setAction_("buttonClicked:")
+        except Exception:
+            log.exception("button wiring failed")
 
 
 def _active_provider_endpoints() -> list[tuple[str, str]]:
@@ -219,8 +266,14 @@ class TokenmonApp(rumps.App):
         # Level-up detection state. The overlay never appears outside of
         # level-up events, so we only need a "last seen level" to detect changes.
         self._last_known_level: int = self._compute_current_level()
+        # Popover replaces the rumps dropdown. Wired after launch via a
+        # short-lived NSTimer (see _ButtonWireHandler).
+        self._popover = TokenmonPopover.alloc().initWithApp_(self)
+        self._button_wire_handler = _ButtonWireHandler.alloc().initWithApp_(self)
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.1, self._button_wire_handler, b"wire:", None, False,
+        )
         self._sync_menubar_icon()
-        self.menu = self._build_menu(Totals(), {}, proxy_up=True)
         self.refresh(None)
 
     def _refresh_pokemon_state(self) -> None:
@@ -515,8 +568,8 @@ class TokenmonApp(rumps.App):
             return
         active = totals.output_tokens
         # When the sprite is showing, the status item shows just the sprite (no
-        # level text — that's surfaced via the tooltip and the dropdown). When
-        # the sprite is off, we fall back to the egg emoji + total tokens (or
+        # text — that's surfaced via the tooltip and the popover). When the
+        # sprite is off, we fall back to the egg emoji + total tokens (or
         # ⚠️ + tokens when the proxy is offline).
         sprite_active = self._show_pokemon and self._animator is not None
         if sprite_active and self._proxy_up:
@@ -525,12 +578,12 @@ class TokenmonApp(rumps.App):
             icon = EGG if self._proxy_up else EGG_DOWN
             self.title = f"{icon} {_fmt_tokens(active)}"
         self._update_tooltip()
-        self.menu.clear()
-        for item in self._build_menu(totals, by_model, proxy_up=self._proxy_up):
-            if item is None:
-                self.menu.add(rumps.separator)
-            else:
-                self.menu.add(item)
+        # Idempotently kill any rumps-installed menu — popover handles clicks.
+        try:
+            if self._nsapp is not None:
+                self._nsapp.nsstatusitem.setMenu_(None)
+        except Exception:
+            pass
 
 
 def main() -> None:
