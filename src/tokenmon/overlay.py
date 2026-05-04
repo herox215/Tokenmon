@@ -14,16 +14,20 @@ import objc
 from AppKit import (
     NSBackingStoreBuffered,
     NSColor,
+    NSCompositingOperationSourceAtop,
+    NSCompositingOperationSourceOver,
     NSFloatingWindowLevel,
     NSFont,
     NSImage,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
+    NSRectFillUsingOperation,
     NSScreen,
     NSShadow,
     NSTextAlignmentCenter,
     NSTextField,
     NSTimer,
+    NSView,
     NSWindow,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorIgnoresCycle,
@@ -41,6 +45,60 @@ DEFAULT_CORNER = "bottom-right"
 LEVEL_UP_BANNER_HEIGHT = 36
 LEVEL_UP_DISPLAY_SEC = 4.0
 
+# Evolution sequence: (delay_before_step_seconds, step_name).
+# Mirrors the Gen-3 Pokémon evolution feel: silhouette flicker that accelerates
+# from slow swaps to rapid blinking, then a white flash, then a held reveal of
+# the new form with a banner. Total runtime ~10 s.
+EVOLUTION_STEPS: list[tuple[float, str]] = [
+    (0.00, "sil_old"),
+    # Slow build — anticipation
+    (0.55, "sil_new"),
+    (0.50, "sil_old"),
+    (0.46, "sil_new"),
+    (0.42, "sil_old"),
+    (0.38, "sil_new"),
+    (0.34, "sil_old"),
+    (0.30, "sil_new"),
+    (0.26, "sil_old"),
+    (0.22, "sil_new"),
+    # Acceleration
+    (0.19, "sil_old"),
+    (0.16, "sil_new"),
+    (0.14, "sil_old"),
+    (0.12, "sil_new"),
+    (0.10, "sil_old"),
+    (0.09, "sil_new"),
+    (0.08, "sil_old"),
+    (0.07, "sil_new"),
+    # Rapid blinking climax
+    (0.06, "sil_old"),
+    (0.05, "sil_new"),
+    (0.05, "sil_old"),
+    (0.05, "sil_new"),
+    # Flash + reveal
+    (0.12, "flash"),
+    (0.90, "reveal"),
+    (6.00, "done"),
+]
+
+
+def _silhouette_image(src: NSImage, color: NSColor) -> NSImage:
+    """Render `src` as a solid-colour silhouette (alpha mask filled with color)."""
+    size = src.size()
+    out = NSImage.alloc().initWithSize_(size)
+    out.lockFocus()
+    src.drawAtPoint_fromRect_operation_fraction_(
+        (0, 0), NSMakeRect(0, 0, size.width, size.height),
+        NSCompositingOperationSourceOver, 1.0,
+    )
+    color.set()
+    NSRectFillUsingOperation(
+        NSMakeRect(0, 0, size.width, size.height),
+        NSCompositingOperationSourceAtop,
+    )
+    out.unlockFocus()
+    return out
+
 
 class _LevelUpHandler(NSObject):
     """NSTimer target that tears down the level-up banner when the timer fires."""
@@ -57,6 +115,58 @@ class _LevelUpHandler(NSObject):
             self._overlay._end_level_up()
         except Exception:
             log.exception("level-up teardown failed")
+
+
+class _EvolutionHandler(NSObject):
+    """NSTimer target that drives the evolution animation step-by-step."""
+
+    def initWithOverlay_silOld_silNew_newImage_newName_(  # noqa: N802
+        self, overlay, sil_old, sil_new, new_img, new_name
+    ):
+        self = objc.super(_EvolutionHandler, self).init()
+        if self is None:
+            return None
+        self._overlay = overlay
+        self._sil_old = sil_old
+        self._sil_new = sil_new
+        self._new_img = new_img
+        self._new_name = new_name
+        self._idx = 0
+        return self
+
+    def start(self):
+        self._scheduleNext()
+
+    def _scheduleNext(self):
+        if self._idx >= len(EVOLUTION_STEPS):
+            return
+        delay, _ = EVOLUTION_STEPS[self._idx]
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            max(0.001, delay), self, b"fire:", None, False
+        )
+
+    def fire_(self, _timer):  # noqa: N802
+        if self._idx >= len(EVOLUTION_STEPS):
+            return
+        _, action = EVOLUTION_STEPS[self._idx]
+        self._idx += 1
+        try:
+            if action == "sil_old":
+                self._overlay._set_evolution_image(self._sil_old, animated=False)
+            elif action == "sil_new":
+                self._overlay._set_evolution_image(self._sil_new, animated=False)
+            elif action == "flash":
+                self._overlay._show_flash()
+            elif action == "reveal":
+                self._overlay._evolution_reveal(self._new_img, self._new_name)
+            elif action == "done":
+                self._overlay._end_evolution()
+                return
+        except Exception:
+            log.exception("evolution step %s failed", action)
+            self._overlay._end_evolution()
+            return
+        self._scheduleNext()
 
 
 def _position_for(corner: str, screen_frame, size: int, margin: int) -> tuple[float, float]:
@@ -87,6 +197,10 @@ class PokemonOverlay:
         self._level_up_label: NSTextField | None = None
         self._level_up_handler: _LevelUpHandler | None = None
         self._level_up_timer: NSTimer | None = None
+        self._evolution_handler: _EvolutionHandler | None = None
+        self._evolution_flash_view: NSView | None = None
+        self._evolution_banner: NSTextField | None = None
+        self._evolution_running: bool = False
 
     def _ensure_window(self) -> None:
         if self._window is not None:
@@ -160,6 +274,154 @@ class PokemonOverlay:
     def set_corner(self, corner: str) -> None:
         self._corner = corner
         self._reposition()
+
+    @property
+    def evolution_running(self) -> bool:
+        return self._evolution_running
+
+    # --- Evolution animation ----------------------------------------------
+
+    def show_evolution(self, old_dex_id: int, new_dex_id: int) -> None:
+        """Run a Gen-3-style evolution animation and end with the new sprite +
+        banner, then hide the overlay."""
+        # Lazy import to avoid module-load circular ref.
+        from tokenmon import pokemon as _pokemon
+
+        # Cancel any in-flight level-up so we don't leak its UI.
+        if self._level_up_timer is not None:
+            self._level_up_timer.invalidate()
+            self._level_up_timer = None
+        if self._level_up_label is not None:
+            self._level_up_label.removeFromSuperview()
+            self._level_up_label = None
+        self._level_up_handler = None
+
+        # Cancel a prior evolution if one is running.
+        self._end_evolution()
+
+        old_path = _pokemon.ensure_sprite(old_dex_id)
+        new_path = _pokemon.ensure_sprite(new_dex_id)
+        if old_path is None or new_path is None:
+            return
+        old_img = NSImage.alloc().initWithContentsOfFile_(str(old_path))
+        new_img = NSImage.alloc().initWithContentsOfFile_(str(new_path))
+        if old_img is None or new_img is None:
+            return
+        sil_old = _silhouette_image(old_img, NSColor.whiteColor())
+        sil_new = _silhouette_image(new_img, NSColor.whiteColor())
+        # Re-load the reveal sprite from disk so the GIF's animation state is
+        # untouched by the drawing operations we did to build the silhouettes.
+        reveal_img = NSImage.alloc().initWithContentsOfFile_(str(new_path))
+        if reveal_img is None:
+            reveal_img = new_img
+
+        self._ensure_window()
+        if self._window is None:
+            return
+        if not self._visible:
+            self._reposition()
+            self._window.orderFrontRegardless()
+            self._visible = True
+
+        self._evolution_running = True
+        handler = _EvolutionHandler.alloc().initWithOverlay_silOld_silNew_newImage_newName_(
+            self, sil_old, sil_new, reveal_img, _pokemon.name_of(new_dex_id),
+        )
+        self._evolution_handler = handler
+        handler.start()
+
+    def _set_evolution_image(self, img: NSImage, *, animated: bool) -> None:
+        if self._image_view is None:
+            return
+        self._image_view.setAnimates_(animated)
+        self._image_view.setImage_(img)
+
+    def _show_flash(self) -> None:
+        """Cover the sprite area with an opaque white view."""
+        if self._window is None or self._image_view is None:
+            return
+        if self._evolution_flash_view is not None:
+            return
+        bounds = self._image_view.frame()
+        flash = NSView.alloc().initWithFrame_(bounds)
+        flash.setWantsLayer_(True)
+        # NSColor's CGColor is a method in pyobjc, not a property.
+        flash.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+        self._window.contentView().addSubview_(flash)
+        self._evolution_flash_view = flash
+
+    def _evolution_reveal(self, new_img: NSImage, new_name: str) -> None:
+        # Drop the flash overlay.
+        if self._evolution_flash_view is not None:
+            self._evolution_flash_view.removeFromSuperview()
+            self._evolution_flash_view = None
+        # Reveal the new sprite, animated. Set the image first, THEN turn on
+        # animation, so the NSImageView picks up the new representations before
+        # starting the timer.
+        if self._image_view is not None:
+            self._image_view.setImage_(new_img)
+            self._image_view.setAnimates_(True)
+        # Grow window upward and add a banner like the level-up one.
+        if self._window is None:
+            return
+        size = self._size
+        banner_h = LEVEL_UP_BANNER_HEIGHT
+        screen = self._window.screen() or NSScreen.mainScreen()
+        if screen is not None:
+            x, y = _position_for(self._corner, screen.visibleFrame(), size, self._margin)
+            self._window.setFrame_display_animate_(
+                NSMakeRect(x, y, size, size + banner_h), True, True
+            )
+        content = self._window.contentView()
+        content.setFrame_(NSMakeRect(0, 0, size, size + banner_h))
+        if self._image_view is not None:
+            self._image_view.setFrame_(NSMakeRect(0, 0, size, size))
+
+        label = NSTextField.alloc().initWithFrame_(NSMakeRect(0, size, size, banner_h))
+        label.setStringValue_(f"{new_name} entwickelt!")
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        label.setAlignment_(NSTextAlignmentCenter)
+        label.setFont_(NSFont.boldSystemFontOfSize_(13))
+        label.setTextColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.85, 0.0, 1.0)
+        )
+        shadow = NSShadow.alloc().init()
+        shadow.setShadowColor_(NSColor.blackColor())
+        shadow.setShadowOffset_(NSMakeSize(0, -1))
+        shadow.setShadowBlurRadius_(3)
+        label.setShadow_(shadow)
+        content.addSubview_(label)
+        self._evolution_banner = label
+
+    def _end_evolution(self) -> None:
+        self._evolution_running = False
+        self._evolution_handler = None
+        if self._evolution_flash_view is not None:
+            self._evolution_flash_view.removeFromSuperview()
+            self._evolution_flash_view = None
+        if self._evolution_banner is not None:
+            self._evolution_banner.removeFromSuperview()
+            self._evolution_banner = None
+        if self._image_view is not None:
+            self._image_view.setAnimates_(True)
+        if self._window is None:
+            return
+        screen = self._window.screen() or NSScreen.mainScreen()
+        if screen is not None:
+            x, y = _position_for(self._corner, screen.visibleFrame(), self._size, self._margin)
+            self._window.setFrame_display_animate_(
+                NSMakeRect(x, y, self._size, self._size), True, False
+            )
+        content = self._window.contentView()
+        content.setFrame_(NSMakeRect(0, 0, self._size, self._size))
+        if self._image_view is not None:
+            self._image_view.setFrame_(NSMakeRect(0, 0, self._size, self._size))
+        self.hide()
+
+    # --- Level-up animation -----------------------------------------------
 
     def show_level_up(self) -> None:
         """Pop the overlay window with a transient "Level up!" banner above the

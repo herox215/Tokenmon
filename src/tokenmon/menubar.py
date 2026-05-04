@@ -197,18 +197,40 @@ class TokenmonApp(rumps.App):
 
     def _refresh_pokemon_state(self) -> None:
         """Recompute current evolution stage based on line XP and reload sprite
-        if the displayed Pokemon has changed."""
+        if the displayed Pokemon has changed. When the change is an evolution
+        within the same line, fire the evolution animation."""
         try:
             xp = query_pokemon_xp(self._line_base_id, TZ)
         except Exception:
             log.exception("failed to query line xp")
             xp = 0
         new_id = pokemon.current_stage_of(self._line_base_id, xp)
-        if new_id != self._pokemon_dex_id:
-            self._pokemon_dex_id = new_id
-            self._pokemon_sprite = pokemon.ensure_sprite(new_id)
-            self._sync_menubar_icon()
-            self._sync_overlay()
+        if new_id == self._pokemon_dex_id:
+            return
+        old_id = self._pokemon_dex_id
+        self._pokemon_dex_id = new_id
+        self._pokemon_sprite = pokemon.ensure_sprite(new_id)
+        self._sync_menubar_icon()
+        self._sync_overlay()
+
+        chain = pokemon.evolution_chain(self._line_base_id)
+        if old_id in chain and new_id in chain and chain.index(new_id) > chain.index(old_id):
+            # Real in-line evolution. Fire notification + animation, and sync the
+            # level cache so the level-up animation doesn't also fire.
+            self._last_known_level = self._compute_current_level()
+            try:
+                rumps.notification(
+                    title="Tokenmon",
+                    subtitle="Entwicklung!",
+                    message=f"{pokemon.name_of(old_id)} entwickelt sich zu {pokemon.name_of(new_id)}!",
+                )
+            except Exception:
+                log.exception("evolution notification failed")
+            if self._show_overlay:
+                try:
+                    self._overlay.show_evolution(old_id, new_id)
+                except Exception:
+                    log.exception("evolution animation failed")
 
     def _sync_overlay(self) -> None:
         """Refresh the overlay's sprite (when the displayed Pokemon changes).
@@ -244,7 +266,9 @@ class TokenmonApp(rumps.App):
             self._level_up_title_until = now + LEVEL_UP_TITLE_DISPLAY_SEC
             # Pop the overlay for the duration of the level-up banner. The
             # overlay hides itself again when the banner timer expires.
-            if self._show_overlay:
+            # Suppress the level-up animation while an evolution animation is
+            # already running (level-up and evolution often coincide).
+            if self._show_overlay and not self._overlay.evolution_running:
                 try:
                     self._overlay.update_sprite(self._pokemon_sprite)
                     self._overlay.show_level_up()
@@ -264,6 +288,23 @@ class TokenmonApp(rumps.App):
         btn = self._statusbar_button()
         if btn is not None:
             btn.setImage_(img)
+
+    def _update_tooltip(self) -> None:
+        btn = self._statusbar_button()
+        if btn is None:
+            return
+        try:
+            xp = query_pokemon_xp(self._line_base_id, TZ)
+        except Exception:
+            xp = 0
+        rate = pokemon.growth_rate_of(self._line_base_id)
+        level, into, needed = pokemon.level_from_xp(xp, rate)
+        name = pokemon.name_of(self._pokemon_dex_id)
+        if level >= pokemon.MAX_LEVEL:
+            tooltip = f"{name} — Lv MAX • {xp:,} XP gesamt"
+        else:
+            tooltip = f"{name} — Lv {level} • {into:,}/{needed:,} XP"
+        btn.setToolTip_(tooltip)
 
     def _stop_animator(self) -> None:
         if self._animator is not None:
@@ -296,8 +337,16 @@ class TokenmonApp(rumps.App):
         if today != self._pokemon_picked_for:
             self._line_base_id = pokemon.pick_for_today(today)
             self._pokemon_picked_for = today
-            self._pokemon_dex_id = self._line_base_id  # _refresh_pokemon_state will evolve it
+            # Compute the correct stage for the new line up-front, otherwise
+            # _refresh_pokemon_state would treat catching-up to existing XP as a
+            # fresh evolution and fire the animation falsely.
+            try:
+                xp = query_pokemon_xp(self._line_base_id, TZ)
+            except Exception:
+                xp = 0
+            self._pokemon_dex_id = pokemon.current_stage_of(self._line_base_id, xp)
             self._pokemon_sprite = pokemon.ensure_sprite(self._pokemon_dex_id)
+            self._last_known_level = self._compute_current_level()
             self._sync_menubar_icon()
 
     def _pokemon_menu_item(self) -> rumps.MenuItem:
@@ -427,6 +476,7 @@ class TokenmonApp(rumps.App):
         now = time.monotonic()
         if self._level_up_title is not None and now < self._level_up_title_until:
             self.title = self._level_up_title
+            self._update_tooltip()
             self.menu.clear()
             for item in self._build_menu(totals, by_model, proxy_up=self._proxy_up):
                 if item is None:
@@ -436,23 +486,17 @@ class TokenmonApp(rumps.App):
             return
         if self._level_up_title is not None and now >= self._level_up_title_until:
             self._level_up_title = None
-        # When the sprite is showing, the title becomes the Pokemon's level so the
-        # status item reads "[sprite] Lv 7"; otherwise we fall back to the egg
-        # emoji + total tokens (or ⚠️ + tokens when the proxy is offline).
+        # When the sprite is showing, the status item shows just the sprite (no
+        # level text — that's surfaced via the tooltip and the dropdown). When
+        # the sprite is off, we fall back to the egg emoji + total tokens (or
+        # ⚠️ + tokens when the proxy is offline).
         sprite_active = self._show_pokemon and self._animator is not None
         if sprite_active and self._proxy_up:
-            try:
-                xp = query_pokemon_xp(self._line_base_id, TZ)
-            except Exception:
-                xp = 0
-            level, _, _ = pokemon.level_from_xp(
-                xp, pokemon.growth_rate_of(self._line_base_id)
-            )
-            level_text = "MAX" if level >= pokemon.MAX_LEVEL else f"Lv {level}"
-            self.title = f" {level_text}"
+            self.title = ""
         else:
             icon = EGG if self._proxy_up else EGG_DOWN
             self.title = f"{icon} {_fmt_tokens(active)}"
+        self._update_tooltip()
         self.menu.clear()
         for item in self._build_menu(totals, by_model, proxy_up=self._proxy_up):
             if item is None:
