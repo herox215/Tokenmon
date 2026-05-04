@@ -89,10 +89,17 @@ class _OpenAIAccumulator:
 
 
 class OpenAIStrategy:
-    """Generic OpenAI-format strategy. Subclasses pin the upstream URL."""
+    """Generic OpenAI-format strategy. Subclasses pin the upstream URL.
+
+    Convention: upstream_url is host-only (no /v1 or /api/v1 prefix). Clients
+    set their own baseURL with the prefix, e.g.
+    ``OPENAI_BASE_URL=http://127.0.0.1:8790/v1``. The proxy receives the path
+    including the prefix and forwards it verbatim, which means the same
+    strategy works whether the client uses /v1, /api/v1 or some other path.
+    """
 
     name = "openai"
-    upstream_url = "https://api.openai.com/v1"
+    upstream_url = "https://api.openai.com"
     default_port = 8790
     label_for_user = "OpenAI"
 
@@ -166,7 +173,7 @@ class OpenAIStrategy:
 
 class OpenRouterStrategy(OpenAIStrategy):
     name = "openrouter"
-    upstream_url = "https://openrouter.ai/api/v1"
+    upstream_url = "https://openrouter.ai"
     default_port = 8789
     label_for_user = "OpenRouter"
 

@@ -163,13 +163,21 @@ class PokedexEntry:
 def _tokens_per_local_day(
     tz_name: str, path: Path
 ) -> list[tuple[date, int]]:
-    """Return [(local_date, sum_active_tokens), ...] sorted by date.
-    Days with zero active tokens are dropped so the Tokendex never shows a
-    Pokemon you didn't actually earn any XP for."""
+    """Return [(local_date, sum_output_tokens), ...] sorted by date.
+
+    XP buckets count output tokens only — input tokens are heavily skewed by
+    each agent's system-prompt / tool-definitions overhead, and the size of
+    that overhead differs wildly across providers (Anthropic with caching vs
+    OpenRouter without). Output is the only token category that consistently
+    reflects actual model engagement and is comparable across providers.
+
+    Days with zero output tokens are dropped so the Tokendex never shows a
+    Pokemon you didn't earn any XP for.
+    """
     tz = ZoneInfo(tz_name)
     with _connect(path) as conn:
         rows = conn.execute(
-            "SELECT ts_utc, input_tokens + output_tokens FROM requests"
+            "SELECT ts_utc, output_tokens FROM requests"
         ).fetchall()
     by_day: dict[date, int] = {}
     for ts_str, tokens in rows:

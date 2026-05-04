@@ -15,10 +15,11 @@ def status() -> None:
     """Show today's usage and LaunchAgent state."""
     init_db()
     totals = query_today()
-    active = totals.input_tokens + totals.output_tokens
-    click.echo(f"Today: {active:,} tokens across {totals.request_count} requests")
-    click.echo(f"  input:  {totals.input_tokens:,}")
+    # Active = output only (provider-agnostic engagement metric).
+    active = totals.output_tokens
+    click.echo(f"Today: {active:,} output tokens across {totals.request_count} requests")
     click.echo(f"  output: {totals.output_tokens:,}")
+    click.echo(f"  input:  {totals.input_tokens:,}  (drives cost; not counted as XP)")
     by_model = query_today_by_model()
     if by_model:
         click.echo("\nBy model:")
@@ -42,7 +43,7 @@ def status() -> None:
             if has_price:
                 priced_tokens += tokens
             cost_str = f"${cost:.4f}" if has_price else "(no pricing)"
-            click.echo(f"  {model}: {t.input_tokens + t.output_tokens:,} tokens, {cost_str}")
+            click.echo(f"  {model}: {t.output_tokens:,} output tokens, {cost_str}")
         suffix = ""
         if all_tokens > 0 and priced_tokens < all_tokens:
             coverage = priced_tokens / all_tokens

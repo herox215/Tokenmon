@@ -412,11 +412,14 @@ class TokenmonApp(rumps.App):
             items.append(rumps.MenuItem("⚠️  Proxy offline — Calls werden NICHT getrackt!"))
             items.append(rumps.MenuItem("Proxy neustarten", callback=self.restart_proxy))
             items.append(None)
-        active = totals.input_tokens + totals.output_tokens
+        # XP / "active" tokens count only the model's output: it's the only
+        # token category comparable across providers (cached input doesn't
+        # exist in OpenRouter, while it dominates Anthropic-via-Claude-Code).
+        active = totals.output_tokens
         items.extend([
-            rumps.MenuItem(f"Heute: {_fmt_tokens(active)} tokens"),
-            rumps.MenuItem(f"  Input:    {_fmt_tokens(totals.input_tokens)}"),
+            rumps.MenuItem(f"Heute: {_fmt_tokens(active)} tokens (output)"),
             rumps.MenuItem(f"  Output:   {_fmt_tokens(totals.output_tokens)}"),
+            rumps.MenuItem(f"  Input:    {_fmt_tokens(totals.input_tokens)}"),
             rumps.MenuItem(f"  Requests: {totals.request_count}"),
             None,
         ])
@@ -441,11 +444,11 @@ class TokenmonApp(rumps.App):
                 all_tokens += model_tokens
                 if has_price:
                     priced_tokens += model_tokens
-                visible_tokens = t.input_tokens + t.output_tokens
+                visible_tokens = t.output_tokens
                 cost_str = _fmt_usd(cost) if has_price else "?"
                 items.append(
                     rumps.MenuItem(
-                        f"  {model}: {_fmt_tokens(visible_tokens)} ({cost_str})"
+                        f"  {model}: {_fmt_tokens(visible_tokens)} out ({cost_str})"
                     )
                 )
             items.append(None)
@@ -517,7 +520,7 @@ class TokenmonApp(rumps.App):
             log.exception("failed to query usage")
             self.title = f"{EGG} ?"
             return
-        active = totals.input_tokens + totals.output_tokens
+        active = totals.output_tokens
         # Level-up title flash takes priority for a few seconds after a level up.
         now = time.monotonic()
         if self._level_up_title is not None and now < self._level_up_title_until:
