@@ -43,7 +43,6 @@ from tokenmon.storage import (
 REFRESH_INTERVAL_SEC = 30
 HEALTH_INTERVAL_SEC = 10
 ACTIVITY_POLL_INTERVAL_SEC = 5
-LEVEL_UP_TITLE_DISPLAY_SEC = 5.0
 TZ = "Europe/Berlin"
 EGG = "🥚"
 EGG_DOWN = "⚠️"
@@ -220,8 +219,6 @@ class TokenmonApp(rumps.App):
         # Level-up detection state. The overlay never appears outside of
         # level-up events, so we only need a "last seen level" to detect changes.
         self._last_known_level: int = self._compute_current_level()
-        self._level_up_title_until: float = 0.0
-        self._level_up_title: str | None = None
         self._sync_menubar_icon()
         self.menu = self._build_menu(Totals(), {}, proxy_up=True)
         self.refresh(None)
@@ -291,10 +288,6 @@ class TokenmonApp(rumps.App):
                 )
             except Exception:
                 log.exception("level-up notification failed")
-            # Title flash on the menubar (only meaningful when sprite mode is OFF
-            # since otherwise the title is just "Lv N").
-            self._level_up_title = "🌟 Level up!"
-            self._level_up_title_until = now + LEVEL_UP_TITLE_DISPLAY_SEC
             # Pop the overlay for the duration of the level-up banner. The
             # overlay hides itself again when the banner timer expires.
             # Suppress the level-up animation while an evolution animation is
@@ -521,20 +514,6 @@ class TokenmonApp(rumps.App):
             self.title = f"{EGG} ?"
             return
         active = totals.output_tokens
-        # Level-up title flash takes priority for a few seconds after a level up.
-        now = time.monotonic()
-        if self._level_up_title is not None and now < self._level_up_title_until:
-            self.title = self._level_up_title
-            self._update_tooltip()
-            self.menu.clear()
-            for item in self._build_menu(totals, by_model, proxy_up=self._proxy_up):
-                if item is None:
-                    self.menu.add(rumps.separator)
-                else:
-                    self.menu.add(item)
-            return
-        if self._level_up_title is not None and now >= self._level_up_title_until:
-            self._level_up_title = None
         # When the sprite is showing, the status item shows just the sprite (no
         # level text — that's surfaced via the tooltip and the dropdown). When
         # the sprite is off, we fall back to the egg emoji + total tokens (or

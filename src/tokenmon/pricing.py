@@ -44,7 +44,14 @@ def _resolve(model: str) -> ModelPrice | None:
     for key, price in PRICES.items():
         if base.startswith(key):
             return price
-    return None
+    # Fall back to OpenRouter's live pricing catalogue (cached under
+    # ~/.tokenmon/openrouter_pricing.json with a 24h TTL).
+    try:
+        from tokenmon.pricing_remote import lookup as remote_lookup
+        return remote_lookup(model)
+    except Exception:
+        log.exception("remote pricing lookup failed")
+        return None
 
 
 def cost_for(
