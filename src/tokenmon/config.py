@@ -15,6 +15,9 @@ CONFIG_PATH = DB_DIR / "config.json"
 
 _DEFAULTS: dict[str, Any] = {
     "show_pokemon_in_menubar": True,
+    "show_overlay": False,
+    "overlay_corner": "bottom-right",
+    "overlay_size": 128,
 }
 
 

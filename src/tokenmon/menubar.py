@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import time
 from datetime import date
 from pathlib import Path
 from urllib.error import URLError
@@ -28,6 +29,7 @@ from Foundation import NSMakeRect
 
 from tokenmon import config, pokemon, tokendex
 from tokenmon.menubar_sprite import SpriteAnimator
+from tokenmon.overlay import PokemonOverlay
 from tokenmon.pricing import cost_for
 from tokenmon.proxy import HOST, PORT
 from tokenmon.storage import (
@@ -40,6 +42,8 @@ from tokenmon.storage import (
 
 REFRESH_INTERVAL_SEC = 30
 HEALTH_INTERVAL_SEC = 10
+ACTIVITY_POLL_INTERVAL_SEC = 5
+LEVEL_UP_TITLE_DISPLAY_SEC = 5.0
 HEALTH_URL = f"http://{HOST}:{PORT}/healthz"
 PROXY_LAUNCHD_LABEL = "com.tokenmon.proxy"
 TZ = "Europe/Berlin"
@@ -177,6 +181,16 @@ class TokenmonApp(rumps.App):
         self._pokemon_sprite: Path | None = pokemon.ensure_sprite(self._pokemon_dex_id)
         self._show_pokemon = bool(config.get("show_pokemon_in_menubar"))
         self._animator: SpriteAnimator | None = None
+        self._overlay = PokemonOverlay(
+            size=int(config.get("overlay_size") or 128),
+            corner=str(config.get("overlay_corner") or "bottom-right"),
+        )
+        self._show_overlay = bool(config.get("show_overlay"))
+        # Level-up detection state. The overlay never appears outside of
+        # level-up events, so we only need a "last seen level" to detect changes.
+        self._last_known_level: int = self._compute_current_level()
+        self._level_up_title_until: float = 0.0
+        self._level_up_title: str | None = None
         self._sync_menubar_icon()
         self.menu = self._build_menu(Totals(), {}, proxy_up=True)
         self.refresh(None)
@@ -194,6 +208,51 @@ class TokenmonApp(rumps.App):
             self._pokemon_dex_id = new_id
             self._pokemon_sprite = pokemon.ensure_sprite(new_id)
             self._sync_menubar_icon()
+            self._sync_overlay()
+
+    def _sync_overlay(self) -> None:
+        """Refresh the overlay's sprite (when the displayed Pokemon changes).
+        Does NOT decide visibility — the overlay only appears on level-up events."""
+        if self._overlay.visible:
+            self._overlay.update_sprite(self._pokemon_sprite)
+
+    def _compute_current_level(self) -> int:
+        try:
+            xp = query_pokemon_xp(self._line_base_id, TZ)
+        except Exception:
+            return 1
+        rate = pokemon.growth_rate_of(self._line_base_id)
+        level, _, _ = pokemon.level_from_xp(xp, rate)
+        return level
+
+    def _check_level_up(self, now: float) -> None:
+        """Detect a level increase since the last poll and fire visuals/notification."""
+        new_level = self._compute_current_level()
+        if new_level > self._last_known_level:
+            self._last_known_level = new_level
+            try:
+                rumps.notification(
+                    title="Tokenmon",
+                    subtitle="Level up!",
+                    message=f"{pokemon.name_of(self._pokemon_dex_id)} ist aufgestiegen!",
+                )
+            except Exception:
+                log.exception("level-up notification failed")
+            # Title flash on the menubar (only meaningful when sprite mode is OFF
+            # since otherwise the title is just "Lv N").
+            self._level_up_title = "🌟 Level up!"
+            self._level_up_title_until = now + LEVEL_UP_TITLE_DISPLAY_SEC
+            # Pop the overlay for the duration of the level-up banner. The
+            # overlay hides itself again when the banner timer expires.
+            if self._show_overlay:
+                try:
+                    self._overlay.update_sprite(self._pokemon_sprite)
+                    self._overlay.show_level_up()
+                except Exception:
+                    log.exception("overlay level-up animation failed")
+        elif new_level < self._last_known_level:
+            # Defensive: data shrunk (manual DB edit?). Track silently.
+            self._last_known_level = new_level
 
     def _statusbar_button(self):
         try:
@@ -260,10 +319,14 @@ class TokenmonApp(rumps.App):
         items: list = []
         items.append(self._pokemon_menu_item())
         items.append(rumps.MenuItem("📖 Tokendex öffnen", callback=self.open_tokendex))
-        items.append(rumps.MenuItem("🎲 Pokemon neu würfeln (debug)", callback=self.reroll_pokemon))
         toggle = rumps.MenuItem("Pokemon im Menubar anzeigen", callback=self.toggle_menubar_pokemon)
         toggle.state = 1 if self._show_pokemon else 0
         items.append(toggle)
+        overlay_toggle = rumps.MenuItem(
+            "Pokemon als Desktop-Overlay anzeigen", callback=self.toggle_overlay
+        )
+        overlay_toggle.state = 1 if self._show_overlay else 0
+        items.append(overlay_toggle)
         items.append(None)
         if not proxy_up:
             items.append(rumps.MenuItem("⚠️  Proxy offline — Calls werden NICHT getrackt!"))
@@ -312,6 +375,16 @@ class TokenmonApp(rumps.App):
             self._proxy_up = up
             self.refresh(None)
 
+    @rumps.timer(ACTIVITY_POLL_INTERVAL_SEC)
+    def activity_poll(self, _sender) -> None:
+        now = time.monotonic()
+        prev_level = self._last_known_level
+        self._check_level_up(now)
+        if self._last_known_level != prev_level:
+            # Refresh now so the menubar title picks up the new level immediately
+            # (otherwise we'd wait up to 30s for the next refresh).
+            self.refresh(None)
+
     def restart_proxy(self, _sender) -> None:
         ok, msg = _restart_proxy_via_launchctl()
         rumps.notification(
@@ -320,17 +393,17 @@ class TokenmonApp(rumps.App):
             message=msg,
         )
 
-    def reroll_pokemon(self, _sender) -> None:
-        self._line_base_id = pokemon.pick_random()
-        self._pokemon_dex_id = self._line_base_id  # _refresh_pokemon_state will evolve it
-        self._pokemon_sprite = pokemon.ensure_sprite(self._pokemon_dex_id)
-        self._sync_menubar_icon()
-        self.refresh(None)
-
     def toggle_menubar_pokemon(self, _sender) -> None:
         self._show_pokemon = not self._show_pokemon
         config.set_("show_pokemon_in_menubar", self._show_pokemon)
         self._sync_menubar_icon()
+        self.refresh(None)
+
+    def toggle_overlay(self, _sender) -> None:
+        self._show_overlay = not self._show_overlay
+        config.set_("show_overlay", self._show_overlay)
+        if not self._show_overlay and self._overlay.visible:
+            self._overlay.hide()
         self.refresh(None)
 
     def open_tokendex(self, _sender) -> None:
@@ -350,6 +423,19 @@ class TokenmonApp(rumps.App):
             self.title = f"{EGG} ?"
             return
         active = totals.input_tokens + totals.output_tokens
+        # Level-up title flash takes priority for a few seconds after a level up.
+        now = time.monotonic()
+        if self._level_up_title is not None and now < self._level_up_title_until:
+            self.title = self._level_up_title
+            self.menu.clear()
+            for item in self._build_menu(totals, by_model, proxy_up=self._proxy_up):
+                if item is None:
+                    self.menu.add(rumps.separator)
+                else:
+                    self.menu.add(item)
+            return
+        if self._level_up_title is not None and now >= self._level_up_title_until:
+            self._level_up_title = None
         # When the sprite is showing, the title becomes the Pokemon's level so the
         # status item reads "[sprite] Lv 7"; otherwise we fall back to the egg
         # emoji + total tokens (or ⚠️ + tokens when the proxy is offline).

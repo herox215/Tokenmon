@@ -164,8 +164,8 @@ def _tokens_per_local_day(
     tz_name: str, path: Path
 ) -> list[tuple[date, int]]:
     """Return [(local_date, sum_active_tokens), ...] sorted by date.
-    Buckets timestamps into the user's chosen TZ in Python (not SQLite, to be
-    timezone-correct regardless of OS local time)."""
+    Days with zero active tokens are dropped so the Tokendex never shows a
+    Pokemon you didn't actually earn any XP for."""
     tz = ZoneInfo(tz_name)
     with _connect(path) as conn:
         rows = conn.execute(
@@ -173,13 +173,12 @@ def _tokens_per_local_day(
         ).fetchall()
     by_day: dict[date, int] = {}
     for ts_str, tokens in rows:
-        # ISO 8601 with tz; Python ≥3.11 handles trailing Z; we always store +00:00.
         ts = datetime.fromisoformat(ts_str)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         local_day = ts.astimezone(tz).date()
         by_day[local_day] = by_day.get(local_day, 0) + int(tokens or 0)
-    return sorted(by_day.items())
+    return sorted((d, t) for d, t in by_day.items() if t > 0)
 
 
 def query_pokedex(

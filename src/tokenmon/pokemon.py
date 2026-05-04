@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import random
 import urllib.request
 from datetime import date
 from pathlib import Path
@@ -312,11 +311,6 @@ def pick_for_today(today: date | None = None, salt: str | None = None) -> int:
     seed = f"{today.isoformat()}:{salt}".encode()
     h = int(hashlib.sha256(seed).hexdigest(), 16)
     return _BASE_IDS[h % len(_BASE_IDS)]
-
-
-def pick_random() -> int:
-    """Random pick (for the 'reroll' debug button)."""
-    return random.choice(_BASE_IDS)
 
 
 def name_of(dex_id: int) -> str:
