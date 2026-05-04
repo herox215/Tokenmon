@@ -526,3 +526,98 @@ def seeded_nature(date_iso: str, salt: str) -> dict:
 def seeded_characteristic(date_iso: str, salt: str) -> str:
     """SHA256(date+salt+':characteristic') mod len(CHARACTERISTICS)."""
     return CHARACTERISTICS[_seed_index(date_iso, salt, "characteristic", len(CHARACTERISTICS))]
+
+
+# --- Catch rates -----------------------------------------------------------
+
+# Canonical Gen-1 (Red/Blue/Yellow) capture rates per dex_id (1..151).
+# Source: Bulbapedia "List of Pokémon by catch rate" (Generation I column).
+# Range: 3 (legendary, hardest) .. 255 (super common, trivial).
+GEN1_CATCH_RATES: dict[int, int] = {
+    1: 45,    2: 45,    3: 45,        # Bulbasaur line
+    4: 45,    5: 45,    6: 45,        # Charmander line
+    7: 45,    8: 45,    9: 45,        # Squirtle line
+    10: 255,  11: 120,  12: 45,       # Caterpie line
+    13: 255,  14: 120,  15: 45,       # Weedle line
+    16: 255,  17: 120,  18: 45,       # Pidgey line
+    19: 255,  20: 127,                # Rattata / Raticate
+    21: 255,  22: 90,                 # Spearow / Fearow
+    23: 255,  24: 90,                 # Ekans / Arbok
+    25: 190,  26: 75,                 # Pikachu / Raichu
+    27: 255,  28: 90,                 # Sandshrew / Sandslash
+    29: 235,  30: 120,  31: 45,       # Nidoran♀ line
+    32: 235,  33: 120,  34: 45,       # Nidoran♂ line
+    35: 150,  36: 25,                 # Clefairy / Clefable
+    37: 190,  38: 75,                 # Vulpix / Ninetales
+    39: 170,  40: 50,                 # Jigglypuff / Wigglytuff
+    41: 255,  42: 90,                 # Zubat / Golbat
+    43: 255,  44: 120,  45: 45,       # Oddish line
+    46: 190,  47: 75,                 # Paras / Parasect
+    48: 190,  49: 75,                 # Venonat / Venomoth
+    50: 255,  51: 50,                 # Diglett / Dugtrio
+    52: 255,  53: 90,                 # Meowth / Persian
+    54: 190,  55: 75,                 # Psyduck / Golduck
+    56: 190,  57: 75,                 # Mankey / Primeape
+    58: 190,  59: 75,                 # Growlithe / Arcanine
+    60: 255,  61: 120,  62: 45,       # Poliwag line
+    63: 200,  64: 100,  65: 50,       # Abra / Kadabra / Alakazam
+    66: 180,  67: 90,   68: 45,       # Machop / Machoke / Machamp
+    69: 255,  70: 120,  71: 45,       # Bellsprout line
+    72: 190,  73: 60,                 # Tentacool / Tentacruel
+    74: 255,  75: 120,  76: 45,       # Geodude / Graveler / Golem
+    77: 190,  78: 60,                 # Ponyta / Rapidash
+    79: 190,  80: 75,                 # Slowpoke / Slowbro
+    81: 190,  82: 60,                 # Magnemite / Magneton
+    83: 45,                           # Farfetch'd
+    84: 190,  85: 45,                 # Doduo / Dodrio
+    86: 190,  87: 75,                 # Seel / Dewgong
+    88: 190,  89: 75,                 # Grimer / Muk
+    90: 190,  91: 60,                 # Shellder / Cloyster
+    92: 190,  93: 90,   94: 45,       # Gastly / Haunter / Gengar
+    95: 45,                           # Onix
+    96: 190,  97: 75,                 # Drowzee / Hypno
+    98: 225,  99: 60,                 # Krabby / Kingler
+    100: 190, 101: 60,                # Voltorb / Electrode
+    102: 90,  103: 45,                # Exeggcute / Exeggutor
+    104: 190, 105: 75,                # Cubone / Marowak
+    106: 45,                          # Hitmonlee
+    107: 45,                          # Hitmonchan
+    108: 45,                          # Lickitung
+    109: 190, 110: 60,                # Koffing / Weezing
+    111: 120, 112: 60,                # Rhyhorn / Rhydon
+    113: 30,                          # Chansey
+    114: 45,                          # Tangela
+    115: 45,                          # Kangaskhan
+    116: 225, 117: 75,                # Horsea / Seadra
+    118: 225, 119: 60,                # Goldeen / Seaking
+    120: 225, 121: 60,                # Staryu / Starmie
+    122: 45,                          # Mr. Mime
+    123: 45,                          # Scyther
+    124: 45,                          # Jynx
+    125: 45,                          # Electabuzz
+    126: 45,                          # Magmar
+    127: 45,                          # Pinsir
+    128: 45,                          # Tauros
+    129: 255, 130: 45,                # Magikarp / Gyarados
+    131: 45,                          # Lapras
+    132: 35,                          # Ditto
+    133: 45,  134: 45,                # Eevee / Vaporeon
+    135: 45,  136: 45,                # Jolteon / Flareon
+    137: 45,                          # Porygon
+    138: 45,  139: 45,                # Omanyte / Omastar
+    140: 45,  141: 45,                # Kabuto / Kabutops
+    142: 45,                          # Aerodactyl
+    143: 25,                          # Snorlax
+    144: 3,                           # Articuno
+    145: 3,                           # Zapdos
+    146: 3,                           # Moltres
+    147: 45,  148: 27,  149: 9,       # Dratini / Dragonair / Dragonite
+    150: 3,                           # Mewtwo
+    151: 45,                          # Mew
+}
+
+
+def catch_rate_of(dex_id: int) -> int:
+    """Returns the canonical Gen-1 capture rate (0-255). Defaults to 100 for
+    unknown dex_ids (reasonable middle-ground for safety)."""
+    return GEN1_CATCH_RATES.get(int(dex_id), 100)

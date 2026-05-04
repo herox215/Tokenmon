@@ -45,6 +45,7 @@ from tokenmon.storage import (
     query_today,
     query_today_by_model,
     query_xp_for_date,
+    query_xp_for_pokemon,
 )
 
 REFRESH_INTERVAL_SEC = 30
@@ -277,6 +278,10 @@ class TokenmonApp(rumps.App):
         # Level-up detection state. The overlay never appears outside of
         # level-up events, so we only need a "last seen level" to detect changes.
         self._last_known_level: int = self._compute_current_level()
+        # Wild-encounter spawn tracking — for every new requests row, we roll
+        # encounter.maybe_spawn(). _last_seen_request_id holds the highest id
+        # already considered, so we don't double-roll.
+        self._last_seen_request_id: int = self._query_max_request_id()
         # Popover replaces the rumps dropdown. Wired after launch via a
         # short-lived NSTimer (see _ButtonWireHandler).
         self._popover = TokenmonPopover.alloc().initWithApp_(self)
@@ -288,16 +293,34 @@ class TokenmonApp(rumps.App):
         self.refresh(None)
 
     def _refresh_pokemon_state(self) -> None:
-        """Recompute current evolution stage based on TODAY's per-instance XP
-        and reload sprite if the displayed Pokemon has changed. Each Pokemon
-        is now an independent instance whose XP is just the day's output
-        tokens — so evolution can still happen mid-day if you generate enough
-        tokens to cross a threshold, but the next day's Pokemon starts fresh
-        in its own row."""
+        """The menubar icon mirrors the user's ACTIVE Pokemon — which defaults
+        to today's caught Pokemon but the user can pin any owned Pokemon as
+        active via the Box detail pane. Per-instance XP comes from
+        query_xp_for_pokemon(active.id) so evolution still triggers as the
+        active accumulates training XP."""
         try:
-            xp = query_xp_for_date(date.today(), TZ)
+            active = box.get_active_pokemon()
         except Exception:
-            log.exception("failed to query today's xp")
+            log.exception("get_active_pokemon failed")
+            active = None
+        if active is not None and active.species_dex_id != self._line_base_id:
+            # Active Pokemon changed (user switched it via the Box detail pane).
+            # Re-anchor everything before the evolution check below runs.
+            self._line_base_id = active.species_dex_id
+            self._pokemon_dex_id = active.species_dex_id
+            self._pokemon_sprite = pokemon.ensure_sprite(active.species_dex_id)
+            self._last_known_level = self._compute_current_level()
+            self._sync_menubar_icon()
+            self._sync_overlay()
+            return
+
+        try:
+            if active is not None:
+                xp = query_xp_for_pokemon(active.id)
+            else:
+                xp = query_xp_for_date(date.today(), TZ)
+        except Exception:
+            log.exception("failed to query active xp")
             xp = 0
         new_id = pokemon.current_stage_of(self._line_base_id, xp)
         if new_id == self._pokemon_dex_id:
@@ -333,9 +356,68 @@ class TokenmonApp(rumps.App):
         if self._overlay.visible:
             self._overlay.update_sprite(self._pokemon_sprite)
 
+    def _query_max_request_id(self) -> int:
+        try:
+            import sqlite3
+            from tokenmon.storage import DB_PATH
+            with sqlite3.connect(DB_PATH, timeout=2.0) as conn:
+                row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM requests").fetchone()
+                return int(row[0] or 0)
+        except Exception:
+            log.exception("max request id query failed")
+            return 0
+
+    def _query_new_request_count(self, since: int) -> int:
+        try:
+            import sqlite3
+            from tokenmon.storage import DB_PATH
+            with sqlite3.connect(DB_PATH, timeout=2.0) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(id), ?) FROM requests WHERE id > ?",
+                    (since, since),
+                ).fetchone()
+                return int(row[0] or 0), int(row[1] or since)
+        except Exception:
+            return 0, since
+
+    def _maybe_roll_encounters(self) -> None:
+        """For every new request that landed since the last poll, give
+        encounter.maybe_spawn() a chance to spawn. The spawn logic itself
+        guards on cooldown + pending status + 3% probability, so calling it
+        once per new request honours the per-call probability semantics."""
+        n_new, max_id = self._query_new_request_count(self._last_seen_request_id)
+        if n_new <= 0:
+            return
+        self._last_seen_request_id = max_id
+        try:
+            from tokenmon import encounter
+        except Exception:
+            log.exception("encounter import failed")
+            return
+        for _ in range(n_new):
+            try:
+                spawned = encounter.maybe_spawn()
+            except Exception:
+                log.exception("maybe_spawn failed")
+                spawned = None
+            if spawned is not None:
+                try:
+                    rumps.notification(
+                        title="Tokenmon",
+                        subtitle="A wild Pokemon appeared!",
+                        message="Click the menubar to investigate.",
+                    )
+                except Exception:
+                    log.exception("encounter notification failed")
+                break  # only one pending encounter at a time
+
     def _compute_current_level(self) -> int:
         try:
-            xp = query_xp_for_date(date.today(), TZ)
+            active = box.get_active_pokemon()
+            if active is not None:
+                xp = query_xp_for_pokemon(active.id)
+            else:
+                xp = query_xp_for_date(date.today(), TZ)
         except Exception:
             return 1
         rate = pokemon.growth_rate_of(self._line_base_id)
@@ -385,27 +467,37 @@ class TokenmonApp(rumps.App):
         if btn is None:
             return
         try:
-            xp = query_xp_for_date(date.today(), TZ)
+            active = box.get_active_pokemon()
+            if active is not None:
+                xp = query_xp_for_pokemon(active.id)
+            else:
+                xp = query_xp_for_date(date.today(), TZ)
         except Exception:
             xp = 0
         rate = pokemon.growth_rate_of(self._line_base_id)
         level, into, needed = pokemon.level_from_xp(xp, rate)
         name = pokemon.name_of(self._pokemon_dex_id)
         if level >= pokemon.MAX_LEVEL:
-            tooltip = f"{name} — Lv MAX • {xp:,} XP today"
+            tooltip = f"{name} — Lv MAX • {xp:,} XP"
         else:
             tooltip = f"{name} — Lv {level} • {into:,}/{needed:,} XP"
         btn.setToolTip_(tooltip)
 
-    def _stop_animator(self) -> None:
+    def _stop_animator(self, *, clear_image: bool = True) -> None:
         if self._animator is not None:
             self._animator.stop()
             self._animator = None
-        self._set_menubar_image(None)
+        if clear_image:
+            self._set_menubar_image(None)
 
     def _start_animator(self) -> None:
-        self._stop_animator()
+        # Don't blank the button while we're swapping animators — the new
+        # animator's first frame paints synchronously when its init runs, and
+        # any None state in between would cause the status-bar button to
+        # collapse to its empty width and shift the open popover.
+        self._stop_animator(clear_image=False)
         if not self._show_pokemon or self._pokemon_sprite is None or not self._pokemon_sprite.exists():
+            self._set_menubar_image(None)
             return
         try:
             anim = SpriteAnimator.alloc().initWithGifPath_setter_(
@@ -426,18 +518,21 @@ class TokenmonApp(rumps.App):
     def _maybe_repick_for_new_day(self) -> None:
         today = date.today()
         if today != self._pokemon_picked_for:
+            # Day rolled over — make sure today's daily-catch row exists, but
+            # the menubar icon follows the user's ACTIVE Pokemon (which may
+            # be a different species they pinned previously).
             try:
-                today_row = box.ensure_today_pokemon()
-                self._line_base_id = today_row.species_dex_id
+                box.ensure_today_pokemon()
+                active = box.get_active_pokemon()
+                self._line_base_id = (
+                    active.species_dex_id if active is not None
+                    else pokemon.pick_for_today(today)
+                )
             except Exception:
-                log.exception("ensure_today_pokemon failed; falling back")
+                log.exception("day-rollover state refresh failed")
                 self._line_base_id = pokemon.pick_for_today(today)
             self._pokemon_picked_for = today
-            try:
-                xp = query_xp_for_date(today, TZ)
-            except Exception:
-                xp = 0
-            self._pokemon_dex_id = pokemon.current_stage_of(self._line_base_id, xp)
+            self._pokemon_dex_id = self._line_base_id
             self._pokemon_sprite = pokemon.ensure_sprite(self._pokemon_dex_id)
             self._last_known_level = self._compute_current_level()
             self._sync_menubar_icon()
@@ -540,6 +635,7 @@ class TokenmonApp(rumps.App):
         now = time.monotonic()
         prev_level = self._last_known_level
         self._check_level_up(now)
+        self._maybe_roll_encounters()
         if self._last_known_level != prev_level:
             # Refresh now so the menubar title picks up the new level immediately
             # (otherwise we'd wait up to 30s for the next refresh).

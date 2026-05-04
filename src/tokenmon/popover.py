@@ -29,6 +29,7 @@ from AppKit import (
     NSEventTypeRightMouseDown,
     NSEventTypeRightMouseUp,
     NSFont,
+    NSFontAttributeName,
     NSGraphicsContext,
     NSImage,
     NSImageInterpolationNone,
@@ -42,34 +43,50 @@ from AppKit import (
     NSScrollView,
     NSTextAlignmentCenter,
     NSTextField,
+    NSTimer,
     NSView,
     NSViewController,
 )
 from Foundation import NSMakeRect, NSMakeSize, NSObject
 
-from tokenmon import config, pokemon
+from tokenmon import config, encounter, pokemon
+from tokenmon.overlay import _silhouette_image
 from tokenmon.pricing import cost_for
 from tokenmon.storage import (
+    get_pending_encounter,
     list_pokemon,
+    query_ball_counts,
     query_pokemon_xp,
     query_today,
     query_today_by_model,
     query_xp_for_date,
+    query_xp_for_pokemon,
 )
 from tokenmon.tokendex import _XPBarView
 
 log = logging.getLogger("tokenmon.popover")
 
 POPOVER_WIDTH = 480
-POPOVER_HEIGHT = 440
+POPOVER_HEIGHT = 500
 SIDEBAR_WIDTH = 60
 CONTENT_WIDTH = POPOVER_WIDTH - SIDEBAR_WIDTH
 TZ = "Europe/Berlin"
 
+# Conditional 5th slot — sentinel value so it can never collide with the
+# 0..3 indices used for the four base panes.
+PANE_ENCOUNTER = -1
 PANE_POKEMON = 0
 PANE_TOKENDEX = 1
 PANE_BOX = 2
 PANE_USAGE = 3
+
+# Pretty-print labels for ball selector buttons.
+BALL_LABELS: dict[str, str] = {
+    "pokeball": "🔴 PokeBall",
+    "greatball": "🔵 Great Ball",
+    "ultraball": "🟡 Ultra Ball",
+    "masterball": "💜 Master Ball",
+}
 
 ROW_HEIGHT = 100  # mirrors tokendex.ROW_HEIGHT
 
@@ -153,15 +170,23 @@ def _new_vc(root_view: NSView) -> NSViewController:
 
 
 class _SidebarView(NSView):
-    """Background-tinted sidebar that highlights the selected slot."""
+    """Background-tinted sidebar that highlights the selected slot.
+
+    The sidebar has a *variable* number of slots: the four base panes are
+    always present (Today / Pokedex / Box / Usage), and a 5th encounter slot
+    is prepended at the top whenever a wild encounter is pending. We track
+    the slot order as a list of ``pane_id``s so the selection-pill geometry
+    automatically adapts to whichever set of slots is currently visible.
+    """
 
     SLOT_HEIGHT = 60
 
-    def initWithFrame_selectedIndex_(self, frame, idx):  # noqa: N802
+    def initWithFrame_paneIds_selected_(self, frame, pane_ids, selected):  # noqa: N802
         self = objc.super(_SidebarView, self).initWithFrame_(frame)
         if self is None:
             return None
-        self._selected = idx
+        self._pane_ids = list(pane_ids)
+        self._selected = selected
         return self
 
     def drawRect_(self, _rect):  # noqa: N802
@@ -172,15 +197,23 @@ class _SidebarView(NSView):
         # Right edge separator.
         NSColor.separatorColor().set()
         NSBezierPath.fillRect_(NSMakeRect(bounds.size.width - 1, 0, 1, bounds.size.height))
-        # Selected-slot pill.
+        # Selected-slot pill — only drawn if the selected pane is actually a slot.
+        try:
+            slot_idx = self._pane_ids.index(self._selected)
+        except ValueError:
+            return
         slot_h = _SidebarView.SLOT_HEIGHT
-        y = bounds.size.height - (self._selected + 1) * slot_h
+        y = bounds.size.height - (slot_idx + 1) * slot_h
         rect = NSMakeRect(4, y + 4, bounds.size.width - 8, slot_h - 8)
         NSColor.controlAccentColor().colorWithAlphaComponent_(0.18).set()
         NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(rect, 6, 6).fill()
 
-    def setSelected_(self, idx):  # noqa: N802
-        self._selected = int(idx)
+    def setPaneIds_(self, pane_ids):  # noqa: N802
+        self._pane_ids = list(pane_ids)
+        self.setNeedsDisplay_(True)
+
+    def setSelected_(self, pane_id):  # noqa: N802
+        self._selected = int(pane_id)
         self.setNeedsDisplay_(True)
 
 
@@ -228,6 +261,133 @@ class _BoxBackHandler(NSObject):
         self._popover._show_pane(PANE_BOX)
 
 
+class _SetActiveHandler(NSObject):
+    """Box-detail "Set as active" button — pins the active Pokemon and re-renders."""
+
+    def initWithPopover_pokemonId_(self, popover, pokemon_id):  # noqa: N802
+        self = objc.super(_SetActiveHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        self._pokemon_id = int(pokemon_id)
+        return self
+
+    def setActiveClicked_(self, _sender):  # noqa: N802
+        try:
+            from tokenmon import box
+            box.set_active_pokemon(self._pokemon_id)
+        except Exception:
+            log.exception("set_active_pokemon failed")
+        # Order matters: update the menubar app's internal _pokemon_sprite
+        # FIRST (so the sidebar icon refresh picks up the new sprite), then
+        # the sidebar icon, then the box detail re-render. We deliberately
+        # skip app.refresh(None) — it rebuilds the menu and resets the
+        # status-bar animator, which causes a brief image-blank that shifts
+        # the popover's anchor by a few pixels. The next 5s activity_poll
+        # picks up tooltip and title changes naturally.
+        try:
+            app = self._popover._app
+            if hasattr(app, "_refresh_pokemon_state"):
+                app._refresh_pokemon_state()
+        except Exception:
+            log.exception("menubar refresh after set_active failed")
+        try:
+            self._popover._refresh_sidebar_pokemon_icon()
+        except Exception:
+            log.exception("sidebar icon refresh failed")
+        # Re-render the detail view so the button label flips.
+        self._popover._show_pane(PANE_BOX)
+
+
+# =============================================================================
+# Encounter pane click handlers
+# =============================================================================
+
+
+class _BallButtonHandler(NSObject):
+    """Per-ball-row click target — throws the ball, then either triggers a
+    catch reveal or rebuilds the encounter pane with the updated counts/hint."""
+
+    def initWithPopover_encounterId_ballType_(self, popover, encounter_id, ball_type):  # noqa: N802
+        self = objc.super(_BallButtonHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        self._encounter_id = int(encounter_id)
+        self._ball_type = str(ball_type)
+        return self
+
+    def ballClicked_(self, _sender):  # noqa: N802
+        try:
+            result = encounter.throw_ball(self._encounter_id, self._ball_type)
+        except Exception:
+            log.exception("throw_ball failed")
+            return
+        if result.get("caught"):
+            self._popover._begin_catch_reveal()
+        else:
+            # Failed throw — rebuild pane to refresh ball counts + hint.
+            self._popover._show_pane(PANE_ENCOUNTER)
+
+
+class _RunAwayHandler(NSObject):
+    """Run-away button — resolves the encounter as 'ran' and falls back to Today."""
+
+    def initWithPopover_encounterId_(self, popover, encounter_id):  # noqa: N802
+        self = objc.super(_RunAwayHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        self._encounter_id = int(encounter_id)
+        return self
+
+    def runAwayClicked_(self, _sender):  # noqa: N802
+        try:
+            encounter.run_away(self._encounter_id)
+        except Exception:
+            log.exception("run_away failed")
+        self._popover._show_pane(PANE_POKEMON)
+
+
+class _RevealTimerHandler(NSObject):
+    """Fires once after the catch-reveal hold to dismiss the encounter pane."""
+
+    def initWithPopover_(self, popover):  # noqa: N802
+        self = objc.super(_RevealTimerHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        return self
+
+    def fire_(self, _timer):  # noqa: N802
+        try:
+            self._popover._show_pane(PANE_POKEMON)
+        except Exception:
+            log.exception("reveal teardown failed")
+
+
+class _DebugSpawnHandler(NSObject):
+    """Usage-pane debug button — force-spawns an encounter or shows '(already pending)'."""
+
+    def initWithPopover_(self, popover):  # noqa: N802
+        self = objc.super(_DebugSpawnHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        return self
+
+    def spawnClicked_(self, _sender):  # noqa: N802
+        try:
+            spawned = encounter.maybe_spawn(force=True)
+        except Exception:
+            log.exception("maybe_spawn(force=True) failed")
+            return
+        if spawned is None:
+            self._popover._flash_already_pending()
+            return
+        self._popover._show_pane(PANE_ENCOUNTER)
+
+
 class TokenmonPopover(NSObject):
     """Holds the NSPopover, builds panes, owns sidebar selection state."""
 
@@ -244,11 +404,16 @@ class TokenmonPopover(NSObject):
 
         self._root = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, POPOVER_WIDTH, POPOVER_HEIGHT))
 
-        self._sidebar = _SidebarView.alloc().initWithFrame_selectedIndex_(
-            NSMakeRect(0, 0, SIDEBAR_WIDTH, POPOVER_HEIGHT), PANE_POKEMON,
+        # Sidebar starts with just the four base panes; rebuild_sidebar() is
+        # called every time the popover opens to add/remove the encounter slot.
+        self._sidebar = _SidebarView.alloc().initWithFrame_paneIds_selected_(
+            NSMakeRect(0, 0, SIDEBAR_WIDTH, POPOVER_HEIGHT),
+            [PANE_POKEMON, PANE_TOKENDEX, PANE_BOX, PANE_USAGE],
+            PANE_POKEMON,
         )
         self._sidebar_buttons: list[NSButton] = []
-        self._build_sidebar_buttons()
+        self._sidebar_pane_ids: list[int] = []
+        self._rebuild_sidebar()
         self._root.addSubview_(self._sidebar)
 
         self._content_container = NSView.alloc().initWithFrame_(
@@ -266,6 +431,17 @@ class TokenmonPopover(NSObject):
         # while the buttons that target them are alive.
         self._box_handlers: list[NSObject] = []
         self._box_back_handler: _BoxBackHandler | None = None
+        self._set_active_handler: _SetActiveHandler | None = None
+
+        # Encounter-pane handler refs.
+        self._ball_button_handlers: list[NSObject] = []
+        self._run_away_handler: _RunAwayHandler | None = None
+        self._reveal_timer_handler: _RevealTimerHandler | None = None
+        self._reveal_timer = None
+        self._pending_reveal_pokemon: dict | None = None
+        self._debug_spawn_handler: _DebugSpawnHandler | None = None
+        self._already_pending_label = None
+        self._already_pending_timer = None
 
         self._vc = _new_vc(self._root)
         self._popover.setContentViewController_(self._vc)
@@ -277,16 +453,40 @@ class TokenmonPopover(NSObject):
 
     # ---- sidebar ----
 
-    def _build_sidebar_buttons(self) -> None:
-        items = [
+    def _rebuild_sidebar(self) -> None:
+        """Rebuild the sidebar buttons based on current pending-encounter state.
+
+        Called once per popover open (and after a successful catch/run-away
+        when the encounter slot needs to disappear). Idempotent — wipes any
+        existing buttons and rebuilds from the current slot list.
+        """
+        # Wipe existing buttons.
+        for btn in self._sidebar_buttons:
+            btn.removeFromSuperview()
+        self._sidebar_buttons = []
+
+        # Determine slot list — encounter slot at top when one is pending.
+        try:
+            pending = get_pending_encounter()
+        except Exception:
+            log.exception("get_pending_encounter failed")
+            pending = None
+
+        items: list[tuple[int, str]] = []
+        if pending is not None:
+            items.append((PANE_ENCOUNTER, "⚡"))
+        items += [
             (PANE_POKEMON, "🥚"),
             (PANE_TOKENDEX, "📖"),
             (PANE_BOX, "📦"),
             (PANE_USAGE, "$"),
         ]
+        self._sidebar_pane_ids = [pane_id for pane_id, _ in items]
+        self._sidebar.setPaneIds_(self._sidebar_pane_ids)
+
         slot_h = _SidebarView.SLOT_HEIGHT
-        for idx, (pane_id, fallback) in enumerate(items):
-            y = POPOVER_HEIGHT - (idx + 1) * slot_h
+        for slot_idx, (pane_id, fallback) in enumerate(items):
+            y = POPOVER_HEIGHT - (slot_idx + 1) * slot_h
             btn = NSButton.alloc().initWithFrame_(
                 NSMakeRect(8, y + 8, SIDEBAR_WIDTH - 16, slot_h - 16)
             )
@@ -294,6 +494,7 @@ class TokenmonPopover(NSObject):
             btn.setBezelStyle_(NSBezelStyleRegularSquare)
             btn.setBordered_(False)
             btn.setFont_(NSFont.systemFontOfSize_(20))
+            # tag() is a 32-bit signed int — PANE_ENCOUNTER = -1 is fine.
             btn.setTag_(pane_id)
             btn.setTarget_(self)
             btn.setAction_(b"sidebarClicked:")
@@ -302,36 +503,61 @@ class TokenmonPopover(NSObject):
 
     def _refresh_sidebar_pokemon_icon(self) -> None:
         sprite = self._app._pokemon_sprite
-        if sprite is not None and sprite.exists():
-            img = NSImage.alloc().initWithContentsOfFile_(str(sprite))
-            if img is not None:
-                img.setSize_(NSMakeSize(36, 36))
-                btn = self._sidebar_buttons[PANE_POKEMON]
-                btn.setImage_(img)
-                btn.setTitle_("")
-                # Nearest-neighbor scaling for the small sidebar sprite too.
-                btn.setWantsLayer_(True)
-                if btn.layer() is not None:
-                    btn.layer().setMagnificationFilter_("nearest")
-                    btn.layer().setMinificationFilter_("nearest")
+        if sprite is None or not sprite.exists():
+            return
+        # Find the Today slot in the current sidebar layout (its index varies
+        # depending on whether the encounter slot is showing).
+        try:
+            slot_idx = self._sidebar_pane_ids.index(PANE_POKEMON)
+        except ValueError:
+            return
+        if slot_idx >= len(self._sidebar_buttons):
+            return
+        img = NSImage.alloc().initWithContentsOfFile_(str(sprite))
+        if img is None:
+            return
+        img.setSize_(NSMakeSize(36, 36))
+        btn = self._sidebar_buttons[slot_idx]
+        btn.setImage_(img)
+        btn.setTitle_("")
+        # Nearest-neighbor scaling for the small sidebar sprite too.
+        btn.setWantsLayer_(True)
+        if btn.layer() is not None:
+            btn.layer().setMagnificationFilter_("nearest")
+            btn.layer().setMinificationFilter_("nearest")
 
     def sidebarClicked_(self, sender):  # noqa: N802
         idx = int(sender.tag())
         if idx == self._current_pane and self._current_pane_view is not None:
             return
-        self._current_pane = idx
-        self._sidebar.setSelected_(idx)
         self._show_pane(idx)
 
     # ---- panes ----
 
     def _show_pane(self, idx: int) -> None:
-        # Reset animation tracking + box click handlers — new pane gets fresh lists.
+        # Reset per-pane handler refs — new pane gets fresh lists.
         self._animated_image_views = []
         self._box_handlers = []
         self._box_back_handler = None
+        self._set_active_handler = None
+        self._ball_button_handlers = []
+        self._run_away_handler = None
+        # Cancel any pending reveal timer if we're transitioning panes manually.
+        if self._reveal_timer is not None:
+            try:
+                self._reveal_timer.invalidate()
+            except Exception:
+                pass
+            self._reveal_timer = None
+        self._reveal_timer_handler = None
+        # _pending_reveal_pokemon is set by _begin_catch_reveal and consumed
+        # only on the very next pane render — clear it here so e.g. switching
+        # to Box and back doesn't accidentally re-show the reveal.
+        self._pending_reveal_pokemon = None
         try:
-            if idx == PANE_POKEMON:
+            if idx == PANE_ENCOUNTER:
+                view = self._build_pane_encounter()
+            elif idx == PANE_POKEMON:
                 view = self._build_pane_pokemon()
             elif idx == PANE_TOKENDEX:
                 view = self._build_pane_tokendex()
@@ -349,9 +575,267 @@ class TokenmonPopover(NSObject):
         view.setFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
         self._content_container.addSubview_(view)
         self._current_pane_view = view
+        self._current_pane = idx
+        # Rebuild sidebar in case the encounter just resolved (slot disappears)
+        # or a new one just spawned (slot appears).
+        self._rebuild_sidebar()
+        self._refresh_sidebar_pokemon_icon()
+        self._sidebar.setSelected_(idx)
 
     # =========================================================================
-    # Pane: Today (today's caught Pokemon detail)
+    # Pane: Encounter (silhouette + ball selector + hints + catch reveal)
+    # =========================================================================
+
+    def _build_pane_encounter(self) -> NSView:
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
+
+        # If somehow we render this pane with no pending encounter, show a
+        # graceful fallback rather than crashing.
+        try:
+            enc = get_pending_encounter()
+        except Exception:
+            log.exception("get_pending_encounter failed")
+            enc = None
+
+        if enc is None:
+            view.addSubview_(_label(
+                NSMakeRect(16, POPOVER_HEIGHT // 2 - 10, CONTENT_WIDTH - 32, 20),
+                "Kein wildes Pokemon mehr — schon resolved.",
+                color=NSColor.secondaryLabelColor(),
+                align=NSTextAlignmentCenter,
+            ))
+            return view
+
+        # --- Header ---
+        header_y = POPOVER_HEIGHT - 40
+        view.addSubview_(_label(
+            NSMakeRect(16, header_y, CONTENT_WIDTH - 32, 22),
+            "A wild Pokemon appeared!",
+            font=NSFont.boldSystemFontOfSize_(15),
+            align=NSTextAlignmentCenter,
+        ))
+
+        # --- Silhouette sprite ---
+        sprite_size = 144
+        sprite_x = (CONTENT_WIDTH - sprite_size) // 2
+        sprite_y = header_y - sprite_size - 8
+        iv = _crisp_image_view(NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size))
+        sp = pokemon.ensure_sprite(enc.species_dex_id)
+        if sp is not None and sp.exists():
+            base = NSImage.alloc().initWithContentsOfFile_(str(sp))
+            if base is not None:
+                sil = _silhouette_image(base, NSColor.whiteColor())
+                iv.setImage_(sil)
+                iv.setAnimates_(True)
+        view.addSubview_(iv)
+        self._animated_image_views.append(iv)
+
+        # --- Level + Type stub ---
+        info_y = sprite_y - 24
+        view.addSubview_(_label(
+            NSMakeRect(0, info_y, CONTENT_WIDTH, 18),
+            f"Level: ~{enc.level}        Type: ???",
+            font=NSFont.systemFontOfSize_(12),
+            color=NSColor.secondaryLabelColor(),
+            align=NSTextAlignmentCenter,
+        ))
+
+        # --- Last hint (italic, only if present) ---
+        hint_y = info_y - 22
+        if enc.last_hint:
+            hint_label = _label(
+                NSMakeRect(16, hint_y, CONTENT_WIDTH - 32, 16),
+                enc.last_hint,
+                font=NSFont.systemFontOfSize_(11),
+                color=NSColor.secondaryLabelColor(),
+                align=NSTextAlignmentCenter,
+            )
+            # Italicise the hint via NSAttributedString.
+            try:
+                from Foundation import NSAttributedString
+                italic = NSFont.fontWithName_size_("HelveticaNeue-Italic", 11)
+                if italic is None:
+                    italic = NSFont.systemFontOfSize_(11)
+                attrs = {NSFontAttributeName: italic}
+                hint_label.setAttributedStringValue_(
+                    NSAttributedString.alloc().initWithString_attributes_(
+                        enc.last_hint, attrs
+                    )
+                )
+                hint_label.setTextColor_(NSColor.secondaryLabelColor())
+                hint_label.setAlignment_(NSTextAlignmentCenter)
+            except Exception:
+                pass  # plain text is fine as a fallback
+            view.addSubview_(hint_label)
+        else:
+            hint_y = info_y  # no gap if no hint
+
+        # --- Separator ---
+        sep1_y = hint_y - 8
+        sep1 = NSView.alloc().initWithFrame_(NSMakeRect(16, sep1_y, CONTENT_WIDTH - 32, 1))
+        sep1.setWantsLayer_(True)
+        sep1.layer().setBackgroundColor_(NSColor.separatorColor().CGColor())
+        view.addSubview_(sep1)
+
+        # --- Ball rows ---
+        try:
+            counts = query_ball_counts()
+        except Exception:
+            log.exception("query_ball_counts failed")
+            counts = {b: 0 for b in encounter.BALL_TYPES}
+
+        row_h = 28
+        rows_top = sep1_y - 8
+        for i, ball_type in enumerate(encounter.BALL_TYPES):
+            count = int(counts.get(ball_type, 0))
+            prob = encounter.catch_probability(enc.catch_rate, ball_type)
+            label_text = BALL_LABELS.get(ball_type, ball_type)
+            if count <= 0:
+                row_text = f"{label_text}    × 0    — (out)"
+            else:
+                row_text = f"{label_text}    × {count}    ~{int(round(prob * 100))}%"
+            y = rows_top - (i + 1) * row_h
+            btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(16, y, CONTENT_WIDTH - 32, row_h - 4)
+            )
+            btn.setTitle_(row_text)
+            btn.setBezelStyle_(1)  # NSBezelStyleRounded
+            btn.setEnabled_(count > 0)
+            handler = _BallButtonHandler.alloc().initWithPopover_encounterId_ballType_(
+                self, enc.id, ball_type,
+            )
+            self._ball_button_handlers.append(handler)
+            btn.setTarget_(handler)
+            btn.setAction_(b"ballClicked:")
+            view.addSubview_(btn)
+
+        # --- Separator + Run away ---
+        sep2_y = rows_top - len(encounter.BALL_TYPES) * row_h - 8
+        sep2 = NSView.alloc().initWithFrame_(NSMakeRect(16, sep2_y, CONTENT_WIDTH - 32, 1))
+        sep2.setWantsLayer_(True)
+        sep2.layer().setBackgroundColor_(NSColor.separatorColor().CGColor())
+        view.addSubview_(sep2)
+
+        run_btn_w = 140
+        run_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect((CONTENT_WIDTH - run_btn_w) // 2, sep2_y - 36, run_btn_w, 28)
+        )
+        run_btn.setTitle_("Run away")
+        run_btn.setBezelStyle_(1)
+        self._run_away_handler = _RunAwayHandler.alloc().initWithPopover_encounterId_(
+            self, enc.id,
+        )
+        run_btn.setTarget_(self._run_away_handler)
+        run_btn.setAction_(b"runAwayClicked:")
+        view.addSubview_(run_btn)
+
+        return view
+
+    # --- Encounter pane: catch reveal animation ---
+
+    def _begin_catch_reveal(self) -> None:
+        """Trigger the cross-fade reveal: fetch the just-resolved encounter
+        (which has ``resolved='caught'`` and ``pokemon_id`` set), stash it,
+        rebuild the encounter pane (which now switches into reveal mode), and
+        schedule a 2.5s timer to dismiss to the Today pane.
+        """
+        # The catch already mutated state — get_pending_encounter() now returns
+        # None. Pull the most recent caught encounter from the DB to find which
+        # species was just caught.
+        from tokenmon.storage import _connect
+        try:
+            with _connect() as conn:
+                row = conn.execute(
+                    "SELECT species_dex_id, pokemon_id "
+                    "FROM encounters "
+                    "WHERE resolved = 'caught' "
+                    "ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+        except Exception:
+            log.exception("query last-caught encounter failed")
+            row = None
+
+        if row is None:
+            # Defensive — shouldn't happen, but if it does just bail to Today.
+            self._show_pane(PANE_POKEMON)
+            return
+
+        self._pending_reveal_pokemon = {
+            "species_dex_id": int(row[0]),
+            "pokemon_id": int(row[1]) if row[1] is not None else None,
+        }
+        # Rebuild pane in reveal mode. Keep _current_pane = PANE_ENCOUNTER but
+        # replace the view; we don't go through _show_pane() because that would
+        # rebuild the sidebar (which would drop the encounter slot since the
+        # encounter is now resolved) — we want the slot to stick around for the
+        # 2.5s reveal hold.
+        view = self._build_pane_encounter_reveal(self._pending_reveal_pokemon)
+        if self._current_pane_view is not None:
+            self._current_pane_view.removeFromSuperview()
+        view.setFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
+        self._content_container.addSubview_(view)
+        self._current_pane_view = view
+
+        # Schedule the dismiss timer.
+        self._reveal_timer_handler = _RevealTimerHandler.alloc().initWithPopover_(self)
+        self._reveal_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                2.5, self._reveal_timer_handler, b"fire:", None, False,
+            )
+        )
+
+    def _build_pane_encounter_reveal(self, payload: dict) -> NSView:
+        """Reveal layout: real animated sprite + 'caught!' banner. Used both
+        when the reveal first kicks off and during the 2.5s hold."""
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
+
+        species_dex_id = int(payload["species_dex_id"])
+        species_name = pokemon.name_of(species_dex_id)
+
+        # Banner.
+        banner_y = POPOVER_HEIGHT - 50
+        view.addSubview_(_label(
+            NSMakeRect(16, banner_y, CONTENT_WIDTH - 32, 24),
+            "Pokemon was caught!",
+            font=NSFont.boldSystemFontOfSize_(16),
+            align=NSTextAlignmentCenter,
+        ))
+        view.addSubview_(_label(
+            NSMakeRect(16, banner_y - 22, CONTENT_WIDTH - 32, 18),
+            f"{species_name} added to your Box.",
+            font=NSFont.systemFontOfSize_(12),
+            color=NSColor.secondaryLabelColor(),
+            align=NSTextAlignmentCenter,
+        ))
+
+        # Real (non-silhouette) sprite at the same position the silhouette had.
+        sprite_size = 144
+        sprite_x = (CONTENT_WIDTH - sprite_size) // 2
+        sprite_y = banner_y - 32 - sprite_size - 8
+        iv = _crisp_image_view(NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size))
+        sp = pokemon.ensure_sprite(species_dex_id)
+        if sp is not None and sp.exists():
+            img = NSImage.alloc().initWithContentsOfFile_(str(sp))
+            if img is not None:
+                iv.setImage_(img)
+                iv.setAnimates_(True)
+        view.addSubview_(iv)
+        self._animated_image_views.append(iv)
+
+        # Name label below sprite.
+        name_y = sprite_y - 28
+        view.addSubview_(_label(
+            NSMakeRect(0, name_y, CONTENT_WIDTH, 22),
+            f"#{species_dex_id:03d}  {species_name}",
+            font=NSFont.boldSystemFontOfSize_(15),
+            align=NSTextAlignmentCenter,
+        ))
+
+        return view
+
+    # =========================================================================
+    # Pane: Today (active Pokemon detail — defaults to today's catch but the
+    # user can pin any owned Pokemon as active via the Box detail view).
     # =========================================================================
 
     def _build_pane_pokemon(self) -> NSView:
@@ -360,16 +844,20 @@ class TokenmonPopover(NSObject):
 
         view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
 
+        # Make sure today's row exists so a fresh install isn't blank, then
+        # ask box.get_active_pokemon() — which honours config['active_pokemon_id']
+        # and falls back to today's catch.
         try:
-            row = box.ensure_today_pokemon()
+            box.ensure_today_pokemon()
+            row = box.get_active_pokemon()
         except Exception:
-            log.exception("ensure_today_pokemon failed")
+            log.exception("get_active_pokemon failed")
             row = None
 
         if row is None:
             view.addSubview_(_label(
                 NSMakeRect(16, POPOVER_HEIGHT // 2 - 10, CONTENT_WIDTH - 32, 20),
-                "Konnte heute kein Pokemon laden.",
+                "Konnte aktives Pokemon nicht laden.",
                 color=NSColor.secondaryLabelColor(),
                 align=NSTextAlignmentCenter,
             ))
@@ -377,9 +865,19 @@ class TokenmonPopover(NSObject):
 
         species = row.species_dex_id
 
+        # "Active: …" header, top of pane.
+        header_y = POPOVER_HEIGHT - 28
+        view.addSubview_(_label(
+            NSMakeRect(0, header_y, CONTENT_WIDTH, 20),
+            f"Active: {pokemon.name_of(species)}",
+            font=NSFont.boldSystemFontOfSize_(13),
+            color=NSColor.secondaryLabelColor(),
+            align=NSTextAlignmentCenter,
+        ))
+
         sprite_size = 144
         sprite_x = (CONTENT_WIDTH - sprite_size) // 2
-        sprite_y = POPOVER_HEIGHT - sprite_size - 28
+        sprite_y = header_y - sprite_size - 12
 
         iv = _crisp_image_view(NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size))
         sp = pokemon.ensure_sprite(species)
@@ -399,9 +897,9 @@ class TokenmonPopover(NSObject):
             align=NSTextAlignmentCenter,
         ))
 
-        # XP for today only (output tokens earned on today's local date).
+        # Active-Pokemon XP: tokens trained against this specific row.
         try:
-            xp = query_xp_for_date(row.caught_date, TZ)
+            xp = query_xp_for_pokemon(row.id)
         except Exception:
             xp = 0
         rate = pokemon.growth_rate_of(species)
@@ -490,14 +988,17 @@ class TokenmonPopover(NSObject):
         for p in box_rows:
             by_species.setdefault(p.species_dex_id, []).append(p)
 
-        # Per species: count + (highest_level, instance_for_sprite).
+        # Per species: count + (highest_level, instance_for_sprite). Use the
+        # per-instance trained-XP attribution (query_xp_for_pokemon) — same as
+        # everywhere else — so this view doesn't double-count tokens that
+        # were trained against a different Pokemon caught on the same day.
         species_summaries: list[dict] = []
         for species_id, instances in by_species.items():
             best_level = 0
             best_instance = instances[0]
             for inst in instances:
                 try:
-                    inst_xp = query_xp_for_date(inst.caught_date, TZ)
+                    inst_xp = query_xp_for_pokemon(inst.id)
                 except Exception:
                     inst_xp = 0
                 rate = pokemon.growth_rate_of(species_id)
@@ -739,8 +1240,9 @@ class TokenmonPopover(NSObject):
         ))
         y_cursor -= 26
 
+        # Per-Pokemon XP — tokens that were trained against THIS specific row.
         try:
-            xp = query_xp_for_date(p.caught_date, TZ)
+            xp = query_xp_for_pokemon(p.id)
         except Exception:
             xp = 0
         rate = pokemon.growth_rate_of(species)
@@ -793,6 +1295,33 @@ class TokenmonPopover(NSObject):
             font=NSFont.systemFontOfSize_(11),
             color=NSColor.tertiaryLabelColor(),
         ))
+
+        # "Set as active" / "✓ Active" button at the bottom.
+        from tokenmon import box
+        try:
+            active_id = box.get_active_pokemon_id()
+        except Exception:
+            log.exception("get_active_pokemon_id failed")
+            active_id = None
+        is_active = active_id == p.id
+
+        btn_w = 160
+        btn_x = (CONTENT_WIDTH - btn_w) // 2
+        active_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(btn_x, 16, btn_w, 28)
+        )
+        if is_active:
+            active_btn.setTitle_("✓ Active")
+            active_btn.setEnabled_(False)
+        else:
+            active_btn.setTitle_("Set as active")
+            self._set_active_handler = (
+                _SetActiveHandler.alloc().initWithPopover_pokemonId_(self, p.id)
+            )
+            active_btn.setTarget_(self._set_active_handler)
+            active_btn.setAction_(b"setActiveClicked:")
+        active_btn.setBezelStyle_(1)  # NSBezelStyleRounded
+        view.addSubview_(active_btn)
 
         return view
 
@@ -916,6 +1445,25 @@ class TokenmonPopover(NSObject):
         view.addSubview_(sw_overlay)
         y_cursor -= 26
 
+        # Debug spawn-encounter button (sits just above the Restart/Quit row).
+        spawn_btn_y = 44
+        spawn_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin_x, spawn_btn_y, 220, 24)
+        )
+        spawn_btn.setTitle_("🐛 Spawn encounter (debug)")
+        spawn_btn.setBezelStyle_(1)
+        self._debug_spawn_handler = _DebugSpawnHandler.alloc().initWithPopover_(self)
+        spawn_btn.setTarget_(self._debug_spawn_handler)
+        spawn_btn.setAction_(b"spawnClicked:")
+        view.addSubview_(spawn_btn)
+
+        # Inline label slot for "(already pending)" — created lazily in
+        # _flash_already_pending() and torn down by its NSTimer.
+        self._already_pending_label_frame = NSMakeRect(
+            margin_x + 226, spawn_btn_y + 4, CONTENT_WIDTH - margin_x - 226 - 16, 16,
+        )
+        self._already_pending_parent = view
+
         # Buttons row: Restart Proxy + Quit, anchored to bottom.
         btn_y = 12
         restart = NSButton.alloc().initWithFrame_(
@@ -937,6 +1485,55 @@ class TokenmonPopover(NSObject):
         view.addSubview_(quit_btn)
 
         return view
+
+    def _flash_already_pending(self) -> None:
+        """Show '(already pending)' next to the debug spawn button briefly."""
+        parent = getattr(self, "_already_pending_parent", None)
+        frame = getattr(self, "_already_pending_label_frame", None)
+        if parent is None or frame is None:
+            return
+        # Tear down any in-flight one first.
+        if self._already_pending_timer is not None:
+            try:
+                self._already_pending_timer.invalidate()
+            except Exception:
+                pass
+            self._already_pending_timer = None
+        if self._already_pending_label is not None:
+            self._already_pending_label.removeFromSuperview()
+            self._already_pending_label = None
+
+        lbl = _label(
+            frame,
+            "(already pending)",
+            font=NSFont.systemFontOfSize_(11),
+            color=NSColor.secondaryLabelColor(),
+        )
+        parent.addSubview_(lbl)
+        self._already_pending_label = lbl
+
+        # Reuse _RevealTimerHandler? — no, that switches panes. Inline handler.
+        class _Hider(NSObject):
+            def initWithPopover_(self_, popover):  # noqa: N802
+                self_ = objc.super(_Hider, self_).init()
+                if self_ is None:
+                    return None
+                self_._popover = popover
+                return self_
+
+            def fire_(self_, _t):  # noqa: N802
+                pop = self_._popover
+                if pop._already_pending_label is not None:
+                    pop._already_pending_label.removeFromSuperview()
+                    pop._already_pending_label = None
+                pop._already_pending_timer = None
+
+        self._already_pending_hider = _Hider.alloc().initWithPopover_(self)
+        self._already_pending_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                1.5, self._already_pending_hider, b"fire:", None, False,
+            )
+        )
 
     # ---- toggle / button actions (Usage pane) ----
 
@@ -972,6 +1569,18 @@ class TokenmonPopover(NSObject):
         if self._popover.isShown():
             self._popover.close()
             return
+        # Auto-select the encounter pane whenever one is pending and the user
+        # is currently on a base pane — covers both "first pop after spawn"
+        # and "user closed popover, encounter spawned, opens again".
+        try:
+            pending = get_pending_encounter()
+        except Exception:
+            log.exception("get_pending_encounter failed")
+            pending = None
+        if pending is not None and self._current_pane in (
+            PANE_POKEMON, PANE_TOKENDEX, PANE_BOX, PANE_USAGE,
+        ):
+            self._current_pane = PANE_ENCOUNTER
         self._refresh_sidebar_pokemon_icon()
         self._show_pane(self._current_pane)
         # Activate so the popover gets keyboard focus and macOS-managed
