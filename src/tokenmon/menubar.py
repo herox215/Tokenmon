@@ -33,7 +33,7 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSObject
 
-from tokenmon import config, pokemon, tokendex
+from tokenmon import box, config, pokemon, tokendex
 from tokenmon.menubar_sprite import SpriteAnimator
 from tokenmon.overlay import PokemonOverlay
 from tokenmon.popover import TokenmonPopover
@@ -42,9 +42,9 @@ from tokenmon.proxy import HOST, PORT
 from tokenmon.storage import (
     Totals,
     init_db,
-    query_pokemon_xp,
     query_today,
     query_today_by_model,
+    query_xp_for_date,
 )
 
 REFRESH_INTERVAL_SEC = 30
@@ -251,7 +251,18 @@ class TokenmonApp(rumps.App):
     def __init__(self) -> None:
         super().__init__(name="Tokenmon", title=f"{EGG} 0", quit_button=None)
         self._proxy_up = True
-        self._line_base_id: int = pokemon.pick_for_today()
+        # Backfill any historical days that don't have a Pokemon entry yet,
+        # then ensure today's entry exists. ensure_today_pokemon is the
+        # source of truth for "today's species" — its species_dex_id drives
+        # the menubar icon, the overlay, and level-up detection.
+        try:
+            init_db()
+            box.migrate_legacy_days()
+            today_row = box.ensure_today_pokemon()
+            self._line_base_id = today_row.species_dex_id
+        except Exception:
+            log.exception("box init failed; falling back to legacy pick")
+            self._line_base_id = pokemon.pick_for_today()
         self._pokemon_picked_for: date = date.today()
         # Current displayed dex_id (could be evolved form). Recomputed each refresh.
         self._pokemon_dex_id: int = self._line_base_id
@@ -277,13 +288,16 @@ class TokenmonApp(rumps.App):
         self.refresh(None)
 
     def _refresh_pokemon_state(self) -> None:
-        """Recompute current evolution stage based on line XP and reload sprite
-        if the displayed Pokemon has changed. When the change is an evolution
-        within the same line, fire the evolution animation."""
+        """Recompute current evolution stage based on TODAY's per-instance XP
+        and reload sprite if the displayed Pokemon has changed. Each Pokemon
+        is now an independent instance whose XP is just the day's output
+        tokens — so evolution can still happen mid-day if you generate enough
+        tokens to cross a threshold, but the next day's Pokemon starts fresh
+        in its own row."""
         try:
-            xp = query_pokemon_xp(self._line_base_id, TZ)
+            xp = query_xp_for_date(date.today(), TZ)
         except Exception:
-            log.exception("failed to query line xp")
+            log.exception("failed to query today's xp")
             xp = 0
         new_id = pokemon.current_stage_of(self._line_base_id, xp)
         if new_id == self._pokemon_dex_id:
@@ -321,7 +335,7 @@ class TokenmonApp(rumps.App):
 
     def _compute_current_level(self) -> int:
         try:
-            xp = query_pokemon_xp(self._line_base_id, TZ)
+            xp = query_xp_for_date(date.today(), TZ)
         except Exception:
             return 1
         rate = pokemon.growth_rate_of(self._line_base_id)
@@ -371,14 +385,14 @@ class TokenmonApp(rumps.App):
         if btn is None:
             return
         try:
-            xp = query_pokemon_xp(self._line_base_id, TZ)
+            xp = query_xp_for_date(date.today(), TZ)
         except Exception:
             xp = 0
         rate = pokemon.growth_rate_of(self._line_base_id)
         level, into, needed = pokemon.level_from_xp(xp, rate)
         name = pokemon.name_of(self._pokemon_dex_id)
         if level >= pokemon.MAX_LEVEL:
-            tooltip = f"{name} — Lv MAX • {xp:,} XP gesamt"
+            tooltip = f"{name} — Lv MAX • {xp:,} XP today"
         else:
             tooltip = f"{name} — Lv {level} • {into:,}/{needed:,} XP"
         btn.setToolTip_(tooltip)
@@ -412,13 +426,15 @@ class TokenmonApp(rumps.App):
     def _maybe_repick_for_new_day(self) -> None:
         today = date.today()
         if today != self._pokemon_picked_for:
-            self._line_base_id = pokemon.pick_for_today(today)
-            self._pokemon_picked_for = today
-            # Compute the correct stage for the new line up-front, otherwise
-            # _refresh_pokemon_state would treat catching-up to existing XP as a
-            # fresh evolution and fire the animation falsely.
             try:
-                xp = query_pokemon_xp(self._line_base_id, TZ)
+                today_row = box.ensure_today_pokemon()
+                self._line_base_id = today_row.species_dex_id
+            except Exception:
+                log.exception("ensure_today_pokemon failed; falling back")
+                self._line_base_id = pokemon.pick_for_today(today)
+            self._pokemon_picked_for = today
+            try:
+                xp = query_xp_for_date(today, TZ)
             except Exception:
                 xp = 0
             self._pokemon_dex_id = pokemon.current_stage_of(self._line_base_id, xp)
@@ -430,9 +446,9 @@ class TokenmonApp(rumps.App):
         dex_id = self._pokemon_dex_id
         label = f"#{dex_id:03d}  {pokemon.name_of(dex_id)}"
         try:
-            xp = query_pokemon_xp(self._line_base_id, TZ)
+            xp = query_xp_for_date(date.today(), TZ)
         except Exception:
-            log.exception("failed to compute line xp")
+            log.exception("failed to compute today's xp")
             xp = 0
         rate = pokemon.growth_rate_of(self._line_base_id)
         level, into, needed = pokemon.level_from_xp(xp, rate)

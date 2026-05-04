@@ -26,6 +26,18 @@ CREATE TABLE IF NOT EXISTS requests (
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts_utc ON requests(ts_utc);
 CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
+
+CREATE TABLE IF NOT EXISTS pokemon (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    caught_date TEXT NOT NULL,
+    species_dex_id INTEGER NOT NULL,
+    nature TEXT NOT NULL,
+    characteristic TEXT NOT NULL,
+    nickname TEXT,
+    is_shiny INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pokemon_caught_date ON pokemon(caught_date);
+CREATE INDEX IF NOT EXISTS idx_pokemon_species ON pokemon(species_dex_id);
 """
 
 
@@ -224,3 +236,137 @@ def query_pokemon_xp(
         for day, tokens in _tokens_per_local_day(tz_name, path)
         if pick_for_today(day) == dex_id
     )
+
+
+@dataclass(slots=True)
+class Pokemon:
+    id: int
+    caught_date: date
+    species_dex_id: int
+    nature: str
+    characteristic: str
+    nickname: str | None
+    is_shiny: bool
+
+
+def _row_to_pokemon(row: tuple) -> Pokemon:
+    return Pokemon(
+        id=row[0],
+        caught_date=date.fromisoformat(row[1]),
+        species_dex_id=row[2],
+        nature=row[3],
+        characteristic=row[4],
+        nickname=row[5],
+        is_shiny=bool(row[6]),
+    )
+
+
+def insert_pokemon(
+    caught_date: date,
+    species_dex_id: int,
+    nature: str,
+    characteristic: str,
+    *,
+    nickname: str | None = None,
+    is_shiny: bool = False,
+    path: Path = DB_PATH,
+) -> int:
+    """Insert a Pokemon row. Returns the new id. Idempotent on (caught_date) —
+    if a row already exists for that date, returns the existing id without
+    overwriting."""
+    caught_date_str = caught_date.isoformat()
+    with _connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO pokemon (
+                caught_date, species_dex_id, nature, characteristic,
+                nickname, is_shiny
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(caught_date) DO NOTHING
+            """,
+            (
+                caught_date_str,
+                species_dex_id,
+                nature,
+                characteristic,
+                nickname,
+                1 if is_shiny else 0,
+            ),
+        )
+        row = conn.execute(
+            "SELECT id FROM pokemon WHERE caught_date = ?",
+            (caught_date_str,),
+        ).fetchone()
+    return int(row[0])
+
+
+def get_pokemon_for_date(d: date, path: Path = DB_PATH) -> Pokemon | None:
+    with _connect(path) as conn:
+        row = conn.execute(
+            """
+            SELECT id, caught_date, species_dex_id, nature, characteristic,
+                   nickname, is_shiny
+            FROM pokemon
+            WHERE caught_date = ?
+            """,
+            (d.isoformat(),),
+        ).fetchone()
+    return _row_to_pokemon(row) if row else None
+
+
+def get_pokemon_by_id(pokemon_id: int, path: Path = DB_PATH) -> Pokemon | None:
+    with _connect(path) as conn:
+        row = conn.execute(
+            """
+            SELECT id, caught_date, species_dex_id, nature, characteristic,
+                   nickname, is_shiny
+            FROM pokemon
+            WHERE id = ?
+            """,
+            (pokemon_id,),
+        ).fetchone()
+    return _row_to_pokemon(row) if row else None
+
+
+def list_pokemon(path: Path = DB_PATH) -> list[Pokemon]:
+    """Sorted by caught_date desc (newest first)."""
+    with _connect(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, caught_date, species_dex_id, nature, characteristic,
+                   nickname, is_shiny
+            FROM pokemon
+            ORDER BY caught_date DESC
+            """
+        ).fetchall()
+    return [_row_to_pokemon(r) for r in rows]
+
+
+def _local_day_utc_bounds(d: date, tz_name: str) -> tuple[str, str]:
+    """Return (start_utc_iso, end_utc_iso) for local date `d` in `tz_name`."""
+    tz = ZoneInfo(tz_name)
+    start_local = datetime(d.year, d.month, d.day, tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    return (
+        start_local.astimezone(timezone.utc).isoformat(timespec="microseconds"),
+        end_local.astimezone(timezone.utc).isoformat(timespec="microseconds"),
+    )
+
+
+def query_xp_for_date(
+    d: date, tz_name: str = "Europe/Berlin", path: Path = DB_PATH
+) -> int:
+    """Sum of output_tokens from `requests` whose ts_utc, converted to
+    `tz_name`, falls on local date `d`. Output-tokens-only — same XP rule
+    as the rest of the codebase."""
+    start, end = _local_day_utc_bounds(d, tz_name)
+    with _connect(path) as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(output_tokens), 0)
+            FROM requests
+            WHERE ts_utc >= ? AND ts_utc < ?
+            """,
+            (start, end),
+        ).fetchone()
+    return int(row[0])

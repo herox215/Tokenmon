@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import random
 import urllib.request
 from datetime import date
 from pathlib import Path
@@ -390,3 +391,138 @@ def ensure_sprite(dex_id: int, timeout: float = 5.0) -> Path | None:
         if p.exists():
             p.unlink(missing_ok=True)
         return None
+
+
+# --- Natures & characteristics --------------------------------------------
+
+# Reference table (Bulbapedia):
+#   Hardy: neutral
+#   Lonely: +Atk -Def, spicy
+#   Brave: +Atk -Speed, spicy
+#   Adamant: +Atk -SpAtk, spicy
+#   Naughty: +Atk -SpDef, spicy
+#   Bold: +Def -Atk, sour
+#   Docile: neutral
+#   Relaxed: +Def -Speed, sour
+#   Impish: +Def -SpAtk, sour
+#   Lax: +Def -SpDef, sour
+#   Timid: +Speed -Atk, sweet
+#   Hasty: +Speed -Def, sweet
+#   Serious: neutral
+#   Jolly: +Speed -SpAtk, sweet
+#   Naive: +Speed -SpDef, sweet
+#   Modest: +SpAtk -Atk, dry
+#   Mild: +SpAtk -Def, dry
+#   Quiet: +SpAtk -Speed, dry
+#   Bashful: neutral
+#   Rash: +SpAtk -SpDef, dry
+#   Calm: +SpDef -Atk, bitter
+#   Gentle: +SpDef -Def, bitter
+#   Sassy: +SpDef -Speed, bitter
+#   Careful: +SpDef -SpAtk, bitter
+#   Quirky: neutral
+
+NATURES: list[dict] = [
+    {"name": "Hardy",   "plus_stat": None,         "minus_stat": None,         "flavor": None},
+    {"name": "Lonely",  "plus_stat": "attack",     "minus_stat": "defense",    "flavor": "spicy"},
+    {"name": "Brave",   "plus_stat": "attack",     "minus_stat": "speed",      "flavor": "spicy"},
+    {"name": "Adamant", "plus_stat": "attack",     "minus_stat": "sp_attack",  "flavor": "spicy"},
+    {"name": "Naughty", "plus_stat": "attack",     "minus_stat": "sp_defense", "flavor": "spicy"},
+    {"name": "Bold",    "plus_stat": "defense",    "minus_stat": "attack",     "flavor": "sour"},
+    {"name": "Docile",  "plus_stat": None,         "minus_stat": None,         "flavor": None},
+    {"name": "Relaxed", "plus_stat": "defense",    "minus_stat": "speed",      "flavor": "sour"},
+    {"name": "Impish",  "plus_stat": "defense",    "minus_stat": "sp_attack",  "flavor": "sour"},
+    {"name": "Lax",     "plus_stat": "defense",    "minus_stat": "sp_defense", "flavor": "sour"},
+    {"name": "Timid",   "plus_stat": "speed",      "minus_stat": "attack",     "flavor": "sweet"},
+    {"name": "Hasty",   "plus_stat": "speed",      "minus_stat": "defense",    "flavor": "sweet"},
+    {"name": "Serious", "plus_stat": None,         "minus_stat": None,         "flavor": None},
+    {"name": "Jolly",   "plus_stat": "speed",      "minus_stat": "sp_attack",  "flavor": "sweet"},
+    {"name": "Naive",   "plus_stat": "speed",      "minus_stat": "sp_defense", "flavor": "sweet"},
+    {"name": "Modest",  "plus_stat": "sp_attack",  "minus_stat": "attack",     "flavor": "dry"},
+    {"name": "Mild",    "plus_stat": "sp_attack",  "minus_stat": "defense",    "flavor": "dry"},
+    {"name": "Quiet",   "plus_stat": "sp_attack",  "minus_stat": "speed",      "flavor": "dry"},
+    {"name": "Bashful", "plus_stat": None,         "minus_stat": None,         "flavor": None},
+    {"name": "Rash",    "plus_stat": "sp_attack",  "minus_stat": "sp_defense", "flavor": "dry"},
+    {"name": "Calm",    "plus_stat": "sp_defense", "minus_stat": "attack",     "flavor": "bitter"},
+    {"name": "Gentle",  "plus_stat": "sp_defense", "minus_stat": "defense",    "flavor": "bitter"},
+    {"name": "Sassy",   "plus_stat": "sp_defense", "minus_stat": "speed",      "flavor": "bitter"},
+    {"name": "Careful", "plus_stat": "sp_defense", "minus_stat": "sp_attack",  "flavor": "bitter"},
+    {"name": "Quirky",  "plus_stat": None,         "minus_stat": None,         "flavor": None},
+]
+
+# Canonical Gen-3+ characteristic phrases (Bulbapedia). One per IV-mod-5 slot
+# across the six stats (HP, Atk, Def, Speed, SpAtk, SpDef = 30 phrases).
+CHARACTERISTICS: list[str] = [
+    "Loves to eat",
+    "Often dozes off",
+    "Often scatters things",
+    "Scatters things often",
+    "Likes to relax",
+    "Proud of its power",
+    "Likes to thrash about",
+    "A little quick tempered",
+    "Likes to fight",
+    "Quick tempered",
+    "Sturdy body",
+    "Capable of taking hits",
+    "Highly persistent",
+    "Good endurance",
+    "Good perseverance",
+    "Highly curious",
+    "Mischievous",
+    "Thoroughly cunning",
+    "Often lost in thought",
+    "Very finicky",
+    "Strong willed",
+    "Somewhat vain",
+    "Strongly defiant",
+    "Hates to lose",
+    "Somewhat stubborn",
+    "Likes to run",
+    "Alert to sounds",
+    "Impetuous and silly",
+    "Somewhat of a clown",
+    "Quick to flee",
+]
+
+
+_RNG = random.SystemRandom()
+
+
+def random_species() -> int:
+    """Uniform random pick from the gen-1 base forms."""
+    return _RNG.choice(_BASE_IDS)
+
+
+def random_nature() -> dict:
+    """Uniform random pick from NATURES."""
+    return _RNG.choice(NATURES)
+
+
+def random_characteristic() -> str:
+    """Uniform random pick from CHARACTERISTICS."""
+    return _RNG.choice(CHARACTERISTICS)
+
+
+def _seed_index(date_iso: str, salt: str, kind: str, n: int) -> int:
+    h = int(hashlib.sha256(f"{date_iso}:{salt}:{kind}".encode()).hexdigest(), 16)
+    return h % n
+
+
+def seeded_species(date_iso: str, salt: str) -> int:
+    """Deterministic species pick — same algorithm as pick_for_today, so the
+    legacy 'Magnemite day' attribution stays intact when migrating historical
+    days."""
+    seed = f"{date_iso}:{salt}".encode()
+    h = int(hashlib.sha256(seed).hexdigest(), 16)
+    return _BASE_IDS[h % len(_BASE_IDS)]
+
+
+def seeded_nature(date_iso: str, salt: str) -> dict:
+    """SHA256(date+salt+':nature') mod len(NATURES)."""
+    return NATURES[_seed_index(date_iso, salt, "nature", len(NATURES))]
+
+
+def seeded_characteristic(date_iso: str, salt: str) -> str:
+    """SHA256(date+salt+':characteristic') mod len(CHARACTERISTICS)."""
+    return CHARACTERISTICS[_seed_index(date_iso, salt, "characteristic", len(CHARACTERISTICS))]
