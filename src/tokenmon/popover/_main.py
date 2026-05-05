@@ -644,11 +644,12 @@ def _sf_symbol(name: str) -> NSImage | None:
     if img is None:
         return None
     try:
-        # NSImageSymbolWeight: 3 = Light, 4 = Regular, 5 = Medium.
-        # 4 (Regular) is the right "match the surrounding label-weight
-        # text" target — the previous 5 looked oversized/bold.
+        # NSImageSymbolWeight: 2 = Thin, 3 = Light, 4 = Regular.
+        # Sidebar icons read best at Thin — they're decorative chrome
+        # rather than primary content, so the lighter stroke matches the
+        # popover's calm, low-contrast aesthetic.
         config = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
-            float(_SIDEBAR_SYMBOL_POINT_SIZE), 4,
+            float(_SIDEBAR_SYMBOL_POINT_SIZE), 2,
         )
         sized = img.imageWithSymbolConfiguration_(config)
         if sized is not None:
@@ -780,16 +781,18 @@ class TokenmonPopover(NSObject):
             log.exception("get_pending_encounter failed")
             pending = None
 
-        # Each entry: (pane_id, sf_symbol_name_or_None, emoji_fallback)
+        # Each entry: (pane_id, sf_symbol_name_or_None, emoji_fallback).
+        # Outline variants (no .fill) at Thin weight = the light, airy
+        # look you see in macOS sidebars.
         slots: list[tuple[int, str | None, str]] = []
         if pending is not None:
-            slots.append((PANE_ENCOUNTER, "exclamationmark.triangle.fill", "⚡"))
+            slots.append((PANE_ENCOUNTER, "exclamationmark.triangle", "⚡"))
         slots += [
-            (PANE_POKEMON, None,                  "🥚"),  # overwritten by sprite
-            (PANE_TOKENDEX, "book.closed.fill",   "📖"),
-            (PANE_BOX,      "archivebox.fill",    "📦"),
-            (PANE_ITEMS,    "bag.fill",           "🎒"),
-            (PANE_USAGE,    "chart.bar.fill",     "$"),
+            (PANE_POKEMON, None,                "🥚"),  # overwritten by sprite
+            (PANE_TOKENDEX, "book.closed",      "📖"),
+            (PANE_BOX,      "archivebox",       "📦"),
+            (PANE_ITEMS,    "bag",              "🎒"),
+            (PANE_USAGE,    "chart.bar",        "$"),
         ]
         self._sidebar_pane_ids = [pane_id for pane_id, *_ in slots]
         self._sidebar.setPaneIds_(self._sidebar_pane_ids)
