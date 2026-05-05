@@ -761,10 +761,91 @@ class TokenmonApp(rumps.App):
             pass
 
 
+def _acquire_singleton_lock(restart: bool = False):
+    """Hold an exclusive flock on ~/.tokenmon/menubar.lock for the lifetime
+    of the process. Returns the open lockfile (caller must keep the ref to
+    keep the lock alive).
+
+    If another instance already holds the lock:
+      - ``restart=True``: read the PID from the file, SIGTERM it, retry.
+      - otherwise: print a message and exit non-zero so launchd / shells
+        bubble the failure up.
+    """
+    import fcntl
+    import os
+    import signal
+    import sys
+
+    from tokenmon.storage import DB_DIR
+
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = DB_DIR / "menubar.lock"
+    f = open(lock_path, "a+")  # noqa: SIM115 — kept for process lifetime
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # Another instance holds the lock. Read its PID for the message
+        # (and for --restart's SIGTERM target).
+        try:
+            f.seek(0)
+            other_pid = int(f.read().strip() or "0")
+        except (ValueError, OSError):
+            other_pid = 0
+        if not restart:
+            print(
+                f"tokenmon-menubar already running (PID {other_pid or '?'}). "
+                f"Pass --restart to replace it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # --restart: politely terminate the other instance and retry.
+        if other_pid > 0:
+            try:
+                os.kill(other_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            # Wait up to 5 s for it to release the lock.
+            for _ in range(50):
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(0.1)
+            else:
+                print(
+                    f"tokenmon-menubar PID {other_pid} did not exit; aborting.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+    # We hold the lock. Stamp our PID for future --restart calls.
+    f.seek(0)
+    f.truncate()
+    f.write(f"{os.getpid()}\n")
+    f.flush()
+    return f
+
+
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(prog="tokenmon-menubar")
+    parser.add_argument(
+        "--restart", action="store_true",
+        help="If another instance is running, terminate it and take over.",
+    )
+    args = parser.parse_args()
+
+    # Hold the lock for the process lifetime — assigning it to a module-
+    # level slot keeps the ref alive past main() (we never return from
+    # rumps.run() until the app quits anyway, but defensive).
+    global _SINGLETON_LOCK
+    _SINGLETON_LOCK = _acquire_singleton_lock(restart=args.restart)
+
     init_db()
     items_remote.prefetch_in_background(list(items.ITEMS.values()))
     TokenmonApp().run()
+
+
+_SINGLETON_LOCK = None
 
 
 if __name__ == "__main__":

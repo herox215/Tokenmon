@@ -112,6 +112,29 @@ class _CatchAnimationHandler(NSObject):
         self._scheduleNext()
 
 
+# --- Drop-claim animation ------------------------------------------------
+
+
+def build_claim_steps(
+    ordered: list[tuple[str, int]],
+) -> list[tuple[float, str]]:
+    """Stagger: each item drops over 3 frames; next item starts after a
+    short delay; final hold then auto-claim.
+
+    Pure — extracted from ``TokenmonPopover._build_claim_steps`` so the
+    Items-pane controller can build its tape without instance state.
+    """
+    steps: list[tuple[float, str]] = []
+    for i, _ in enumerate(ordered):
+        steps.extend([
+            (0.10, f"drop_{i}_1"),
+            (0.06, f"drop_{i}_2"),
+            (0.06, f"drop_{i}_3"),
+        ])
+    steps.append((0.80, "done"))
+    return steps
+
+
 # --- Pat animation -------------------------------------------------------
 
 PAT_HOP_PX = 10
@@ -179,5 +202,72 @@ class _PatHandler(NSObject):
                 self._popover._end_pat()
             except Exception:
                 log.exception("pat teardown failed")
+            return
+        self._scheduleNext()
+
+
+# --- Reveal timer + claim-animation runner -------------------------------
+
+
+class _RevealTimerHandler(NSObject):
+    """Fires once after the catch-reveal hold to dismiss the encounter pane."""
+
+    def initWithPopover_(self, popover):  # noqa: N802
+        self = objc.super(_RevealTimerHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        return self
+
+    def fire_(self, _timer):  # noqa: N802
+        try:
+            # Late import: PANE_POKEMON lives in popover.widgets to avoid a
+            # circular import (animation -> _main).
+            from tokenmon.popover.widgets import PANE_POKEMON
+            self._popover._show_pane(PANE_POKEMON)
+        except Exception:
+            log.exception("reveal teardown failed")
+
+
+class _ClaimAnimationHandler(NSObject):
+    """NSTimer-driven step runner for the items-claim animation. Same
+    pattern as _CatchAnimationHandler / _PatHandler.
+
+    The popover knows how to interpret each (delay, action) step — this
+    object just paces them."""
+
+    def initWithPopover_steps_(self, popover, steps):  # noqa: N802
+        self = objc.super(_ClaimAnimationHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        self._steps = list(steps)
+        self._idx = 0
+        return self
+
+    def start(self):
+        self._scheduleNext()
+
+    def _scheduleNext(self):
+        if self._idx >= len(self._steps):
+            return
+        delay, _ = self._steps[self._idx]
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            max(0.001, delay), self, b"fire:", None, False,
+        )
+
+    def fire_(self, _timer):  # noqa: N802
+        if self._idx >= len(self._steps):
+            return
+        _, action = self._steps[self._idx]
+        self._idx += 1
+        try:
+            self._popover._claim_step(action)
+        except Exception:
+            log.exception("claim step %s failed", action)
+            try:
+                self._popover._end_drop_claim_animation()
+            except Exception:
+                log.exception("claim teardown failed")
             return
         self._scheduleNext()
