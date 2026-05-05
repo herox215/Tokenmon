@@ -78,7 +78,8 @@ PANE_ENCOUNTER = -1
 PANE_POKEMON = 0
 PANE_TOKENDEX = 1
 PANE_BOX = 2
-PANE_USAGE = 3
+PANE_ITEMS = 3
+PANE_USAGE = 4
 
 # Pretty-print labels for ball selector buttons.
 BALL_LABELS: dict[str, str] = {
@@ -439,7 +440,7 @@ class TokenmonPopover(NSObject):
         # called every time the popover opens to add/remove the encounter slot.
         self._sidebar = _SidebarView.alloc().initWithFrame_paneIds_selected_(
             NSMakeRect(0, 0, SIDEBAR_WIDTH, POPOVER_HEIGHT),
-            [PANE_POKEMON, PANE_TOKENDEX, PANE_BOX, PANE_USAGE],
+            [PANE_POKEMON, PANE_TOKENDEX, PANE_BOX, PANE_ITEMS, PANE_USAGE],
             PANE_POKEMON,
         )
         self._sidebar_buttons: list[NSButton] = []
@@ -513,6 +514,7 @@ class TokenmonPopover(NSObject):
             (PANE_POKEMON, "🥚"),
             (PANE_TOKENDEX, "📖"),
             (PANE_BOX, "📦"),
+            (PANE_ITEMS, "🎒"),
             (PANE_USAGE, "$"),
         ]
         self._sidebar_pane_ids = [pane_id for pane_id, _ in items]
@@ -599,6 +601,8 @@ class TokenmonPopover(NSObject):
                 view = self._build_pane_tokendex()
             elif idx == PANE_BOX:
                 view = self._build_pane_box()
+            elif idx == PANE_ITEMS:
+                view = self._build_pane_items()
             elif idx == PANE_USAGE:
                 view = self._build_pane_usage()
             else:
@@ -1466,6 +1470,107 @@ class TokenmonPopover(NSObject):
     # =========================================================================
     # Pane: Usage
     # =========================================================================
+
+    # =========================================================================
+    # Pane: Items (PokeBall inventory + earn rates)
+    # =========================================================================
+
+    _ITEM_DEFS: list[tuple[str, str, str, str, int]] = [
+        # (key, emoji, display name, description, threshold-per-ball)
+        ("pokeball",   "🔴", "Poké Ball",   "Standard ball — works best on common Pokémon.",                1_000),
+        ("greatball",  "🔵", "Great Ball",  "1.5× catch rate — better odds against tougher Pokémon.",     10_000),
+        ("ultraball",  "🟡", "Ultra Ball",  "2× catch rate — for the rare ones.",                         50_000),
+        ("masterball", "💜", "Master Ball", "Catches anything, no questions asked. Save it for Mewtwo.", 500_000),
+    ]
+
+    def _build_pane_items(self) -> NSView:
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
+
+        # Header.
+        view.addSubview_(_label(
+            NSMakeRect(16, POPOVER_HEIGHT - 32, CONTENT_WIDTH - 32, 22),
+            "Items",
+            font=NSFont.boldSystemFontOfSize_(15),
+        ))
+
+        try:
+            counts = query_ball_counts()
+        except Exception:
+            log.exception("query_ball_counts failed")
+            counts = {}
+
+        # Per-item rows.
+        y_cursor = POPOVER_HEIGHT - 50
+        for key, emoji, name, description, threshold in self._ITEM_DEFS:
+            count = int(counts.get(key, 0) or 0)
+            row_h = 56
+
+            # Emoji on the left.
+            view.addSubview_(_label(
+                NSMakeRect(16, y_cursor - row_h + 14, 36, 30),
+                emoji,
+                font=NSFont.systemFontOfSize_(24),
+                align=NSTextAlignmentCenter,
+            ))
+
+            # Name + count on the same row.
+            text_x = 60
+            text_w = CONTENT_WIDTH - text_x - 20
+            count_text = f"× {count}"
+            count_color = (
+                NSColor.tertiaryLabelColor() if count == 0
+                else NSColor.labelColor()
+            )
+            # Name (left), count (right).
+            name_field = _label(
+                NSMakeRect(text_x, y_cursor - 22, text_w - 50, 18),
+                name,
+                font=NSFont.boldSystemFontOfSize_(13),
+            )
+            view.addSubview_(name_field)
+            count_field = _label(
+                NSMakeRect(CONTENT_WIDTH - 80, y_cursor - 22, 64, 18),
+                count_text,
+                font=NSFont.boldSystemFontOfSize_(13),
+                color=count_color,
+                align=2,  # NSTextAlignmentRight
+            )
+            view.addSubview_(count_field)
+
+            # Description below.
+            desc_field = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(text_x, y_cursor - row_h + 4, text_w, 32)
+            )
+            desc_field.setStringValue_(description)
+            desc_field.setBezeled_(False)
+            desc_field.setDrawsBackground_(False)
+            desc_field.setEditable_(False)
+            desc_field.setSelectable_(False)
+            desc_field.setFont_(NSFont.systemFontOfSize_(11))
+            desc_field.setTextColor_(NSColor.secondaryLabelColor())
+            desc_field.setLineBreakMode_(0)  # word-wrapping
+            try:
+                desc_field.cell().setWraps_(True)
+            except Exception:
+                pass
+            view.addSubview_(desc_field)
+
+            y_cursor -= row_h + 4
+
+        # Footer hint about earn rates.
+        footer_y = 16
+        rates_lines = "  ·  ".join(
+            f"{e} 1 / {t:,}" for _, e, _, _, t in self._ITEM_DEFS
+        )
+        view.addSubview_(_label(
+            NSMakeRect(16, footer_y, CONTENT_WIDTH - 32, 14),
+            f"Earned per output token:  {rates_lines}",
+            font=NSFont.systemFontOfSize_(10),
+            color=NSColor.tertiaryLabelColor(),
+            align=NSTextAlignmentCenter,
+        ))
+
+        return view
 
     def _build_pane_usage(self) -> NSView:
         view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
