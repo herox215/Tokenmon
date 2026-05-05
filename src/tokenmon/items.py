@@ -24,6 +24,7 @@ class Item:
     threshold: int
     cap: int = 99
     actions: tuple[str, ...] = ()
+    sprite_name: str | None = None
 
 
 ITEMS: dict[str, Item] = {
@@ -34,6 +35,7 @@ ITEMS: dict[str, Item] = {
         description="Standard ball — works best on common Pokémon.",
         threshold=1_000,
         actions=("throw",),
+        sprite_name="poke-ball",
     ),
     "greatball": Item(
         key="greatball",
@@ -42,6 +44,7 @@ ITEMS: dict[str, Item] = {
         description="1.5× catch rate — better odds against tougher Pokémon.",
         threshold=10_000,
         actions=("throw",),
+        sprite_name="great-ball",
     ),
     "ultraball": Item(
         key="ultraball",
@@ -50,6 +53,7 @@ ITEMS: dict[str, Item] = {
         description="2× catch rate — for the rare ones.",
         threshold=50_000,
         actions=("throw",),
+        sprite_name="ultra-ball",
     ),
     "masterball": Item(
         key="masterball",
@@ -58,6 +62,7 @@ ITEMS: dict[str, Item] = {
         description="Catches anything, no questions asked. Save it for Mewtwo.",
         threshold=500_000,
         actions=("throw",),
+        sprite_name="master-ball",
     ),
 }
 

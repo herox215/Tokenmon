@@ -33,7 +33,7 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSObject
 
-from tokenmon import box, config, pokemon, tokendex
+from tokenmon import box, config, items, items_remote, pokemon, tokendex
 from tokenmon.menubar_sprite import SpriteAnimator
 from tokenmon.overlay import PokemonOverlay
 from tokenmon.popover import TokenmonPopover
@@ -702,6 +702,7 @@ class TokenmonApp(rumps.App):
 
 def main() -> None:
     init_db()
+    items_remote.prefetch_in_background(list(items.ITEMS.values()))
     TokenmonApp().run()
 
 

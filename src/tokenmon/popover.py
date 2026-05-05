@@ -33,6 +33,7 @@ from AppKit import (
     NSGraphicsContext,
     NSImage,
     NSImageInterpolationNone,
+    NSImageLeft,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
     NSMenu,
@@ -49,7 +50,7 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSMakeSize, NSObject
 
-from tokenmon import config, encounter, items, pokemon
+from tokenmon import config, encounter, items, items_remote, pokemon
 from tokenmon.overlay import _silhouette_image
 from tokenmon.pricing import cost_for
 from tokenmon.storage import (
@@ -428,16 +429,35 @@ class _ItemRowHandler(NSObject):
         """Same dispatch path used by both the menu (multi-action items) and
         the direct-execute shortcut for single-action items."""
         if action == "throw":
+            # Snapshot the encounter's species before resolving the throw —
+            # use_item will mutate it to resolved on a catch and the silhouette
+            # we want to show during the animation needs the dex_id from the
+            # *unresolved* row.
+            try:
+                pending = get_pending_encounter()
+            except Exception:
+                log.exception("get_pending_encounter failed")
+                return
+            if pending is None or pending.id != self._encounter_id:
+                return
+            species_dex_id = int(pending.species_dex_id)
             try:
                 result = encounter.use_item(self._encounter_id, self._item_key)
             except Exception:
                 log.exception("use_item(throw) failed")
                 return
-            if result.get("caught"):
-                self._popover._encounter_bag_open = False
-                self._popover._begin_catch_reveal()
-            else:
-                self._popover._show_pane(PANE_ENCOUNTER)
+            # Drop bag-open state so the post-animation outcome lands cleanly:
+            # success → reveal pane (sidebar refreshes), failure → we re-set
+            # bag-open inside _end_catch_animation before re-rendering.
+            self._popover._encounter_bag_open = False
+            self._popover._begin_catch_animation(
+                item_key=self._item_key,
+                encounter_id=self._encounter_id,
+                species_dex_id=species_dex_id,
+                caught=bool(result.get("caught")),
+                shakes=int(result.get("shakes", 0)),
+                hint=result.get("hint"),
+            )
 
     def actionSelected_(self, sender):  # noqa: N802
         try:
@@ -505,6 +525,108 @@ class _DebugSpawnHandler(NSObject):
         self._popover._show_pane(PANE_ENCOUNTER)
 
 
+# =============================================================================
+# Catch animation — GBA-style throw → absorb → wobble → outcome
+# =============================================================================
+
+
+# Animation tunables. Wobble is implemented as a horizontal frame translation
+# (no CALayer transforms required). Total runtime ranges from ~1.5s (0 shakes,
+# instant break-out) to ~3.7s (3 shakes + click + reveal handoff).
+CATCH_BALL_SIZE = 40
+CATCH_THROW_FRAMES = 3
+CATCH_WOBBLE_DX = 14
+CATCH_REST_DROP_PX = 24
+
+
+def _build_catch_steps(caught: bool, shakes: int) -> list[tuple[float, str]]:
+    """Construct the (delay, action) tape played by _CatchAnimationHandler.
+
+    ``shakes`` is 0..3. ``caught`` only affects the outcome cap (`click` vs
+    `burst`). The total runtime scales linearly with ``shakes`` — that's the
+    whole point: a 0-shake break-out feels rapidly disappointing, a 3-shake
+    catch feels suspenseful.
+    """
+    steps: list[tuple[float, str]] = [
+        (0.00, "throw_start"),
+        (0.10, "throw_arc_1"),
+        (0.10, "throw_arc_2"),
+        (0.10, "throw_arc_3"),
+        (0.05, "absorb_flash"),
+        (0.12, "flash_end"),
+        (0.20, "ball_drop"),
+    ]
+    for k in range(int(shakes)):
+        steps.extend([
+            (0.55, f"shake_left_{k}"),
+            (0.16, f"shake_right_{k}"),
+            (0.16, f"shake_centre_{k}"),
+        ])
+    if caught:
+        steps.extend([
+            (0.55, "click"),
+            (0.10, "caught_announce"),
+            (0.25, "caught_sparkle_1"),
+            (0.18, "caught_sparkle_2"),
+            (0.18, "caught_sparkle_3"),
+            (0.18, "caught_sparkle_4"),
+            (1.20, "caught_hold"),
+            (0.30, "done"),
+        ])
+    else:
+        steps.extend([(0.55, "burst"), (0.25, "done")])
+    return steps
+
+
+class _CatchAnimationHandler(NSObject):
+    """NSTimer target that drives the catch animation step-by-step.
+
+    Mirrors :class:`tokenmon.overlay._EvolutionHandler`: a flat list of
+    ``(delay, action)`` tuples is consumed one one-shot timer at a time, with
+    the popover responsible for actually mutating views per action.
+    """
+
+    def initWithPopover_payload_(self, popover, payload):  # noqa: N802
+        self = objc.super(_CatchAnimationHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        self._payload = payload  # {caught, shakes, hint, item_key, encounter_id}
+        self._steps = _build_catch_steps(
+            bool(payload.get("caught", False)),
+            int(payload.get("shakes", 0)),
+        )
+        self._idx = 0
+        return self
+
+    def start(self):
+        self._scheduleNext()
+
+    def _scheduleNext(self):
+        if self._idx >= len(self._steps):
+            return
+        delay, _ = self._steps[self._idx]
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            max(0.001, delay), self, b"fire:", None, False,
+        )
+
+    def fire_(self, _timer):  # noqa: N802
+        if self._idx >= len(self._steps):
+            return
+        _, action = self._steps[self._idx]
+        self._idx += 1
+        try:
+            self._popover._catch_step(action, self._payload)
+        except Exception:
+            log.exception("catch step %s failed", action)
+            try:
+                self._popover._end_catch_animation(self._payload)
+            except Exception:
+                log.exception("catch animation teardown failed")
+            return
+        self._scheduleNext()
+
+
 class TokenmonPopover(NSObject):
     """Holds the NSPopover, builds panes, owns sidebar selection state."""
 
@@ -562,6 +684,17 @@ class TokenmonPopover(NSObject):
         self._reveal_timer_handler: _RevealTimerHandler | None = None
         self._reveal_timer = None
         self._pending_reveal_pokemon: dict | None = None
+        # Catch-animation state. The handler holds its own step index; we just
+        # need a strong ref so the NSTimer target survives, plus pointers to
+        # the views we mutate per step.
+        self._catch_anim_handler: _CatchAnimationHandler | None = None
+        self._catch_anim_silhouette: NSImageView | None = None
+        self._catch_anim_ball: NSImageView | None = None
+        self._catch_anim_flash: NSView | None = None
+        self._catch_anim_pane: NSView | None = None
+        self._catch_anim_geom: dict | None = None
+        self._catch_anim_header: NSTextField | None = None
+        self._catch_anim_sparkles: list[NSTextField] = []
         self._debug_spawn_handler: _DebugSpawnHandler | None = None
         self._already_pending_label = None
         self._already_pending_timer = None
@@ -687,6 +820,22 @@ class TokenmonPopover(NSObject):
         # only on the very next pane render — clear it here so e.g. switching
         # to Box and back doesn't accidentally re-show the reveal.
         self._pending_reveal_pokemon = None
+        # Drop any in-flight catch-animation refs. The handler's pending
+        # NSTimers will still fire, but _catch_step short-circuits when the
+        # views are gone, so they become no-ops.
+        self._catch_anim_handler = None
+        self._catch_anim_silhouette = None
+        self._catch_anim_ball = None
+        self._catch_anim_pane = None
+        self._catch_anim_geom = None
+        self._catch_anim_header = None
+        self._catch_anim_sparkles = []
+        if self._catch_anim_flash is not None:
+            try:
+                self._catch_anim_flash.removeFromSuperview()
+            except Exception:
+                pass
+            self._catch_anim_flash = None
         try:
             if idx == PANE_ENCOUNTER:
                 view = self._build_pane_encounter()
@@ -890,9 +1039,16 @@ class TokenmonPopover(NSObject):
                 NSMakeRect(16, y, CONTENT_WIDTH - 32, row_h - 2)
             )
             chevron = "  ›" if enabled else ""
-            btn.setTitle_(
-                f"{item.emoji}  {item.display_name}     × {count}{chevron}"
-            )
+            sprite = items_remote.get_item_image(item)
+            if sprite is not None:
+                sprite.setSize_(NSMakeSize(20, 20))
+                btn.setImage_(sprite)
+                btn.setImagePosition_(NSImageLeft)
+                btn.setTitle_(f"  {item.display_name}     × {count}{chevron}")
+            else:
+                btn.setTitle_(
+                    f"{item.emoji}  {item.display_name}     × {count}{chevron}"
+                )
             btn.setBezelStyle_(1)
             btn.setAlignment_(0)  # left
             btn.setEnabled_(enabled)
@@ -1053,6 +1209,288 @@ class TokenmonPopover(NSObject):
         ))
 
         return view
+
+    # =========================================================================
+    # Pane: Catch animation (between throw and outcome — silhouette + wobble)
+    # =========================================================================
+
+    def _begin_catch_animation(
+        self,
+        *,
+        item_key: str,
+        encounter_id: int,
+        species_dex_id: int,
+        caught: bool,
+        shakes: int,
+        hint: str | None,
+    ) -> None:
+        """Replace the encounter pane content with the animation pane and
+        start the timer-driven step sequence.
+
+        We deliberately don't call ``_show_pane`` — that would rebuild the
+        sidebar (dropping the encounter slot now that the encounter resolved
+        in the DB) and reset ``_encounter_bag_open``. We want the slot and
+        the bag-open state to persist for the duration of the animation, just
+        like the existing reveal flow at popover.py:_begin_catch_reveal.
+        """
+        payload = {
+            "item_key": item_key,
+            "encounter_id": int(encounter_id),
+            "species_dex_id": int(species_dex_id),
+            "caught": bool(caught),
+            "shakes": int(shakes),
+            "hint": hint,
+        }
+        view = self._build_pane_catch_animation(payload)
+        if self._current_pane_view is not None:
+            self._current_pane_view.removeFromSuperview()
+        view.setFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
+        self._content_container.addSubview_(view)
+        self._current_pane_view = view
+        self._catch_anim_pane = view
+
+        self._catch_anim_handler = (
+            _CatchAnimationHandler.alloc().initWithPopover_payload_(self, payload)
+        )
+        self._catch_anim_handler.start()
+
+    def _build_pane_catch_animation(self, payload: dict) -> NSView:
+        """Build the pane the catch animation runs on. Same layout as the
+        encounter default pane (header + silhouette in the same spot) so the
+        transition is seamless when the animation pane replaces it.
+        """
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
+
+        # --- Header (same look as the encounter-default pane). Kept as a ref
+        # so the catch-success step can swap it to "Gotcha!" in yellow. ---
+        header_y = POPOVER_HEIGHT - 40
+        header = _label(
+            NSMakeRect(16, header_y, CONTENT_WIDTH - 32, 22),
+            "A wild Pokemon appeared!",
+            font=NSFont.boldSystemFontOfSize_(15),
+            align=NSTextAlignmentCenter,
+        )
+        view.addSubview_(header)
+        self._catch_anim_header = header
+
+        # --- Silhouette sprite (same position as the default pane) ---
+        sprite_size = 144
+        sprite_x = (CONTENT_WIDTH - sprite_size) // 2
+        sprite_y = header_y - sprite_size - 8
+        sil_iv = _crisp_image_view(NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size))
+        species_dex_id = int(payload["species_dex_id"])
+        sp = pokemon.ensure_sprite(species_dex_id)
+        if sp is not None and sp.exists():
+            base = NSImage.alloc().initWithContentsOfFile_(str(sp))
+            if base is not None:
+                sil = _silhouette_image(base, NSColor.whiteColor())
+                sil_iv.setImage_(sil)
+                sil_iv.setAnimates_(True)
+        view.addSubview_(sil_iv)
+        self._animated_image_views.append(sil_iv)
+        self._catch_anim_silhouette = sil_iv
+
+        # --- Ball sprite — starts off-pane top-right, hidden until throw_start ---
+        ball = _crisp_image_view(NSMakeRect(
+            CONTENT_WIDTH + CATCH_BALL_SIZE,  # off-pane to the right
+            sprite_y + sprite_size,
+            CATCH_BALL_SIZE, CATCH_BALL_SIZE,
+        ))
+        item = items.get(payload["item_key"])
+        if item is not None:
+            ball_img = items_remote.get_item_image(item)
+            if ball_img is not None:
+                ball.setImage_(ball_img)
+        ball.setHidden_(True)
+        view.addSubview_(ball)
+        self._catch_anim_ball = ball
+
+        # Stash the geometry the step handler needs so it doesn't re-derive
+        # positions every frame.
+        sprite_centre_x = sprite_x + sprite_size // 2
+        sprite_centre_y = sprite_y + sprite_size // 2
+        rest_x = sprite_centre_x - CATCH_BALL_SIZE // 2
+        rest_y = sprite_y + CATCH_REST_DROP_PX  # near the bottom of the sprite area
+        absorb_x = sprite_centre_x - CATCH_BALL_SIZE // 2
+        absorb_y = sprite_centre_y - CATCH_BALL_SIZE // 2
+        # Three frames along an arc from off-pane-right + above to absorb point.
+        start_x = CONTENT_WIDTH + CATCH_BALL_SIZE
+        start_y = sprite_y + sprite_size + 40
+        arc_frames: list[tuple[int, int]] = []
+        for i in range(1, CATCH_THROW_FRAMES + 1):
+            t = i / float(CATCH_THROW_FRAMES)
+            x = int(start_x + (absorb_x - start_x) * t)
+            # Simple parabolic arc: peak roughly between start and absorb.
+            arc_y = start_y + (absorb_y - start_y) * t
+            lift = -28 * (4 * t * (1 - t))  # max −28 px at t=0.5
+            arc_frames.append((x, int(arc_y + lift)))
+        self._catch_anim_geom = {
+            "rest_x": rest_x,
+            "rest_y": rest_y,
+            "absorb_x": absorb_x,
+            "absorb_y": absorb_y,
+            "arc_frames": arc_frames,
+            "ball_size": CATCH_BALL_SIZE,
+        }
+
+        # --- Sparkles, hidden until the caught-success steps reveal them.
+        # Four glyphs scattered around the ball at rest, each at slightly
+        # different size so the burst feels less rigid.
+        sparkle_specs: list[tuple[str, int, int, int]] = [
+            ("✨", -22, CATCH_BALL_SIZE - 4, 22),
+            ("⭐", CATCH_BALL_SIZE + 4, CATCH_BALL_SIZE - 12, 18),
+            ("✨", -14, -16, 16),
+            ("⭐", CATCH_BALL_SIZE - 6, -10, 20),
+        ]
+        sparkles: list[NSTextField] = []
+        for ch, dx, dy, sz in sparkle_specs:
+            sp_label = _label(
+                NSMakeRect(rest_x + dx, rest_y + dy, sz + 8, sz + 8),
+                ch,
+                font=NSFont.systemFontOfSize_(sz),
+                align=NSTextAlignmentCenter,
+            )
+            sp_label.setHidden_(True)
+            view.addSubview_(sp_label)
+            sparkles.append(sp_label)
+        self._catch_anim_sparkles = sparkles
+
+        return view
+
+    def _catch_step(self, action: str, payload: dict) -> None:
+        """Execute one step of the catch animation. Called from
+        :class:`_CatchAnimationHandler` on the main thread."""
+        ball = self._catch_anim_ball
+        sil = self._catch_anim_silhouette
+        geom = self._catch_anim_geom or {}
+        if ball is None or sil is None or not geom:
+            # View was torn down (user navigated away). Just bail — the timer
+            # will fire its remaining steps as no-ops.
+            return
+
+        size = geom["ball_size"]
+
+        if action == "throw_start":
+            # Reveal the ball at the off-pane start. Arc frames will move it
+            # toward the silhouette over the next few steps.
+            ball.setHidden_(False)
+            return
+
+        if action.startswith("throw_arc_"):
+            idx = int(action.rsplit("_", 1)[-1]) - 1
+            arc = geom["arc_frames"]
+            if 0 <= idx < len(arc):
+                x, y = arc[idx]
+                ball.setFrame_(NSMakeRect(x, y, size, size))
+            return
+
+        if action == "absorb_flash":
+            ball.setFrame_(NSMakeRect(geom["absorb_x"], geom["absorb_y"], size, size))
+            sil.setHidden_(True)
+            self._show_catch_flash()
+            return
+
+        if action == "flash_end":
+            self._hide_catch_flash()
+            return
+
+        if action == "ball_drop":
+            ball.setFrame_(NSMakeRect(geom["rest_x"], geom["rest_y"], size, size))
+            return
+
+        if action.startswith("shake_left_"):
+            ball.setFrame_(NSMakeRect(
+                geom["rest_x"] - CATCH_WOBBLE_DX, geom["rest_y"] + 2, size, size,
+            ))
+            return
+
+        if action.startswith("shake_right_"):
+            ball.setFrame_(NSMakeRect(
+                geom["rest_x"] + CATCH_WOBBLE_DX, geom["rest_y"] + 2, size, size,
+            ))
+            return
+
+        if action.startswith("shake_centre_"):
+            ball.setFrame_(NSMakeRect(geom["rest_x"], geom["rest_y"], size, size))
+            return
+
+        if action == "click":
+            # Brief flash to mark the catch confirmation; flash_end is folded
+            # into the next step (caught_announce) which doesn't need it gone.
+            self._show_catch_flash()
+            return
+
+        if action == "caught_announce":
+            self._hide_catch_flash()
+            if self._catch_anim_header is not None:
+                self._catch_anim_header.setStringValue_("Gotcha!")
+                self._catch_anim_header.setTextColor_(
+                    NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                        1.0, 0.85, 0.0, 1.0,
+                    )
+                )
+            return
+
+        if action.startswith("caught_sparkle_"):
+            idx = int(action.rsplit("_", 1)[-1]) - 1
+            if 0 <= idx < len(self._catch_anim_sparkles):
+                self._catch_anim_sparkles[idx].setHidden_(False)
+            return
+
+        if action == "caught_hold":
+            return  # ball + sparkles + banner already on-screen; just hold
+
+        if action == "burst":
+            # Pokémon escapes — hide the ball, bring the silhouette back.
+            ball.setHidden_(True)
+            sil.setHidden_(False)
+            return
+
+        if action == "done":
+            self._end_catch_animation(payload)
+            return
+
+    def _show_catch_flash(self) -> None:
+        if self._catch_anim_pane is None or self._catch_anim_flash is not None:
+            return
+        bounds = self._catch_anim_pane.bounds()
+        flash = NSView.alloc().initWithFrame_(bounds)
+        flash.setWantsLayer_(True)
+        flash.layer().setBackgroundColor_(NSColor.whiteColor().CGColor())
+        self._catch_anim_pane.addSubview_(flash)
+        self._catch_anim_flash = flash
+
+    def _hide_catch_flash(self) -> None:
+        if self._catch_anim_flash is None:
+            return
+        try:
+            self._catch_anim_flash.removeFromSuperview()
+        except Exception:
+            log.exception("flash teardown failed")
+        self._catch_anim_flash = None
+
+    def _end_catch_animation(self, payload: dict) -> None:
+        """Final step — drop animation refs and route to the outcome pane."""
+        self._catch_anim_handler = None
+        self._catch_anim_silhouette = None
+        self._catch_anim_ball = None
+        self._catch_anim_pane = None
+        self._catch_anim_geom = None
+        self._catch_anim_header = None
+        self._catch_anim_sparkles = []
+        self._hide_catch_flash()
+
+        if payload.get("caught"):
+            # Hand off to the existing reveal flow, which schedules its own
+            # 2.5s timer and dismisses to the Today pane afterwards.
+            self._begin_catch_reveal()
+        else:
+            # Failure — return to the bag-open pane so the user can throw
+            # again. The new hint is already persisted on the encounter row
+            # by encounter._resolve_throw, so _build_pane_encounter will pick
+            # it up.
+            self._encounter_bag_open = True
+            self._show_pane(PANE_ENCOUNTER)
 
     # =========================================================================
     # Pane: Today (active Pokemon detail — defaults to today's catch but the
@@ -1679,13 +2117,22 @@ class TokenmonPopover(NSObject):
             count = int(counts.get(key, 0) or 0)
             row_h = 56
 
-            # Emoji on the left.
-            view.addSubview_(_label(
-                NSMakeRect(16, y_cursor - row_h + 14, 36, 30),
-                item.emoji,
-                font=NSFont.systemFontOfSize_(24),
-                align=NSTextAlignmentCenter,
-            ))
+            # Sprite (or emoji fallback) on the left.
+            sprite = items_remote.get_item_image(item)
+            if sprite is not None:
+                iv = NSImageView.alloc().initWithFrame_(
+                    NSMakeRect(16, y_cursor - row_h + 14, 36, 30)
+                )
+                iv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+                iv.setImage_(sprite)
+                view.addSubview_(iv)
+            else:
+                view.addSubview_(_label(
+                    NSMakeRect(16, y_cursor - row_h + 14, 36, 30),
+                    item.emoji,
+                    font=NSFont.systemFontOfSize_(24),
+                    align=NSTextAlignmentCenter,
+                ))
 
             # Name + count on the same row.
             text_x = 60

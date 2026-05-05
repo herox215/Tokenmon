@@ -187,8 +187,14 @@ def use_item(
       - any other action / no actions: raises ``ValueError`` ("item not usable
         in encounter").
 
-    Returns the same shape the legacy ``throw_ball`` returned:
-      ``{'caught': bool, 'hint': str|None, 'pokemon_id': int|None}``.
+    Returns:
+      ``{'caught': bool, 'hint': str|None, 'pokemon_id': int|None,
+         'shakes': int}``
+
+    ``shakes`` is the GBA-style wobble count (0..3) the UI should display
+    before the outcome resolves. On a catch it's always 3 (followed by the
+    "click"); on a failure it's the number of shakes survived before the ball
+    broke open.
 
     Raises ``ValueError`` if ``item_key`` is unknown or the item has no
     encounter-applicable action.
@@ -205,6 +211,12 @@ def _resolve_throw(
     encounter_id: int, item_key: str, *, path: Path = DB_PATH
 ) -> dict:
     """Resolve a single throw of ``item_key`` against the pending encounter.
+
+    Catch is sampled GBA-style: 4 independent Bernoulli checks each with
+    survival probability ``s = p ** 0.25`` so the marginal catch chance stays
+    exactly ``p``. The number of consecutive successes before the first
+    failure becomes the wobble count the UI shows (0..3); all 4 passing is a
+    catch and the UI plays 3 wobbles + "click".
 
     Side effects:
       - increments per-item usage counter on the encounter,
@@ -230,8 +242,20 @@ def _resolve_throw(
     increment_item_used(pending.id, item_key, path=path)
 
     p = catch_probability(pending.catch_rate, item_key)
-    if _RNG.random() < p:
-        # Caught — insert a Pokemon row.
+    # Per-shake survival probability. p == 0 short-circuits to s == 0 (zero
+    # shakes, immediate break-out); p == 1 short-circuits to s == 1 (always
+    # caught) — both edge cases are exact under ``** 0.25``.
+    s = p ** 0.25
+    shakes_passed = 0
+    for _ in range(4):
+        if _RNG.random() < s:
+            shakes_passed += 1
+        else:
+            break
+    caught = shakes_passed == 4
+    shakes = min(shakes_passed, 3)
+
+    if caught:
         try:
             new_pokemon_id = box.add_caught_pokemon(
                 pending.species_dex_id,
@@ -250,11 +274,21 @@ def _resolve_throw(
                 path=path,
             )
         mark_encounter_caught(pending.id, new_pokemon_id, path=path)
-        return {"caught": True, "hint": None, "pokemon_id": new_pokemon_id}
+        return {
+            "caught": True,
+            "hint": None,
+            "pokemon_id": new_pokemon_id,
+            "shakes": shakes,
+        }
 
     hint = _hint_for_species(pending.species_dex_id)
     update_encounter_hint(pending.id, hint, path=path)
-    return {"caught": False, "hint": hint, "pokemon_id": None}
+    return {
+        "caught": False,
+        "hint": hint,
+        "pokemon_id": None,
+        "shakes": shakes,
+    }
 
 
 def throw_ball(
