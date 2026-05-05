@@ -8,6 +8,7 @@ from .data import (
     ALL_NAMES,
     EVOLUTIONS,
     GEN1_CATCH_RATES,
+    GEN1_TYPES,
     GROWTH_RATES,
     _LINE_OF,
 )
@@ -77,6 +78,17 @@ def growth_rate_of(dex_id: int) -> str:
 def catch_rate_of(dex_id: int) -> int:
     """Canonical Gen-1 capture rate (0-255), default 100 for unknown ids."""
     return GEN1_CATCH_RATES.get(int(dex_id), 100)
+
+
+def types_of(dex_id: int) -> tuple[str, ...]:
+    """Tuple of 1 or 2 lowercase type names for ``dex_id``. Resolves via
+    line_of so evolved forms inherit their pre-evolution's typing entry
+    when not listed directly. Returns ('normal',) as a safe default for
+    unknown dex_ids."""
+    direct = GEN1_TYPES.get(int(dex_id))
+    if direct:
+        return direct
+    return GEN1_TYPES.get(line_of(int(dex_id)), ("normal",))
 
 
 def evolution_chain(base_dex_id: int) -> list[int]:

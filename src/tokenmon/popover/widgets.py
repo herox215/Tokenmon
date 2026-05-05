@@ -13,6 +13,8 @@ from AppKit import (
     NSColor,
     NSCursor,
     NSFont,
+    NSFontAttributeName,
+    NSForegroundColorAttributeName,
     NSGraphicsContext,
     NSImageInterpolationNone,
     NSImageScaleProportionallyUpOrDown,
@@ -21,7 +23,7 @@ from AppKit import (
     NSView,
     NSViewController,
 )
-from Foundation import NSMakeRect, NSObject, NSPointInRect
+from Foundation import NSAttributedString, NSMakeRect, NSObject, NSPointInRect
 
 log = logging.getLogger("tokenmon.popover.widgets")
 
@@ -191,3 +193,76 @@ class _SidebarView(NSView):
     def setSelected_(self, pane_id):  # noqa: N802
         self._selected = int(pane_id)
         self.setNeedsDisplay_(True)
+
+
+# --- Type badges ----------------------------------------------------------
+
+TYPE_BADGE_HEIGHT = 18
+TYPE_BADGE_WIDTH = 64
+TYPE_BADGE_GAP = 6
+
+
+class _TypeBadge(NSView):
+    """A rounded-rectangle pill rendered in the canonical Pokemon-game color
+    for one elemental type, with the type name in white capitalised text.
+
+    Drawn manually (not as a layer-backed view) so the rounded fill +
+    centred text composite correctly without dragging in a custom layer
+    delegate.
+    """
+
+    def initWithFrame_typeName_(self, frame, type_name):  # noqa: N802
+        self = objc.super(_TypeBadge, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._type_name = (type_name or "normal").lower()
+        return self
+
+    def drawRect_(self, _rect):  # noqa: N802
+        from tokenmon.pokemon import TYPE_COLORS
+
+        bounds = self.bounds()
+        r, g, b = TYPE_COLORS.get(self._type_name, (0.5, 0.5, 0.5))
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0).set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bounds, 4, 4).fill()
+
+        # Centred uppercase label, white, bold 10pt.
+        text = self._type_name.upper()
+        attrs = {
+            NSFontAttributeName: NSFont.boldSystemFontOfSize_(10),
+            NSForegroundColorAttributeName: NSColor.whiteColor(),
+        }
+        astr = NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+        size = astr.size()
+        x = (bounds.size.width - size.width) / 2
+        y = (bounds.size.height - size.height) / 2
+        astr.drawAtPoint_((x, y))
+
+
+def _type_badge_row(
+    cx: float, y: float, types: tuple[str, ...],
+    *,
+    badge_w: int = TYPE_BADGE_WIDTH,
+    badge_h: int = TYPE_BADGE_HEIGHT,
+    gap: int = TYPE_BADGE_GAP,
+) -> list[_TypeBadge]:
+    """Build 1 or 2 ``_TypeBadge`` views centred horizontally on ``cx``.
+
+    Returns a list of badges the caller should ``addSubview_`` on the
+    parent view. They're not packed into a wrapper view so the parent
+    keeps full control over the subview tree (and so we don't add a
+    layer-backed wrapper that fights with surrounding pane layout).
+    """
+    if not types:
+        return []
+    n = len(types)
+    total_w = n * badge_w + (n - 1) * gap
+    start_x = cx - total_w / 2
+    badges: list[_TypeBadge] = []
+    for i, t in enumerate(types):
+        x = start_x + i * (badge_w + gap)
+        b = _TypeBadge.alloc().initWithFrame_typeName_(
+            NSMakeRect(x, y, badge_w, badge_h), t,
+        )
+        badges.append(b)
+    return badges

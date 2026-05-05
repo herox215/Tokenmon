@@ -1043,6 +1043,16 @@ class TokenmonPopover(NSObject):
             align=NSTextAlignmentCenter,
         ))
 
+        # Type badges below the name.
+        from tokenmon.popover.widgets import (
+            TYPE_BADGE_HEIGHT, _type_badge_row,
+        )
+        types = pokemon.types_of(species_dex_id)
+        for badge in _type_badge_row(
+            CONTENT_WIDTH / 2, name_y - TYPE_BADGE_HEIGHT - 4, types,
+        ):
+            view.addSubview_(badge)
+
         return view
 
     # =========================================================================
@@ -1438,7 +1448,16 @@ class TokenmonPopover(NSObject):
             align=NSTextAlignmentCenter,
         ))
 
-        lvl_y = name_y - 28
+        # Type badges, centred under the name.
+        from tokenmon.popover.widgets import (
+            TYPE_BADGE_HEIGHT, _type_badge_row,
+        )
+        types = pokemon.types_of(species)
+        badge_y = name_y - TYPE_BADGE_HEIGHT - 6
+        for badge in _type_badge_row(CONTENT_WIDTH / 2, badge_y, types):
+            view.addSubview_(badge)
+
+        lvl_y = badge_y - 22
         lvl_text = "Lv MAX" if level >= pokemon.MAX_LEVEL else f"Lv {level}"
         view.addSubview_(_label(
             NSMakeRect(0, lvl_y, CONTENT_WIDTH, 22),
@@ -1960,6 +1979,19 @@ class TokenmonPopover(NSObject):
             font=NSFont.boldSystemFontOfSize_(15),
         ))
         y_cursor -= 26
+
+        # Type badges, smaller (52×16) so they fit the right column.
+        from tokenmon.popover.widgets import _type_badge_row
+        types = pokemon.types_of(species)
+        badge_w_small = 52
+        badge_h_small = 16
+        badge_y = y_cursor - badge_h_small - 2
+        col_cx = col_x + col_w / 2
+        for badge in _type_badge_row(
+            col_cx, badge_y, types, badge_w=badge_w_small, badge_h=badge_h_small,
+        ):
+            view.addSubview_(badge)
+        y_cursor = badge_y - 4
 
         lvl_text = "Lv MAX" if level >= pokemon.MAX_LEVEL else f"Lv {level}"
         view.addSubview_(_label(

@@ -14,9 +14,11 @@ from .data import (
     GEN1_DAY_ONLY,
     GEN1_GENDERLESS,
     GEN1_NIGHT_ONLY,
+    GEN1_TYPES,
     GROWTH_RATES,
     NATURES,
     CHARACTERISTICS,
+    TYPE_COLORS,
     _BASE_IDS,
     _LINE_OF,
 )
@@ -42,6 +44,7 @@ from .level import (
     line_of,
     name_of,
     stage_thresholds,
+    types_of,
     unlocked_stages_of,
     xp_for_level,
 )
@@ -70,7 +73,8 @@ __all__ = [
     # data
     "ALL_NAMES", "EVOLUTIONS", "GEN1_BASE_FORMS", "GEN1_CATCH_RATES",
     "GEN1_DAY_ONLY", "GEN1_GENDERLESS", "GEN1_NIGHT_ONLY",
-    "GROWTH_RATES", "NATURES", "CHARACTERISTICS",
+    "GEN1_TYPES", "GROWTH_RATES", "NATURES", "CHARACTERISTICS",
+    "TYPE_COLORS",
     # sprites
     "SHINY_SPRITE_DIR", "SHINY_SPRITE_URL_TMPL",
     "SPRITE_DIR", "SPRITE_URL_TMPL",
@@ -79,7 +83,7 @@ __all__ = [
     "MAX_LEVEL", "catch_rate_of", "current_stage_of",
     "evolution_chain", "growth_rate_of", "level_from_xp",
     "line_of", "name_of", "stage_thresholds",
-    "unlocked_stages_of", "xp_for_level",
+    "types_of", "unlocked_stages_of", "xp_for_level",
     # rng
     "DAY_HOUR_END", "DAY_HOUR_START", "SHINY_RATE",
     "can_spawn_now", "current_time_window",
