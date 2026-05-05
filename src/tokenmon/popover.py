@@ -1284,7 +1284,7 @@ class TokenmonPopover(NSObject):
         try:
             with _connect() as conn:
                 row = conn.execute(
-                    "SELECT species_dex_id, pokemon_id "
+                    "SELECT species_dex_id, pokemon_id, gender, is_shiny "
                     "FROM encounters "
                     "WHERE resolved = 'caught' "
                     "ORDER BY id DESC LIMIT 1"
@@ -1301,6 +1301,8 @@ class TokenmonPopover(NSObject):
         self._pending_reveal_pokemon = {
             "species_dex_id": int(row[0]),
             "pokemon_id": int(row[1]) if row[1] is not None else None,
+            "gender": row[2],
+            "is_shiny": bool(row[3]) if row[3] is not None else False,
         }
         # Rebuild pane in reveal mode. Keep _current_pane = PANE_ENCOUNTER but
         # replace the view; we don't go through _show_pane() because that would
@@ -1329,13 +1331,20 @@ class TokenmonPopover(NSObject):
 
         species_dex_id = int(payload["species_dex_id"])
         species_name = pokemon.name_of(species_dex_id)
+        is_shiny = bool(payload.get("is_shiny", False))
+        gender = payload.get("gender")
 
-        # Banner.
+        # Banner — extra "Shiny!" line so the rare drop never goes unnoticed.
         banner_y = POPOVER_HEIGHT - 50
+        banner_text = "Shiny Pokemon was caught!" if is_shiny else "Pokemon was caught!"
         view.addSubview_(_label(
             NSMakeRect(16, banner_y, CONTENT_WIDTH - 32, 24),
-            "Pokemon was caught!",
+            banner_text,
             font=NSFont.boldSystemFontOfSize_(16),
+            color=(
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.85, 0.0, 1.0)
+                if is_shiny else NSColor.labelColor()
+            ),
             align=NSTextAlignmentCenter,
         ))
         view.addSubview_(_label(
@@ -1351,7 +1360,7 @@ class TokenmonPopover(NSObject):
         sprite_x = (CONTENT_WIDTH - sprite_size) // 2
         sprite_y = banner_y - 32 - sprite_size - 8
         iv = _crisp_image_view(NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size))
-        sp = pokemon.ensure_sprite(species_dex_id)
+        sp = pokemon.ensure_sprite(species_dex_id, shiny=is_shiny)
         if sp is not None and sp.exists():
             img = NSImage.alloc().initWithContentsOfFile_(str(sp))
             if img is not None:
@@ -1361,10 +1370,16 @@ class TokenmonPopover(NSObject):
         self._animated_image_views.append(iv)
 
         # Name label below sprite.
+        sym = pokemon.gender_symbol(gender)
+        name_decoration = (
+            ("✨ " if is_shiny else "")
+            + f"#{species_dex_id:03d}  {species_name}"
+            + (f"  {sym}" if sym else "")
+        )
         name_y = sprite_y - 28
         view.addSubview_(_label(
             NSMakeRect(0, name_y, CONTENT_WIDTH, 22),
-            f"#{species_dex_id:03d}  {species_name}",
+            name_decoration,
             font=NSFont.boldSystemFontOfSize_(15),
             align=NSTextAlignmentCenter,
         ))
@@ -1708,7 +1723,7 @@ class TokenmonPopover(NSObject):
         sprite_y = header_y - sprite_size - 12
 
         iv = _crisp_image_view(NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size))
-        sp = pokemon.ensure_sprite(species)
+        sp = pokemon.ensure_sprite(species, shiny=row.is_shiny)
         if sp is not None and sp.exists():
             img = NSImage.alloc().initWithContentsOfFile_(str(sp))
             if img is not None:
@@ -1753,10 +1768,16 @@ class TokenmonPopover(NSObject):
         self._pat_catcher = catcher
 
         name = pokemon.name_of(species)
+        sym = pokemon.gender_symbol(row.gender)
+        name_decoration = (
+            ("✨ " if row.is_shiny else "")
+            + f"#{species:03d}  {name}"
+            + (f"  {sym}" if sym else "")
+        )
         name_y = sprite_y - 32
         view.addSubview_(_label(
             NSMakeRect(0, name_y, CONTENT_WIDTH, 26),
-            f"#{species:03d}  {name}",
+            name_decoration,
             font=NSFont.boldSystemFontOfSize_(18),
             align=NSTextAlignmentCenter,
         ))
@@ -2195,7 +2216,7 @@ class TokenmonPopover(NSObject):
                     btn.layer().setMinificationFilter_("nearest")
                 # species_dex_id reflects the CURRENT form (evolution mutates
                 # the row in place), so just read it directly.
-                sp = pokemon.ensure_sprite(p.species_dex_id)
+                sp = pokemon.ensure_sprite(p.species_dex_id, shiny=p.is_shiny)
                 if sp is not None and sp.exists():
                     img = NSImage.alloc().initWithContentsOfFile_(str(sp))
                     if img is not None:
@@ -2260,7 +2281,7 @@ class TokenmonPopover(NSObject):
         sprite_x = 16
         sprite_y = POPOVER_HEIGHT - 56 - sprite_size
         iv = _crisp_image_view(NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size))
-        sp = pokemon.ensure_sprite(species)
+        sp = pokemon.ensure_sprite(species, shiny=p.is_shiny)
         if sp is not None and sp.exists():
             img = NSImage.alloc().initWithContentsOfFile_(str(sp))
             if img is not None:
@@ -2273,9 +2294,15 @@ class TokenmonPopover(NSObject):
         col_w = CONTENT_WIDTH - col_x - 16
         y_cursor = POPOVER_HEIGHT - 60
 
+        sym = pokemon.gender_symbol(p.gender)
+        name_decoration = (
+            ("✨ " if p.is_shiny else "")
+            + f"#{species:03d}  {pokemon.name_of(species)}"
+            + (f"  {sym}" if sym else "")
+        )
         view.addSubview_(_label(
             NSMakeRect(col_x, y_cursor - 22, col_w, 22),
-            f"#{species:03d}  {pokemon.name_of(species)}",
+            name_decoration,
             font=NSFont.boldSystemFontOfSize_(15),
         ))
         y_cursor -= 26

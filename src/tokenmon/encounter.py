@@ -103,6 +103,8 @@ def maybe_spawn(*, force: bool = False, path: Path = DB_PATH) -> Encounter | Non
     characteristic = pokemon.random_characteristic()
     level = _RNG.randint(LEVEL_MIN, LEVEL_MAX)
     catch_rate = pokemon.catch_rate_of(species_dex_id)
+    gender = pokemon.roll_gender(species_dex_id)
+    is_shiny = pokemon.roll_shiny()
 
     enc_id = insert_encounter(
         species_dex_id=species_dex_id,
@@ -110,6 +112,8 @@ def maybe_spawn(*, force: bool = False, path: Path = DB_PATH) -> Encounter | Non
         characteristic=characteristic,
         level=level,
         catch_rate=catch_rate,
+        gender=gender,
+        is_shiny=is_shiny,
         path=path,
     )
     # Re-read so we return a fully-populated Encounter (with timestamps etc).
@@ -261,6 +265,8 @@ def _resolve_throw(
                 pending.species_dex_id,
                 pending.nature,
                 pending.characteristic,
+                is_shiny=pending.is_shiny,
+                gender=pending.gender,
                 path=path,
             )
         except AttributeError:  # pragma: no cover — staging fallback
@@ -271,6 +277,8 @@ def _resolve_throw(
                 species_dex_id=pending.species_dex_id,
                 nature=pending.nature,
                 characteristic=pending.characteristic,
+                is_shiny=pending.is_shiny,
+                gender=pending.gender,
                 path=path,
             )
         mark_encounter_caught(pending.id, new_pokemon_id, path=path)

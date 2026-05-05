@@ -146,6 +146,69 @@ def _ensure_affection_column(conn: sqlite3.Connection) -> None:
         )
 
 
+def _ensure_gender_shiny_columns(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: adds ``gender`` to ``pokemon``/``encounters`` and
+    ``is_shiny`` to ``encounters``. ``pokemon.is_shiny`` already exists as
+    part of the original schema. ``gender`` is nullable — None means
+    genderless (legendaries, Magnemite line, Voltorb line, Staryu line,
+    Porygon, Ditto), 'M' or 'F' otherwise."""
+    pcols = {row[1] for row in conn.execute("PRAGMA table_info(pokemon)")}
+    if "gender" not in pcols:
+        conn.execute("ALTER TABLE pokemon ADD COLUMN gender TEXT")
+    ecols = {row[1] for row in conn.execute("PRAGMA table_info(encounters)")}
+    if "gender" not in ecols:
+        conn.execute("ALTER TABLE encounters ADD COLUMN gender TEXT")
+    if "is_shiny" not in ecols:
+        conn.execute(
+            "ALTER TABLE encounters ADD COLUMN is_shiny INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def _ensure_pokemon_source_column(conn: sqlite3.Connection) -> None:
+    """Add ``pokemon.source`` ('daily' vs 'wild') and drop the legacy
+    UNIQUE(caught_date) index so multiple wild catches can share a calendar
+    day. Backfills existing rows: the oldest row per date becomes 'daily'
+    (matches the original semantics where the daily was always the first
+    row for its day), the rest become 'wild'. Wild rows whose caught_date
+    was backdated by the old kludge get reset to the encounter's catch
+    timestamp where we can reconstruct it.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(pokemon)")}
+    if "source" in cols:
+        return  # already migrated
+    conn.execute(
+        "ALTER TABLE pokemon ADD COLUMN source TEXT NOT NULL DEFAULT 'wild'"
+    )
+    conn.execute(
+        """
+        UPDATE pokemon SET source = 'daily'
+        WHERE id IN (
+            SELECT MIN(id) FROM pokemon GROUP BY caught_date
+        )
+        """
+    )
+    # Recover the real catch date for wild catches by joining encounters.
+    # encounters.resolved_utc is UTC, but date() truncation off-by-one at
+    # local midnight is acceptable for this one-shot recovery.
+    conn.execute(
+        """
+        UPDATE pokemon SET caught_date = (
+            SELECT date(e.resolved_utc) FROM encounters e
+            WHERE e.pokemon_id = pokemon.id AND e.resolved_utc IS NOT NULL
+        )
+        WHERE source = 'wild' AND id IN (
+            SELECT pokemon_id FROM encounters
+            WHERE pokemon_id IS NOT NULL AND resolved_utc IS NOT NULL
+        )
+        """
+    )
+    # Replace the UNIQUE index with a non-unique one. Old `ON CONFLICT
+    # (caught_date)` callers must be updated alongside this migration —
+    # insert_pokemon stops using ON CONFLICT in the same change.
+    conn.execute("DROP INDEX IF EXISTS idx_pokemon_caught_date")
+    conn.execute("CREATE INDEX idx_pokemon_caught_date ON pokemon(caught_date)")
+
+
 # Mapping of legacy ``encounters.<col>`` columns to the corresponding item key
 # in the new generic ``encounter_item_uses`` junction table. Used only by the
 # one-shot migration helper below.
@@ -203,6 +266,8 @@ def init_db(path: Path = DB_PATH) -> None:
         conn.executescript(SCHEMA)
         _ensure_trained_pokemon_column(conn)
         _ensure_affection_column(conn)
+        _ensure_gender_shiny_columns(conn)
+        _ensure_pokemon_source_column(conn)
         _migrate_encounter_balls_to_items(conn)
 
 
@@ -422,11 +487,12 @@ class Pokemon:
     nickname: str | None
     is_shiny: bool
     affection: int = 0
+    gender: str | None = None  # 'M', 'F', or None for genderless species
 
 
 _POKEMON_COLUMNS = (
     "id, caught_date, species_dex_id, nature, characteristic, "
-    "nickname, is_shiny, affection"
+    "nickname, is_shiny, affection, gender"
 )
 
 
@@ -440,6 +506,7 @@ def _row_to_pokemon(row: tuple) -> Pokemon:
         nickname=row[5],
         is_shiny=bool(row[6]),
         affection=int(row[7]) if len(row) > 7 and row[7] is not None else 0,
+        gender=row[8] if len(row) > 8 else None,
     )
 
 
@@ -451,41 +518,51 @@ def insert_pokemon(
     *,
     nickname: str | None = None,
     is_shiny: bool = False,
+    gender: str | None = None,
+    source: str = "daily",
     path: Path = DB_PATH,
 ) -> int:
-    """Insert a Pokemon row. Returns the new id. Idempotent on (caught_date) —
-    if a row already exists for that date, returns the existing id without
-    overwriting."""
-    caught_date_str = caught_date.isoformat()
+    """Insert a Pokemon row and return its id.
+
+    Caller is responsible for "is the daily already inserted?" idempotency —
+    we no longer rely on a UNIQUE(caught_date) constraint because wild
+    catches can legitimately share a calendar day with the daily.
+    ``source`` is ``'daily'`` or ``'wild'``; the daily-picker keeps the
+    default, encounter catches pass ``'wild'``.
+    """
     with _connect(path) as conn:
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO pokemon (
                 caught_date, species_dex_id, nature, characteristic,
-                nickname, is_shiny
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(caught_date) DO NOTHING
+                nickname, is_shiny, gender, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                caught_date_str,
+                caught_date.isoformat(),
                 species_dex_id,
                 nature,
                 characteristic,
                 nickname,
                 1 if is_shiny else 0,
+                gender,
+                source,
             ),
         )
-        row = conn.execute(
-            "SELECT id FROM pokemon WHERE caught_date = ?",
-            (caught_date_str,),
-        ).fetchone()
-    return int(row[0])
+    return int(cur.lastrowid)
 
 
 def get_pokemon_for_date(d: date, path: Path = DB_PATH) -> Pokemon | None:
+    """Return the *daily* Pokemon for date ``d`` (source='daily'), or None.
+
+    Wild catches can share a calendar day with the daily, so this helper
+    explicitly filters to source='daily' to keep "today's daily" semantics
+    unambiguous for callers like ``ensure_today_pokemon``.
+    """
     with _connect(path) as conn:
         row = conn.execute(
-            f"SELECT {_POKEMON_COLUMNS} FROM pokemon WHERE caught_date = ?",
+            f"SELECT {_POKEMON_COLUMNS} FROM pokemon "
+            "WHERE caught_date = ? AND source = 'daily' LIMIT 1",
             (d.isoformat(),),
         ).fetchone()
     return _row_to_pokemon(row) if row else None
@@ -631,6 +708,8 @@ class Encounter:
     resolved_utc: datetime | None
     pokemon_id: int | None
     last_hint: str | None
+    gender: str | None = None
+    is_shiny: bool = False
 
 
 def _parse_utc(ts: str | None) -> datetime | None:
@@ -659,13 +738,16 @@ def _row_to_encounter(row: tuple) -> Encounter:
         resolved_utc=_parse_utc(row[12]),
         pokemon_id=int(row[13]) if row[13] is not None else None,
         last_hint=row[14],
+        gender=row[15] if len(row) > 15 else None,
+        is_shiny=bool(row[16]) if len(row) > 16 and row[16] is not None else False,
     )
 
 
 _ENCOUNTER_COLS = (
     "id, spawned_utc, species_dex_id, nature, characteristic, level, "
     "catch_rate, pokeballs_used, greatballs_used, ultraballs_used, "
-    "masterballs_used, resolved, resolved_utc, pokemon_id, last_hint"
+    "masterballs_used, resolved, resolved_utc, pokemon_id, last_hint, "
+    "gender, is_shiny"
 )
 
 
@@ -676,6 +758,8 @@ def insert_encounter(
     level: int,
     catch_rate: int,
     *,
+    gender: str | None = None,
+    is_shiny: bool = False,
     path: Path = DB_PATH,
 ) -> int:
     """Insert a fresh pending encounter and return its id.
@@ -689,10 +773,13 @@ def insert_encounter(
             """
             INSERT INTO encounters (
                 spawned_utc, species_dex_id, nature, characteristic,
-                level, catch_rate
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                level, catch_rate, gender, is_shiny
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (spawned, species_dex_id, nature, characteristic, level, catch_rate),
+            (
+                spawned, species_dex_id, nature, characteristic,
+                level, catch_rate, gender, 1 if is_shiny else 0,
+            ),
         )
         return int(cur.lastrowid)
 

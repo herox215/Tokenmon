@@ -21,10 +21,59 @@ from tokenmon.storage import DB_DIR
 log = logging.getLogger("tokenmon.pokemon")
 
 SPRITE_DIR = DB_DIR / "sprites"
+SHINY_SPRITE_DIR = DB_DIR / "sprites_shiny"
 SPRITE_URL_TMPL = (
     "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/"
     "pokemon/versions/generation-v/black-white/animated/{id}.gif"
 )
+SHINY_SPRITE_URL_TMPL = (
+    "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/"
+    "pokemon/versions/generation-v/black-white/animated/shiny/{id}.gif"
+)
+
+# Gen-1 species that have no gender at all — legendaries plus the canonically
+# genderless lines (Magnemite, Voltorb, Staryu, Porygon, Ditto). For everyone
+# else we roll a flat 50/50.
+GEN1_GENDERLESS: frozenset[int] = frozenset({
+    81, 82,           # Magnemite, Magneton
+    100, 101,         # Voltorb, Electrode
+    120, 121,         # Staryu, Starmie
+    132,              # Ditto
+    137,              # Porygon
+    144, 145, 146,    # Articuno, Zapdos, Moltres
+    150, 151,         # Mewtwo, Mew
+})
+
+# Modern (Gen 6+) shiny rate. Pokemon's "very rare" — about 1 in 4096.
+SHINY_RATE = 1 / 4096
+
+_RNG = random.SystemRandom()
+
+
+def is_genderless(dex_id: int) -> bool:
+    return int(dex_id) in GEN1_GENDERLESS
+
+
+def roll_gender(dex_id: int) -> str | None:
+    """Returns 'M'/'F' for normal species, None for genderless ones."""
+    if is_genderless(dex_id):
+        return None
+    return "M" if _RNG.random() < 0.5 else "F"
+
+
+def roll_shiny() -> bool:
+    """Independent 1/4096 shiny roll."""
+    return _RNG.random() < SHINY_RATE
+
+
+def gender_symbol(gender: str | None) -> str:
+    """UI helper — '♂', '♀', or '' for genderless. (We hide the symbol for
+    genderless rather than show a placeholder.)"""
+    if gender == "M":
+        return "♂"
+    if gender == "F":
+        return "♀"
+    return ""
 
 # All Gen-1 Pokemon names — bases AND evolved forms. We only need the entries
 # that appear in our 79 evolution lines (which is most of Gen 1).
@@ -370,17 +419,22 @@ def unlocked_stages_of(base_dex_id: int, xp: int) -> list[int]:
     return out
 
 
-def sprite_path(dex_id: int) -> Path:
-    return SPRITE_DIR / f"{dex_id}.gif"
+def sprite_path(dex_id: int, *, shiny: bool = False) -> Path:
+    base = SHINY_SPRITE_DIR if shiny else SPRITE_DIR
+    return base / f"{dex_id}.gif"
 
 
-def ensure_sprite(dex_id: int, timeout: float = 5.0) -> Path | None:
-    """Download the animated sprite if not already cached. Returns path or None."""
-    p = sprite_path(dex_id)
+def ensure_sprite(
+    dex_id: int, timeout: float = 5.0, *, shiny: bool = False,
+) -> Path | None:
+    """Download the animated sprite if not already cached. Returns path or
+    None. ``shiny=True`` uses the PokeAPI shiny variant URL and caches under
+    a separate directory so regular and shiny copies don't collide."""
+    p = sprite_path(dex_id, shiny=shiny)
     if p.exists() and p.stat().st_size > 0:
         return p
-    SPRITE_DIR.mkdir(parents=True, exist_ok=True)
-    url = SPRITE_URL_TMPL.format(id=dex_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    url = (SHINY_SPRITE_URL_TMPL if shiny else SPRITE_URL_TMPL).format(id=dex_id)
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "tokenmon/0.1"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -388,7 +442,10 @@ def ensure_sprite(dex_id: int, timeout: float = 5.0) -> Path | None:
         p.write_bytes(data)
         return p
     except Exception as exc:
-        log.warning("sprite download failed for #%d: %s", dex_id, exc)
+        log.warning(
+            "sprite download failed for #%d (shiny=%s): %s",
+            dex_id, shiny, exc,
+        )
         if p.exists():
             p.unlink(missing_ok=True)
         return None
@@ -490,9 +547,63 @@ CHARACTERISTICS: list[str] = [
 _RNG = random.SystemRandom()
 
 
+# --- Time-of-day spawn windows --------------------------------------------
+#
+# Two periods: 'day' (06:00–20:00 local) and 'night' (20:00–06:00). Species
+# default to spawning in both. Curated lists below restrict thematic Pokemon
+# to one period — Gastly line and Drowzee at night, the bird/diurnal mons in
+# the day. Picked from canonical Gen-2+ time-encounter data and lore.
+
+DAY_HOUR_START = 6
+DAY_HOUR_END = 20  # exclusive — 20:00 onward counts as night
+
+GEN1_NIGHT_ONLY: frozenset[int] = frozenset({
+    35, 36,         # Clefairy, Clefable
+    41, 42,         # Zubat, Golbat
+    92, 93, 94,     # Gastly, Haunter, Gengar
+    96, 97,         # Drowzee, Hypno
+    104, 105,       # Cubone, Marowak (Lavender Town)
+})
+
+GEN1_DAY_ONLY: frozenset[int] = frozenset({
+    16, 17, 18,     # Pidgey, Pidgeotto, Pidgeot
+    21, 22,         # Spearow, Fearow
+    84, 85,         # Doduo, Dodrio
+})
+
+
+def current_time_window(now: "datetime | None" = None) -> str:
+    """Returns 'day' or 'night' based on the local hour. Imported lazily so
+    test code can inject a fixed time."""
+    from datetime import datetime as _dt
+    h = (now or _dt.now()).hour
+    return "day" if DAY_HOUR_START <= h < DAY_HOUR_END else "night"
+
+
+def can_spawn_now(dex_id: int, *, window: str | None = None) -> bool:
+    """True iff ``dex_id`` is allowed to spawn in ``window`` (defaults to the
+    current local time window). Species not in either set spawn always."""
+    if window is None:
+        window = current_time_window()
+    if window == "day" and int(dex_id) in GEN1_NIGHT_ONLY:
+        return False
+    if window == "night" and int(dex_id) in GEN1_DAY_ONLY:
+        return False
+    return True
+
+
 def random_species() -> int:
-    """Uniform random pick from the gen-1 base forms."""
-    return _RNG.choice(_BASE_IDS)
+    """Uniform random pick from the gen-1 base forms that can spawn at the
+    current time of day. The night-only / day-only filter is applied on top
+    of the base-form pool — a base form whose entire line is night-only
+    simply gets excluded during the day, and vice versa."""
+    window = current_time_window()
+    pool = [d for d in _BASE_IDS if can_spawn_now(d, window=window)]
+    # Defensive — if curated lists ever drain the pool entirely, fall back to
+    # the unfiltered pool so spawning never deadlocks.
+    if not pool:
+        pool = _BASE_IDS
+    return _RNG.choice(pool)
 
 
 def random_nature() -> dict:

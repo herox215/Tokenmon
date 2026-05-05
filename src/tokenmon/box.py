@@ -15,8 +15,7 @@ responsibilities:
 
 from __future__ import annotations
 
-import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -118,49 +117,27 @@ def add_caught_pokemon(
     characteristic: str,
     *,
     caught_date: date | None = None,
+    is_shiny: bool = False,
+    gender: str | None = None,
     path: Path = DB_PATH,
 ) -> int:
     """Insert a Pokemon row for a wild encounter that the user just caught.
 
-    The schema's ``UNIQUE(caught_date)`` index conflicts with the user's
-    desire to allow duplicates (multiple Pokemon may share a calendar day if
-    they catch one wild on top of the daily). As a v1 kludge we retreat the
-    caught_date by one day at a time until we find an empty slot. This is
-    visibly wrong (a Pokemon caught today might appear under yesterday's
-    date) but works as an interim measure.
-
-    TODO(schema): drop the UNIQUE constraint on pokemon.caught_date — or
-    introduce a composite UNIQUE(caught_date, slot) — so duplicates can live
-    on their actual catch day. Tracked in Phase 4.
+    Stores with ``source='wild'`` so it can coexist with the day's daily
+    pick. The legacy "backdate one day at a time on UNIQUE collision" kludge
+    is gone — the unique constraint was dropped in the source-column
+    migration.
     """
-    target = caught_date or _today_local()
-    # Direct insert path so we don't tangle with insert_pokemon's
-    # ON CONFLICT DO NOTHING (which would silently return today's existing
-    # id without letting us know we collided).
-    while True:
-        try:
-            with sqlite3.connect(path, isolation_level=None, timeout=5.0) as conn:
-                conn.execute("PRAGMA journal_mode=WAL")
-                cur = conn.execute(
-                    """
-                    INSERT INTO pokemon (
-                        caught_date, species_dex_id, nature, characteristic,
-                        nickname, is_shiny
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        target.isoformat(),
-                        species_dex_id,
-                        nature,
-                        characteristic,
-                        None,
-                        0,
-                    ),
-                )
-                return int(cur.lastrowid)
-        except sqlite3.IntegrityError:
-            # UNIQUE(caught_date) collision — back off one day and retry.
-            target = target - timedelta(days=1)
+    return insert_pokemon(
+        caught_date=caught_date or _today_local(),
+        species_dex_id=species_dex_id,
+        nature=nature,
+        characteristic=characteristic,
+        is_shiny=is_shiny,
+        gender=gender,
+        source="wild",
+        path=path,
+    )
 
 
 def maybe_evolve(pokemon_id: int, path: Path = DB_PATH) -> int | None:

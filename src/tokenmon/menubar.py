@@ -267,18 +267,26 @@ class TokenmonApp(rumps.App):
         # then ensure today's entry exists. ensure_today_pokemon is the
         # source of truth for "today's species" — its species_dex_id drives
         # the menubar icon, the overlay, and level-up detection.
+        is_shiny_init = False
         try:
             init_db()
             box.migrate_legacy_days()
             today_row = box.ensure_today_pokemon()
             self._line_base_id = today_row.species_dex_id
+            is_shiny_init = bool(getattr(today_row, "is_shiny", False))
         except Exception:
             log.exception("box init failed; falling back to legacy pick")
             self._line_base_id = pokemon.pick_for_today()
         self._pokemon_picked_for: date = date.today()
         # Current displayed dex_id (could be evolved form). Recomputed each refresh.
         self._pokemon_dex_id: int = self._line_base_id
-        self._pokemon_sprite: Path | None = pokemon.ensure_sprite(self._pokemon_dex_id)
+        # Whether the active Pokemon is shiny — drives which sprite we cache.
+        # _refresh_pokemon_state keeps this in sync when the user pins a
+        # different active or the active evolves.
+        self._pokemon_is_shiny: bool = is_shiny_init
+        self._pokemon_sprite: Path | None = pokemon.ensure_sprite(
+            self._pokemon_dex_id, shiny=self._pokemon_is_shiny,
+        )
         self._show_pokemon = bool(config.get("show_pokemon_in_menubar"))
         self._animator: SpriteAnimator | None = None
         self._overlay = PokemonOverlay(
@@ -321,10 +329,13 @@ class TokenmonApp(rumps.App):
             return
 
         # User switched active to a different row.
-        if active.species_dex_id != self._line_base_id:
+        if active.species_dex_id != self._line_base_id or active.is_shiny != self._pokemon_is_shiny:
             self._line_base_id = active.species_dex_id
             self._pokemon_dex_id = active.species_dex_id
-            self._pokemon_sprite = pokemon.ensure_sprite(active.species_dex_id)
+            self._pokemon_is_shiny = bool(active.is_shiny)
+            self._pokemon_sprite = pokemon.ensure_sprite(
+                active.species_dex_id, shiny=self._pokemon_is_shiny,
+            )
             self._last_known_level = self._compute_current_level()
             self._sync_menubar_icon()
             self._sync_overlay()
@@ -342,7 +353,9 @@ class TokenmonApp(rumps.App):
         old_id = self._pokemon_dex_id
         self._pokemon_dex_id = new_id
         self._line_base_id = new_id
-        self._pokemon_sprite = pokemon.ensure_sprite(new_id)
+        self._pokemon_sprite = pokemon.ensure_sprite(
+            new_id, shiny=self._pokemon_is_shiny,
+        )
         self._sync_menubar_icon()
         self._sync_overlay()
 
@@ -550,7 +563,10 @@ class TokenmonApp(rumps.App):
                 self._line_base_id = pokemon.pick_for_today(today)
             self._pokemon_picked_for = today
             self._pokemon_dex_id = self._line_base_id
-            self._pokemon_sprite = pokemon.ensure_sprite(self._pokemon_dex_id)
+            self._pokemon_is_shiny = bool(getattr(active, "is_shiny", False)) if active is not None else False
+            self._pokemon_sprite = pokemon.ensure_sprite(
+                self._pokemon_dex_id, shiny=self._pokemon_is_shiny,
+            )
             self._last_known_level = self._compute_current_level()
             self._sync_menubar_icon()
 
