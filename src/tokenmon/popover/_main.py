@@ -68,121 +68,39 @@ from tokenmon.tokendex import _XPBarView
 
 log = logging.getLogger("tokenmon.popover")
 
-POPOVER_WIDTH = 480
-POPOVER_HEIGHT = 500
-SIDEBAR_WIDTH = 60
-CONTENT_WIDTH = POPOVER_WIDTH - SIDEBAR_WIDTH
 TZ = "Europe/Berlin"
 
-# Conditional 5th slot — sentinel value so it can never collide with the
-# 0..3 indices used for the four base panes.
-PANE_ENCOUNTER = -1
-PANE_POKEMON = 0
-PANE_TOKENDEX = 1
-PANE_BOX = 2
-PANE_ITEMS = 3
-PANE_USAGE = 4
+# Layout constants + widgets are now in popover.widgets — re-imported here
+# so the rest of this module (and external callers via the package) keep
+# their existing references working.
+from tokenmon.popover.widgets import (
+    CONTENT_WIDTH,
+    PANE_BOX,
+    PANE_ENCOUNTER,
+    PANE_ITEMS,
+    PANE_POKEMON,
+    PANE_TOKENDEX,
+    PANE_USAGE,
+    POPOVER_HEIGHT,
+    POPOVER_WIDTH,
+    ROW_HEIGHT,
+    SIDEBAR_WIDTH,
+    _ContentVC,
+    _CrispImageView,
+    _PatClickCatcher,
+    _SidebarView,
+    _crisp_image_view,
+    _label,
+    _new_vc,
+)
 
-ROW_HEIGHT = 100  # mirrors tokendex.ROW_HEIGHT
 
-
-# Pretty per-action menu titles for the bag's right-click-style flyout. The
-# ``{name}`` placeholder gets formatted with the Item.display_name. Items in
-# Item.actions that aren't in this dict simply get omitted from the menu.
+# Pretty per-action menu titles for the bag's right-click-style flyout.
 ACTION_TITLES: dict[str, str] = {
     "throw": "Throw at wild Pokemon",
     "use": "Use {name}",
     "evolve": "Use on a Pokemon",
 }
-
-
-class _CrispImageView(NSImageView):
-    """NSImageView subclass that disables interpolation when drawing the image.
-    Without this, animated GIF sprites get bilinear-blurred when scaled up
-    from their native ~96×96 to e.g. 144×144 in the popover."""
-
-    def drawRect_(self, rect):  # noqa: N802
-        ctx = NSGraphicsContext.currentContext()
-        if ctx is not None:
-            ctx.setImageInterpolation_(NSImageInterpolationNone)
-        objc.super(_CrispImageView, self).drawRect_(rect)
-
-
-class _PatClickCatcher(NSView):
-    """Transparent NSView layered on top of the active sprite to catch clicks.
-
-    We had to abandon both NSClickGestureRecognizer and a mouseDown_ override
-    on NSImageView itself: NSImageView's internal image cell intercepts the
-    event before subclass overrides see it. A vanilla NSView in front,
-    however, reliably gets mouseDown_ — and since we never override drawRect_
-    on it, it stays fully transparent and the GIF animation underneath shows
-    through unmodified.
-    """
-
-    def initWithFrame_target_(self, frame, target):  # noqa: N802
-        self = objc.super(_PatClickCatcher, self).initWithFrame_(frame)
-        if self is None:
-            return None
-        self._pat_target = target
-        return self
-
-    def acceptsFirstMouse_(self, _event):  # noqa: N802
-        return True
-
-    def resetCursorRects(self):  # noqa: N802
-        # macOS calls this whenever it needs to recompute cursor regions for
-        # the view; we register the pointing-hand cursor over our entire
-        # bounds so the user gets a "this is clickable" affordance.
-        self.addCursorRect_cursor_(self.bounds(), NSCursor.pointingHandCursor())
-
-    def hitTest_(self, point):  # noqa: N802
-        # Force ourselves to be the hit-test result inside our bounds, so a
-        # click never falls through to a sibling/parent view whose hit-test
-        # would otherwise win.
-        if NSPointInRect(self.convertPoint_fromView_(point, self.superview()),
-                         self.bounds()):
-            return self
-        return objc.super(_PatClickCatcher, self).hitTest_(point)
-
-    def mouseDown_(self, _event):  # noqa: N802
-        target = getattr(self, "_pat_target", None)
-        if target is None:
-            return
-        try:
-            target._begin_pat()
-        except Exception:
-            log.exception("pat handler failed in mouseDown_")
-
-
-def _crisp_image_view(frame) -> NSImageView:
-    """Build a layer-backed NSImageView with nearest-neighbor magnification
-    AND a draw-time interpolation override — belt-and-suspenders so pixel-art
-    sprites stay sharp at any zoom level."""
-    iv = _CrispImageView.alloc().initWithFrame_(frame)
-    iv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
-    iv.setAnimates_(True)
-    iv.setWantsLayer_(True)
-    layer = iv.layer()
-    if layer is not None:
-        layer.setMagnificationFilter_("nearest")
-        layer.setMinificationFilter_("nearest")
-    return iv
-
-
-def _label(frame, text, *, font=None, color=None, align=None, multiline=False) -> NSTextField:
-    f = NSTextField.alloc().initWithFrame_(frame)
-    f.setStringValue_(text)
-    f.setBezeled_(False)
-    f.setDrawsBackground_(False)
-    f.setEditable_(False)
-    f.setSelectable_(False)
-    f.setFont_(font or NSFont.systemFontOfSize_(13))
-    f.setTextColor_(color or NSColor.labelColor())
-    if align is not None:
-        f.setAlignment_(align)
-    if multiline:
-        f.setLineBreakMode_(0)  # NSLineBreakByWordWrapping
-    return f
 
 
 from tokenmon.ui_helpers import (
@@ -192,71 +110,6 @@ from tokenmon.ui_helpers import (
     fmt_tokens as _fmt_tokens,
     fmt_usd as _fmt_usd,
 )
-
-
-class _ContentVC(NSViewController):
-    """Trivial NSViewController subclass — NSPopover requires one."""
-
-    def loadView(self):  # noqa: N802
-        if hasattr(self, "_root_view") and self._root_view is not None:
-            self.setView_(self._root_view)
-        else:
-            self.setView_(NSView.alloc().initWithFrame_(NSMakeRect(0, 0, POPOVER_WIDTH, POPOVER_HEIGHT)))
-
-
-def _new_vc(root_view: NSView) -> NSViewController:
-    vc = _ContentVC.alloc().init()
-    vc._root_view = root_view
-    vc.view()  # force loadView
-    return vc
-
-
-class _SidebarView(NSView):
-    """Background-tinted sidebar that highlights the selected slot.
-
-    The sidebar has a *variable* number of slots: the four base panes are
-    always present (Today / Pokedex / Box / Usage), and a 5th encounter slot
-    is prepended at the top whenever a wild encounter is pending. We track
-    the slot order as a list of ``pane_id``s so the selection-pill geometry
-    automatically adapts to whichever set of slots is currently visible.
-    """
-
-    SLOT_HEIGHT = 60
-
-    def initWithFrame_paneIds_selected_(self, frame, pane_ids, selected):  # noqa: N802
-        self = objc.super(_SidebarView, self).initWithFrame_(frame)
-        if self is None:
-            return None
-        self._pane_ids = list(pane_ids)
-        self._selected = selected
-        return self
-
-    def drawRect_(self, _rect):  # noqa: N802
-        bounds = self.bounds()
-        # Subtle sidebar background tint.
-        NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.03).set()
-        NSBezierPath.fillRect_(bounds)
-        # Right edge separator.
-        NSColor.separatorColor().set()
-        NSBezierPath.fillRect_(NSMakeRect(bounds.size.width - 1, 0, 1, bounds.size.height))
-        # Selected-slot pill — only drawn if the selected pane is actually a slot.
-        try:
-            slot_idx = self._pane_ids.index(self._selected)
-        except ValueError:
-            return
-        slot_h = _SidebarView.SLOT_HEIGHT
-        y = bounds.size.height - (slot_idx + 1) * slot_h
-        rect = NSMakeRect(4, y + 4, bounds.size.width - 8, slot_h - 8)
-        NSColor.controlAccentColor().colorWithAlphaComponent_(0.18).set()
-        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(rect, 6, 6).fill()
-
-    def setPaneIds_(self, pane_ids):  # noqa: N802
-        self._pane_ids = list(pane_ids)
-        self.setNeedsDisplay_(True)
-
-    def setSelected_(self, pane_id):  # noqa: N802
-        self._selected = int(pane_id)
-        self.setNeedsDisplay_(True)
 
 
 class _RightClickHandler(NSObject):
@@ -562,180 +415,19 @@ class _DebugSpawnHandler(NSObject):
         self._popover._show_pane(PANE_ENCOUNTER)
 
 
-# =============================================================================
-# Catch animation — GBA-style throw → absorb → wobble → outcome
-# =============================================================================
-
-
-# Animation tunables. Wobble is implemented as a horizontal frame translation
-# (no CALayer transforms required). Total runtime ranges from ~1.5s (0 shakes,
-# instant break-out) to ~3.7s (3 shakes + click + reveal handoff).
-CATCH_BALL_SIZE = 40
-CATCH_THROW_FRAMES = 3
-CATCH_WOBBLE_DX = 14
-CATCH_REST_DROP_PX = 24
-
-
-def _build_catch_steps(caught: bool, shakes: int) -> list[tuple[float, str]]:
-    """Construct the (delay, action) tape played by _CatchAnimationHandler.
-
-    ``shakes`` is 0..3. ``caught`` only affects the outcome cap (`click` vs
-    `burst`). The total runtime scales linearly with ``shakes`` — that's the
-    whole point: a 0-shake break-out feels rapidly disappointing, a 3-shake
-    catch feels suspenseful.
-    """
-    steps: list[tuple[float, str]] = [
-        (0.00, "throw_start"),
-        (0.10, "throw_arc_1"),
-        (0.10, "throw_arc_2"),
-        (0.10, "throw_arc_3"),
-        (0.05, "absorb_flash"),
-        (0.12, "flash_end"),
-        (0.20, "ball_drop"),
-    ]
-    for k in range(int(shakes)):
-        steps.extend([
-            (0.55, f"shake_left_{k}"),
-            (0.16, f"shake_right_{k}"),
-            (0.16, f"shake_centre_{k}"),
-        ])
-    if caught:
-        steps.extend([
-            (0.55, "click"),
-            (0.10, "caught_announce"),
-            (0.25, "caught_sparkle_1"),
-            (0.18, "caught_sparkle_2"),
-            (0.18, "caught_sparkle_3"),
-            (0.18, "caught_sparkle_4"),
-            (1.20, "caught_hold"),
-            (0.30, "done"),
-        ])
-    else:
-        steps.extend([(0.55, "burst"), (0.25, "done")])
-    return steps
-
-
-class _CatchAnimationHandler(NSObject):
-    """NSTimer target that drives the catch animation step-by-step.
-
-    Mirrors :class:`tokenmon.overlay._EvolutionHandler`: a flat list of
-    ``(delay, action)`` tuples is consumed one one-shot timer at a time, with
-    the popover responsible for actually mutating views per action.
-    """
-
-    def initWithPopover_payload_(self, popover, payload):  # noqa: N802
-        self = objc.super(_CatchAnimationHandler, self).init()
-        if self is None:
-            return None
-        self._popover = popover
-        self._payload = payload  # {caught, shakes, hint, item_key, encounter_id}
-        self._steps = _build_catch_steps(
-            bool(payload.get("caught", False)),
-            int(payload.get("shakes", 0)),
-        )
-        self._idx = 0
-        return self
-
-    def start(self):
-        self._scheduleNext()
-
-    def _scheduleNext(self):
-        if self._idx >= len(self._steps):
-            return
-        delay, _ = self._steps[self._idx]
-        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            max(0.001, delay), self, b"fire:", None, False,
-        )
-
-    def fire_(self, _timer):  # noqa: N802
-        if self._idx >= len(self._steps):
-            return
-        _, action = self._steps[self._idx]
-        self._idx += 1
-        try:
-            self._popover._catch_step(action, self._payload)
-        except Exception:
-            log.exception("catch step %s failed", action)
-            try:
-                self._popover._end_catch_animation(self._payload)
-            except Exception:
-                log.exception("catch animation teardown failed")
-            return
-        self._scheduleNext()
-
-
-# =============================================================================
-# Pat interaction — click the active sprite, sprite hops; hearts above 90%
-# =============================================================================
-
-
-PAT_HOP_PX = 10
-PAT_HEART_THRESHOLD = int(0.9 * AFFECTION_MAX)  # 90% of 255 = 229
-
-
-def _build_pat_steps(with_hearts: bool) -> list[tuple[float, str]]:
-    """Two-bounce sequence; hearts (when affection threshold met) appear at
-    each bounce apex so the burst feels tied to the motion."""
-    if with_hearts:
-        return [
-            (0.00, "hop_up"),
-            (0.05, "heart_1"),
-            (0.10, "hop_down"),
-            (0.10, "hop_up"),
-            (0.04, "heart_2"),
-            (0.06, "heart_3"),
-            (0.10, "hop_down"),
-            (0.04, "heart_4"),
-            (0.06, "heart_5"),
-            (0.90, "done"),
-        ]
-    return [
-        (0.00, "hop_up"),
-        (0.14, "hop_down"),
-        (0.10, "hop_up"),
-        (0.14, "hop_down"),
-        (0.20, "done"),
-    ]
-
-
-class _PatHandler(NSObject):
-    """NSTimer-driven step runner mirroring _CatchAnimationHandler."""
-
-    def initWithPopover_steps_(self, popover, steps):  # noqa: N802
-        self = objc.super(_PatHandler, self).init()
-        if self is None:
-            return None
-        self._popover = popover
-        self._steps = list(steps)
-        self._idx = 0
-        return self
-
-    def start(self):
-        self._scheduleNext()
-
-    def _scheduleNext(self):
-        if self._idx >= len(self._steps):
-            return
-        delay, _ = self._steps[self._idx]
-        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            max(0.001, delay), self, b"fire:", None, False,
-        )
-
-    def fire_(self, _timer):  # noqa: N802
-        if self._idx >= len(self._steps):
-            return
-        _, action = self._steps[self._idx]
-        self._idx += 1
-        try:
-            self._popover._pat_step(action)
-        except Exception:
-            log.exception("pat step %s failed", action)
-            try:
-                self._popover._end_pat()
-            except Exception:
-                log.exception("pat teardown failed")
-            return
-        self._scheduleNext()
+# Animation handlers + step builders live in popover.animation.
+from tokenmon.popover.animation import (
+    CATCH_BALL_SIZE,
+    CATCH_REST_DROP_PX,
+    CATCH_THROW_FRAMES,
+    CATCH_WOBBLE_DX,
+    PAT_HEART_THRESHOLD,
+    PAT_HOP_PX,
+    _build_catch_steps,
+    _build_pat_steps,
+    _CatchAnimationHandler,
+    _PatHandler,
+)
 
 
 class TokenmonPopover(NSObject):
