@@ -239,6 +239,15 @@ class TokenmonApp(rumps.App):
         # stays active. Resets when the active changes or becomes None.
         self._affection_ticks: int = 0
         self._affection_active_id: int | None = None
+        # Floating-item-drop detection: snapshot pending_drops at startup so
+        # any items already pending aren't re-played as "new drops" the
+        # first time the poll fires. Subsequent polls diff against this.
+        try:
+            from tokenmon.storage import query_pending_drops
+            self._last_pending_snapshot: dict[str, int] = dict(query_pending_drops())
+        except Exception:
+            log.exception("initial query_pending_drops failed")
+            self._last_pending_snapshot = {}
         # Wild-encounter spawn tracking — for every new requests row, we roll
         # encounter.maybe_spawn(). _last_seen_request_id holds the highest id
         # already considered, so we don't double-roll.
@@ -608,10 +617,35 @@ class TokenmonApp(rumps.App):
         self._check_level_up(now)
         self._maybe_roll_encounters()
         self._tick_affection()
+        self._tick_pending_drops()
         if self._last_known_level != prev_level:
             # Refresh now so the menubar title picks up the new level immediately
             # (otherwise we'd wait up to 30s for the next refresh).
             self.refresh(None)
+
+    def _tick_pending_drops(self) -> None:
+        """Diff pending_drops against the last snapshot. Newly-arrived items
+        get a floating overlay animation when the desktop overlay is on.
+
+        Snapshot is updated unconditionally so a claim (which empties the
+        table) doesn't "look like" -N new drops on the next tick."""
+        try:
+            from tokenmon.storage import query_pending_drops
+            current = dict(query_pending_drops())
+        except Exception:
+            log.exception("query_pending_drops failed in tick")
+            return
+        new_drops: dict[str, int] = {}
+        for key, count in current.items():
+            delta = int(count) - int(self._last_pending_snapshot.get(key, 0))
+            if delta > 0:
+                new_drops[key] = delta
+        self._last_pending_snapshot = current
+        if new_drops and self._show_overlay and self._overlay.visible:
+            try:
+                self._overlay.show_floating_items(new_drops)
+            except Exception:
+                log.exception("show_floating_items failed")
 
     def _tick_affection(self) -> None:
         """Grow the active Pokemon's affection by 1 every

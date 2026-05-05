@@ -117,6 +117,129 @@ class _LevelUpHandler(NSObject):
             log.exception("level-up teardown failed")
 
 
+class _FloatingItemHandler(NSObject):
+    """One floating-item drift animation. Each instance owns its own
+    transparent click-through NSWindow showing a single item sprite,
+    drifts it upward over a fixed duration, fades out, then closes the
+    window.
+
+    PokemonOverlay creates one handler per dropped item and staggers
+    their starts so a multi-item drop arrives as a small shower."""
+
+    FLOAT_FRAMES = 24
+    FRAME_INTERVAL = 0.05  # → 1.2 s total
+    STEP_DY = 3.0           # px per frame; ~72 px float distance
+    FADE_IN_FRAMES = 4
+    FADE_OUT_FRAMES = 6
+    SIZE = 32
+
+    def initWithSprite_x_y_delay_(  # noqa: N802
+        self, sprite, x, y, initial_delay,
+    ):
+        self = objc.super(_FloatingItemHandler, self).init()
+        if self is None:
+            return None
+        self._sprite = sprite
+        self._start_x = float(x)
+        self._start_y = float(y)
+        self._initial_delay = float(initial_delay)
+        self._frame = 0
+        self._window = None
+        self._image_view = None
+        return self
+
+    def _build_window(self):
+        size = _FloatingItemHandler.SIZE
+        rect = NSMakeRect(self._start_x, self._start_y, size, size)
+        win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect, NSWindowStyleMaskBorderless, NSBackingStoreBuffered, False,
+        )
+        win.setOpaque_(False)
+        win.setBackgroundColor_(NSColor.clearColor())
+        win.setHasShadow_(False)
+        win.setIgnoresMouseEvents_(True)
+        win.setMovable_(False)
+        win.setLevel_(NSFloatingWindowLevel)
+        win.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorIgnoresCycle
+            | NSWindowCollectionBehaviorTransient
+        )
+        win.setReleasedWhenClosed_(False)
+        win.setAlphaValue_(0.0)
+
+        iv = NSImageView.alloc().initWithFrame_(NSMakeRect(0, 0, size, size))
+        iv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+        iv.setImage_(self._sprite)
+        iv.setWantsLayer_(True)
+        layer = iv.layer()
+        if layer is not None:
+            layer.setMagnificationFilter_("nearest")
+            layer.setMinificationFilter_("nearest")
+        win.setContentView_(iv)
+        self._window = win
+        self._image_view = iv
+
+    def start(self):
+        delay = max(0.001, self._initial_delay)
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            delay, self, b"begin:", None, False,
+        )
+
+    def begin_(self, _timer):  # noqa: N802
+        try:
+            self._build_window()
+        except Exception:
+            log.exception("floating item window build failed")
+            return
+        if self._window is None:
+            return
+        self._window.orderFrontRegardless()
+        self._scheduleNext()
+
+    def _scheduleNext(self):
+        if self._window is None or self._frame >= _FloatingItemHandler.FLOAT_FRAMES:
+            self._end()
+            return
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            _FloatingItemHandler.FRAME_INTERVAL, self, b"fire:", None, False,
+        )
+
+    def fire_(self, _timer):  # noqa: N802
+        if self._window is None:
+            return
+        self._frame += 1
+        new_y = self._start_y + self._frame * _FloatingItemHandler.STEP_DY
+        self._window.setFrameOrigin_((self._start_x, new_y))
+        # Fade in the first FADE_IN_FRAMES, hold, fade out the last FADE_OUT_FRAMES.
+        fi = _FloatingItemHandler.FADE_IN_FRAMES
+        fo = _FloatingItemHandler.FADE_OUT_FRAMES
+        total = _FloatingItemHandler.FLOAT_FRAMES
+        if self._frame <= fi:
+            alpha = self._frame / float(fi)
+        elif self._frame >= total - fo:
+            alpha = max(0.0, (total - self._frame) / float(fo))
+        else:
+            alpha = 1.0
+        self._window.setAlphaValue_(alpha)
+        if self._frame >= total:
+            self._end()
+            return
+        self._scheduleNext()
+
+    def _end(self):
+        if self._window is None:
+            return
+        try:
+            self._window.orderOut_(None)
+            self._window.close()
+        except Exception:
+            log.exception("floating item teardown failed")
+        self._window = None
+        self._image_view = None
+
+
 class _EvolutionHandler(NSObject):
     """NSTimer target that drives the evolution animation step-by-step."""
 
@@ -201,6 +324,10 @@ class PokemonOverlay:
         self._evolution_flash_view: NSView | None = None
         self._evolution_banner: NSTextField | None = None
         self._evolution_running: bool = False
+        # Strong refs to in-flight floating-item handlers — without these
+        # the NSObject subclasses get garbage-collected before their
+        # NSTimers fire and the windows never animate.
+        self._floating_item_handlers: list[_FloatingItemHandler] = []
 
     def _ensure_window(self) -> None:
         if self._window is not None:
@@ -271,6 +398,64 @@ class PokemonOverlay:
         if self._window is not None:
             self._window.orderOut_(None)
         self._visible = False
+
+    # --- Floating-item drift animation -----------------------------------
+
+    def show_floating_items(self, drops: dict[str, int]) -> None:
+        """For each new drop, spawn a small click-through window above the
+        Pokemon overlay that drifts upward and fades out. Stagger the
+        spawns so a multi-item drop reads as a quick shower rather than
+        a synchronised pop-in.
+
+        ``drops`` maps item_key → count. Multi-count items emit one
+        floater per unit (capped at MAX_FLOATERS_PER_ITEM so a 50-pokeball
+        haul doesn't spawn 50 windows).
+        """
+        if not drops or self._window is None or not self._visible:
+            return
+        # Lazy import — overlay is a leaf module that pokemon imports;
+        # items_remote depends on storage, which is fine here.
+        from tokenmon import items_remote
+
+        MAX_FLOATERS_PER_ITEM = 5
+        MAX_FLOATERS_TOTAL = 8
+        STAGGER_SEC = 0.18
+
+        # Anchor: directly above the Pokemon overlay window.
+        frame = self._window.frame()
+        base_x = frame.origin.x + frame.size.width / 2 - _FloatingItemHandler.SIZE / 2
+        base_y = frame.origin.y + frame.size.height + 4
+
+        # Expand drops into a flat queue, capped per-item and overall.
+        queue: list[str] = []
+        for key, count in drops.items():
+            if count <= 0:
+                continue
+            for _ in range(min(int(count), MAX_FLOATERS_PER_ITEM)):
+                queue.append(key)
+        if len(queue) > MAX_FLOATERS_TOTAL:
+            queue = queue[:MAX_FLOATERS_TOTAL]
+
+        for i, key in enumerate(queue):
+            sprite = items_remote.get_sprite_by_name(key)
+            if sprite is None:
+                continue
+            # Slight horizontal jitter so a stack of identical items
+            # doesn't look like a single window animating.
+            jitter = (i % 3 - 1) * 10
+            x = base_x + jitter
+            y = base_y
+            handler = _FloatingItemHandler.alloc().initWithSprite_x_y_delay_(
+                sprite, x, y, i * STAGGER_SEC,
+            )
+            self._floating_item_handlers.append(handler)
+            handler.start()
+
+        # Trim the strong-ref list — keep only the last ~30 handlers so
+        # we don't accumulate forever. Closed handlers' windows are
+        # already None'd out so they're harmless to keep around briefly.
+        if len(self._floating_item_handlers) > 30:
+            self._floating_item_handlers = self._floating_item_handlers[-30:]
 
     @property
     def visible(self) -> bool:
