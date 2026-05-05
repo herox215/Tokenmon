@@ -154,6 +154,37 @@ def add_caught_pokemon(
     return new_id
 
 
+def use_stone(
+    pokemon_id: int, stone_key: str, *, path: Path = DB_PATH,
+) -> int | None:
+    """Apply an evolution stone to ``pokemon_id``.
+
+    On success: mutates the row's species_dex_id to the evolved form,
+    decrements one ``stone_key`` from the inventory, marks the Pokedex
+    entry caught for the new form, and returns the new dex_id. Returns
+    ``None`` when the stone has no effect (wrong species or unknown
+    stone). Does NOT decrement the inventory on a no-op so the player
+    doesn't lose a stone for trying.
+    """
+    row = get_pokemon_by_id(pokemon_id, path=path)
+    if row is None:
+        return None
+    evolved = pokemon.stone_evolution_for(row.species_dex_id, stone_key)
+    if evolved is None:
+        return None
+    update_pokemon_species(pokemon_id, evolved, path=path)
+    try:
+        from tokenmon.storage import (
+            decrement_inventory,
+            mark_caught as _pokedex_mark_caught,
+        )
+        decrement_inventory(stone_key, 1, path=path)
+        _pokedex_mark_caught(evolved, path=path)
+    except Exception:  # pragma: no cover — non-fatal
+        pass
+    return evolved
+
+
 def maybe_evolve(pokemon_id: int, path: Path = DB_PATH) -> int | None:
     """If the Pokemon's trained XP has crossed an evolution threshold, mutate
     its species_dex_id to the new form in the DB and return the new species

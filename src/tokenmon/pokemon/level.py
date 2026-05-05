@@ -10,6 +10,7 @@ from .data import (
     GEN1_CATCH_RATES,
     GEN1_TYPES,
     GROWTH_RATES,
+    STONE_EVOLUTIONS,
     _LINE_OF,
 )
 
@@ -92,11 +93,35 @@ def types_of(dex_id: int) -> tuple[str, ...]:
 
 
 def evolution_chain(base_dex_id: int) -> list[int]:
-    """[base, stage2, ...] in order. Singleton list when no evolution exists."""
+    """[base, stage2, ...] in order, including stone-evolved branches.
+
+    For straight chains (Bulbasaur line) this returns the linear sequence.
+    For multi-branch lines (Eevee) every reachable form is appended once
+    in registry order so the Pokedex / Box display can render the whole
+    family.
+    """
     chain = [base_dex_id]
     for _, evo in EVOLUTIONS.get(base_dex_id, []):
-        chain.append(evo)
+        if evo not in chain:
+            chain.append(evo)
+    # Stone evolutions can extend the chain at any stage already collected.
+    # Walk forward repeatedly so a stage-3 stone evolution attached to a
+    # stage-2 level evolution (e.g. Oddish → Gloom → Vileplume) is captured.
+    i = 0
+    while i < len(chain):
+        cur = chain[i]
+        for evolved in STONE_EVOLUTIONS.get(cur, {}).values():
+            if evolved not in chain:
+                chain.append(evolved)
+        i += 1
     return chain
+
+
+def stone_evolution_for(current_dex_id: int, stone_key: str) -> int | None:
+    """If using ``stone_key`` on the species ``current_dex_id`` would
+    trigger an evolution, return the evolved dex_id; otherwise None.
+    """
+    return STONE_EVOLUTIONS.get(int(current_dex_id), {}).get(stone_key)
 
 
 def stage_thresholds(base_dex_id: int) -> list[int]:
@@ -123,18 +148,43 @@ def species_seen_through(current_dex_id: int) -> tuple[int, ...]:
     """Every species this instance has been at some point — base form plus
     any earlier-stage evolutions up to and including ``current_dex_id``.
 
-    Used by the Pokedex to keep pre-evolutions marked as caught after
-    ``box.maybe_evolve`` mutates the pokemon row in place. If the dex_id
-    isn't part of any known line, returns just ``(current_dex_id,)`` so
-    callers don't lose the entry.
+    Walks the predecessor graph back from ``current_dex_id`` to the base.
+    Considers both level evolutions (EVOLUTIONS, where ``from`` is the
+    chain stage right before ``to``) and stone evolutions (STONE_EVOLUTIONS,
+    where ``from`` is the dict key). Handles branched lines like Eevee:
+    Vaporeon walks back to Eevee, not to a sibling Eeveelution.
     """
     current = int(current_dex_id)
     base = line_of(current)
-    chain = evolution_chain(base)
-    if current not in chain:
+    if current == base:
         return (current,)
-    idx = chain.index(current)
-    return tuple(chain[: idx + 1])
+
+    # Build predecessor map for this line: to_dex_id → from_dex_id.
+    pred: dict[int, int] = {}
+    chain_seq = [base]
+    for level, evo in EVOLUTIONS.get(base, []):
+        prev = chain_seq[-1] if chain_seq else base
+        pred.setdefault(evo, prev)
+        if evo not in chain_seq:
+            chain_seq.append(evo)
+    for src, stones in STONE_EVOLUTIONS.items():
+        if line_of(src) != base:
+            continue
+        for evolved in stones.values():
+            pred.setdefault(evolved, src)
+
+    # Walk back from current to base via pred.
+    seen = [current]
+    cur = current
+    safety = 12
+    while cur != base and safety > 0:
+        safety -= 1
+        prev = pred.get(cur)
+        if prev is None:
+            break
+        seen.insert(0, prev)
+        cur = prev
+    return tuple(seen)
 
 
 def unlocked_stages_of(base_dex_id: int, xp: int) -> list[int]:

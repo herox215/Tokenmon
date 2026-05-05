@@ -92,11 +92,12 @@ ALL_NAMES: dict[int, str] = {
 
 
 # --- Evolution chains -----------------------------------------------------
-# {base_dex_id: [(level_threshold, evolved_dex_id), ...]}
-# Stone/trade/friendship evolutions are mapped to level 30 (mid-game when
-# stones are typically obtainable). Eevee defaults to Vaporeon for the branch.
+# {base_dex_id: [(level_threshold, evolved_dex_id), ...]} for purely
+# level-driven evolutions. Trade evolutions still stand in for level 30
+# (no trade mechanic in the app yet). Stone evolutions live in
+# STONE_EVOLUTIONS below and are user-triggered, not XP-driven.
 
-_STONE_TRADE_LEVEL = 30
+_TRADE_LEVEL = 30  # placeholder for the four Gen-1 trade evolutions
 
 EVOLUTIONS: dict[int, list[tuple[int, int]]] = {
     1:   [(16, 2), (32, 3)],
@@ -108,28 +109,28 @@ EVOLUTIONS: dict[int, list[tuple[int, int]]] = {
     19:  [(20, 20)],
     21:  [(20, 22)],
     23:  [(22, 24)],
-    25:  [(_STONE_TRADE_LEVEL, 26)],
+    25:  [],                                   # Pikachu (Thunder Stone — STONE_EVOLUTIONS)
     27:  [(22, 28)],
-    29:  [(16, 30), (_STONE_TRADE_LEVEL, 31)],
-    32:  [(16, 33), (_STONE_TRADE_LEVEL, 34)],
-    35:  [(_STONE_TRADE_LEVEL, 36)],
-    37:  [(_STONE_TRADE_LEVEL, 38)],
-    39:  [(_STONE_TRADE_LEVEL, 40)],
+    29:  [(16, 30)],                           # Nidoran♀ → Nidorina (Moon Stone for stage 3)
+    32:  [(16, 33)],                           # Nidoran♂ → Nidorino (Moon Stone for stage 3)
+    35:  [],                                   # Clefairy (Moon Stone)
+    37:  [],                                   # Vulpix (Fire Stone)
+    39:  [],                                   # Jigglypuff (Moon Stone)
     41:  [(22, 42)],
-    43:  [(21, 44), (_STONE_TRADE_LEVEL, 45)],
+    43:  [(21, 44)],                           # Oddish → Gloom (Leaf Stone for stage 3)
     46:  [(24, 47)],
     48:  [(31, 49)],
     50:  [(26, 51)],
     52:  [(28, 53)],
     54:  [(33, 55)],
     56:  [(28, 57)],
-    58:  [(_STONE_TRADE_LEVEL, 59)],
-    60:  [(25, 61), (_STONE_TRADE_LEVEL, 62)],
-    63:  [(16, 64), (_STONE_TRADE_LEVEL, 65)],
-    66:  [(28, 67), (_STONE_TRADE_LEVEL, 68)],
-    69:  [(21, 70), (_STONE_TRADE_LEVEL, 71)],
+    58:  [],                                   # Growlithe (Fire Stone)
+    60:  [(25, 61)],                           # Poliwag → Poliwhirl (Water Stone for stage 3)
+    63:  [(16, 64), (_TRADE_LEVEL, 65)],       # Abra → Kadabra → Alakazam (Trade)
+    66:  [(28, 67), (_TRADE_LEVEL, 68)],       # Machop → Machoke → Machamp (Trade)
+    69:  [(21, 70)],                           # Bellsprout → Weepinbell (Leaf Stone for stage 3)
     72:  [(30, 73)],
-    74:  [(25, 75), (_STONE_TRADE_LEVEL, 76)],
+    74:  [(25, 75), (_TRADE_LEVEL, 76)],       # Geodude → Graveler → Golem (Trade)
     77:  [(40, 78)],
     79:  [(37, 80)],
     81:  [(30, 82)],
@@ -137,13 +138,13 @@ EVOLUTIONS: dict[int, list[tuple[int, int]]] = {
     84:  [(31, 85)],
     86:  [(34, 87)],
     88:  [(38, 89)],
-    90:  [(_STONE_TRADE_LEVEL, 91)],
-    92:  [(25, 93), (_STONE_TRADE_LEVEL, 94)],
+    90:  [],                                   # Shellder (Water Stone)
+    92:  [(25, 93), (_TRADE_LEVEL, 94)],       # Gastly → Haunter → Gengar (Trade)
     95:  [],
     96:  [(26, 97)],
     98:  [(28, 99)],
     100: [(30, 101)],
-    102: [(_STONE_TRADE_LEVEL, 103)],
+    102: [],                                   # Exeggcute (Leaf Stone)
     104: [(28, 105)],
     106: [],
     107: [],
@@ -155,7 +156,7 @@ EVOLUTIONS: dict[int, list[tuple[int, int]]] = {
     115: [],
     116: [(32, 117)],
     118: [(33, 119)],
-    120: [(_STONE_TRADE_LEVEL, 121)],
+    120: [],                                   # Staryu (Water Stone)
     122: [],
     123: [],
     124: [],
@@ -166,7 +167,7 @@ EVOLUTIONS: dict[int, list[tuple[int, int]]] = {
     129: [(20, 130)],
     131: [],
     132: [],
-    133: [(_STONE_TRADE_LEVEL, 134)],
+    133: [],                                   # Eevee — three stone branches
     137: [],
     138: [(40, 139)],
     140: [(40, 141)],
@@ -181,7 +182,35 @@ EVOLUTIONS: dict[int, list[tuple[int, int]]] = {
 }
 
 
+# Stone-driven evolutions: keyed by the dex_id the stone applies TO. Values
+# map stone-item-key → evolved dex_id. Multi-branch (Eevee) is supported by
+# listing every option under the same source species.
+STONE_EVOLUTIONS: dict[int, dict[str, int]] = {
+    25:  {"thunder-stone": 26},      # Pikachu  → Raichu
+    35:  {"moon-stone":    36},      # Clefairy → Clefable
+    37:  {"fire-stone":    38},      # Vulpix   → Ninetales
+    39:  {"moon-stone":    40},      # Jigglypuff → Wigglytuff
+    58:  {"fire-stone":    59},      # Growlithe → Arcanine
+    90:  {"water-stone":   91},      # Shellder → Cloyster
+    102: {"leaf-stone":    103},     # Exeggcute → Exeggutor
+    120: {"water-stone":   121},     # Staryu → Starmie
+    30:  {"moon-stone":    31},      # Nidorina  → Nidoqueen
+    33:  {"moon-stone":    34},      # Nidorino  → Nidoking
+    44:  {"leaf-stone":    45},      # Gloom     → Vileplume
+    61:  {"water-stone":   62},      # Poliwhirl → Poliwrath
+    70:  {"leaf-stone":    71},      # Weepinbell → Victreebel
+    133: {
+        "fire-stone":    136,        # Eevee → Flareon
+        "water-stone":   134,        # Eevee → Vaporeon
+        "thunder-stone": 135,        # Eevee → Jolteon
+    },
+}
+
+
 # Map every dex_id (base + every evolved form) back to its base_dex_id.
+# Composes both EVOLUTIONS (level chains) and STONE_EVOLUTIONS so
+# stone-only base forms (e.g. Pikachu) and stone-evolved targets (Raichu,
+# the three Eeveelutions, …) all resolve to the right base.
 GEN1_BASE_FORMS: dict[int, str] = {}
 _LINE_OF: dict[int, int] = {}
 for _base, _chain in EVOLUTIONS.items():
@@ -189,6 +218,17 @@ for _base, _chain in EVOLUTIONS.items():
     _LINE_OF[_base] = _base
     for _, _evo in _chain:
         _LINE_OF[_evo] = _base
+# Pull stone-evolved forms into the same line as their source. Source
+# species that aren't already in _LINE_OF (because they have empty level
+# chains) are treated as base forms here.
+for _src, _stones in STONE_EVOLUTIONS.items():
+    _src_base = _LINE_OF.get(_src, _src)
+    if _src not in _LINE_OF:
+        GEN1_BASE_FORMS[_src] = ALL_NAMES[_src]
+        _LINE_OF[_src] = _src
+        _src_base = _src
+    for _evolved in _stones.values():
+        _LINE_OF[_evolved] = _src_base
 
 _BASE_IDS: list[int] = sorted(GEN1_BASE_FORMS.keys())
 

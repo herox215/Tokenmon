@@ -393,6 +393,80 @@ class _RevealTimerHandler(NSObject):
             log.exception("reveal teardown failed")
 
 
+class _StoneUseHandler(NSObject):
+    """Items pane "Use" button — applies an evolution stone to the active
+    Pokemon. On no-effect (wrong species), shows a notification rather than
+    silently consuming the stone."""
+
+    def initWithPopover_itemKey_(self, popover, item_key):  # noqa: N802
+        self = objc.super(_StoneUseHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        self._item_key = str(item_key)
+        return self
+
+    def useClicked_(self, _sender):  # noqa: N802
+        try:
+            active = box.get_active_pokemon()
+        except Exception:
+            log.exception("get_active_pokemon failed in use-stone")
+            return
+        if active is None:
+            try:
+                rumps.notification(
+                    title="Tokenmon",
+                    subtitle="Kein aktives Pokémon",
+                    message="Setze zuerst ein Pokémon als aktiv.",
+                )
+            except Exception:
+                pass
+            return
+        try:
+            evolved = box.use_stone(active.id, self._item_key)
+        except Exception:
+            log.exception("use_stone failed")
+            return
+        if evolved is None:
+            item = items.get(self._item_key)
+            name = item.display_name if item else self._item_key
+            try:
+                rumps.notification(
+                    title="Tokenmon",
+                    subtitle=f"{name} hatte keinen Effekt",
+                    message=f"{pokemon.name_of(active.species_dex_id)} kann mit "
+                            f"{name} nicht entwickelt werden.",
+                )
+            except Exception:
+                pass
+            self._popover._show_pane(PANE_ITEMS)
+            return
+        # Success — refresh menubar state so the icon picks up the new form,
+        # then re-render the items pane (count -1) and announce.
+        try:
+            app = self._popover._app
+            if hasattr(app, "_refresh_pokemon_state"):
+                app._refresh_pokemon_state()
+        except Exception:
+            log.exception("menubar refresh after use_stone failed")
+        try:
+            self._popover._refresh_sidebar_pokemon_icon()
+        except Exception:
+            log.exception("sidebar icon refresh failed")
+        try:
+            rumps.notification(
+                title="Tokenmon",
+                subtitle="Entwicklung!",
+                message=(
+                    f"{pokemon.name_of(active.species_dex_id)} entwickelte sich "
+                    f"zu {pokemon.name_of(evolved)}!"
+                ),
+            )
+        except Exception:
+            pass
+        self._popover._show_pane(PANE_ITEMS)
+
+
 class _DebugSpawnHandler(NSObject):
     """Usage-pane debug button — force-spawns an encounter or shows '(already pending)'."""
 
@@ -483,6 +557,7 @@ class TokenmonPopover(NSObject):
         self._bag_open_handler: _BagOpenHandler | None = None
         self._bag_back_handler: _BagBackHandler | None = None
         self._item_row_handlers: list[_ItemRowHandler] = []
+        self._stone_use_handlers: list = []
         self._run_away_handler: _RunAwayHandler | None = None
         self._reveal_timer_handler: _RevealTimerHandler | None = None
         self._reveal_timer = None
@@ -612,6 +687,7 @@ class TokenmonPopover(NSObject):
         self._bag_open_handler = None
         self._bag_back_handler = None
         self._item_row_handlers = []
+        self._stone_use_handlers = []
         self._run_away_handler = None
         self._pokedex_handlers = []
         self._pokedex_back_handler = None
@@ -2167,6 +2243,23 @@ class TokenmonPopover(NSObject):
             except Exception:
                 pass
             view.addSubview_(desc_field)
+
+            # "Use" button for items with the "use" action and count > 0.
+            # Currently that's exclusively evolution stones; future "use"
+            # items (e.g. consumable berries) will render the same button.
+            if "use" in item.actions and count > 0:
+                use_btn = NSButton.alloc().initWithFrame_(
+                    NSMakeRect(CONTENT_WIDTH - 80, y_cursor - row_h + 8, 64, 24)
+                )
+                use_btn.setTitle_("Use")
+                use_btn.setBezelStyle_(1)
+                handler = _StoneUseHandler.alloc().initWithPopover_itemKey_(
+                    self, key,
+                )
+                self._stone_use_handlers.append(handler)
+                use_btn.setTarget_(handler)
+                use_btn.setAction_(b"useClicked:")
+                view.addSubview_(use_btn)
 
             y_cursor -= row_h + 4
 

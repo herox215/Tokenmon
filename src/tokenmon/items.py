@@ -76,6 +76,58 @@ ITEMS: dict[str, Item] = {
         sprite_name="master-ball",
         tok_chance=1 / 500_000,
     ),
+    # Evolution stones — used on the active Pokemon to trigger species-
+    # specific stone evolutions. Rarer than Ultra Balls (~1 per 100k tokens).
+    "fire-stone": Item(
+        key="fire-stone",
+        emoji="🔥",
+        display_name="Fire Stone",
+        description="Evolves Fire-loving Pokémon. Use on the active Pokémon.",
+        threshold=100_000,
+        actions=("use",),
+        sprite_name="fire-stone",
+        tok_chance=1 / 100_000,
+    ),
+    "water-stone": Item(
+        key="water-stone",
+        emoji="💧",
+        display_name="Water Stone",
+        description="Evolves aquatic Pokémon. Use on the active Pokémon.",
+        threshold=100_000,
+        actions=("use",),
+        sprite_name="water-stone",
+        tok_chance=1 / 100_000,
+    ),
+    "thunder-stone": Item(
+        key="thunder-stone",
+        emoji="⚡",
+        display_name="Thunder Stone",
+        description="Evolves Electric Pokémon. Use on the active Pokémon.",
+        threshold=100_000,
+        actions=("use",),
+        sprite_name="thunder-stone",
+        tok_chance=1 / 100_000,
+    ),
+    "leaf-stone": Item(
+        key="leaf-stone",
+        emoji="🌿",
+        display_name="Leaf Stone",
+        description="Evolves Grass-type Pokémon. Use on the active Pokémon.",
+        threshold=100_000,
+        actions=("use",),
+        sprite_name="leaf-stone",
+        tok_chance=1 / 100_000,
+    ),
+    "moon-stone": Item(
+        key="moon-stone",
+        emoji="🌙",
+        display_name="Moon Stone",
+        description="Evolves nocturnal & Fairy-adjacent Pokémon. Use on the active Pokémon.",
+        threshold=100_000,
+        actions=("use",),
+        sprite_name="moon-stone",
+        tok_chance=1 / 100_000,
+    ),
 }
 
 # Catch-rate modifier per ball when used in 'throw' action. Items not in this
