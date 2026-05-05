@@ -109,40 +109,16 @@ class _ButtonWireHandler(NSObject):
             log.exception("button wiring failed")
 
 
-def _active_provider_endpoints() -> list[tuple[str, str]]:
-    """Return [(provider_name, health_url), ...] for everything that
-    proxy_providers config currently lists."""
-    from tokenmon.providers import load as load_provider
-    out: list[tuple[str, str]] = []
-    for name in (config.get("proxy_providers") or ["anthropic"]):
-        try:
-            strategy = load_provider(name)
-        except ValueError:
-            log.warning("unknown provider in config: %s", name)
-            continue
-        out.append((name, f"http://{HOST}:{strategy.default_port}/healthz"))
-    return out
-
-
 from tokenmon.ui_helpers import fmt_tokens as _fmt_tokens, fmt_usd as _fmt_usd
 
-
-def _ping(url: str, timeout: float = 1.0) -> bool:
-    try:
-        with urlopen(url, timeout=timeout) as r:
-            return r.status == 200
-    except (URLError, TimeoutError, OSError):
-        return False
-
-
-def _proxy_health() -> tuple[bool, list[str]]:
-    """Returns (all_up, down_providers). all_up = True even when the list of
-    configured providers is empty (nothing to fail)."""
-    down: list[str] = []
-    for name, url in _active_provider_endpoints():
-        if not _ping(url):
-            down.append(name)
-    return (len(down) == 0), down
+# Health helpers moved to menubar.health; aliased here to keep callers in
+# this module unchanged during the split.
+from tokenmon.menubar.health import (
+    active_provider_endpoints as _active_provider_endpoints,
+    ping as _ping,
+    proxy_health as _proxy_health,
+    restart_proxies_via_launchctl as _restart_proxies_via_launchctl,
+)
 
 
 from tokenmon.tokendex import _XPBarView  # ObjC class — defined once, imported here
@@ -219,28 +195,6 @@ def _make_pokemon_view(
     ))
 
     return container
-
-
-def _restart_proxies_via_launchctl() -> tuple[bool, str]:
-    """Restart every configured provider's proxy via launchctl. Returns
-    (all_ok, message)."""
-    import os as _os
-    from tokenmon.launchd import proxy_label
-    failures: list[str] = []
-    for name in (config.get("proxy_providers") or ["anthropic"]):
-        label = proxy_label(name)
-        try:
-            result = subprocess.run(
-                ["launchctl", "kickstart", "-k", f"gui/{_os.getuid()}/{label}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode != 0:
-                failures.append(f"{name}: {result.stderr.strip() or f'exit {result.returncode}'}")
-        except (subprocess.SubprocessError, OSError) as exc:
-            failures.append(f"{name}: {exc}")
-    if not failures:
-        return True, "Proxies neugestartet"
-    return False, "; ".join(failures)
 
 
 class TokenmonApp(rumps.App):
