@@ -2434,19 +2434,6 @@ class TokenmonPopover(NSObject):
 
             y_cursor -= row_h + 4
 
-        # Footer hint about earn rates.
-        footer_y = 16
-        rates_lines = "  ·  ".join(
-            f"{it.emoji} 1 / {it.threshold:,}" for it in items.ITEMS.values()
-        )
-        view.addSubview_(_label(
-            NSMakeRect(16, footer_y, CONTENT_WIDTH - 32, 14),
-            f"Earned per output token:  {rates_lines}",
-            font=NSFont.systemFontOfSize_(10),
-            color=NSColor.tertiaryLabelColor(),
-            align=NSTextAlignmentCenter,
-        ))
-
         return view
 
     # =========================================================================
