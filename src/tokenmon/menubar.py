@@ -124,23 +124,7 @@ def _active_provider_endpoints() -> list[tuple[str, str]]:
     return out
 
 
-def _fmt_tokens(n: int) -> str:
-    """1234 -> '1.2K', 1_234_567 -> '1.2M'."""
-    if n < 1000:
-        return str(n)
-    if n < 1_000_000:
-        return f"{n/1000:.1f}K"
-    if n < 1_000_000_000:
-        return f"{n/1_000_000:.2f}M"
-    return f"{n/1_000_000_000:.2f}B"
-
-
-def _fmt_usd(amount: float) -> str:
-    if amount < 0.01:
-        return f"${amount:.4f}"
-    if amount < 1:
-        return f"${amount:.3f}"
-    return f"${amount:.2f}"
+from tokenmon.ui_helpers import fmt_tokens as _fmt_tokens, fmt_usd as _fmt_usd
 
 
 def _ping(url: str, timeout: float = 1.0) -> bool:

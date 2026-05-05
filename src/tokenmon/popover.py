@@ -185,45 +185,13 @@ def _label(frame, text, *, font=None, color=None, align=None, multiline=False) -
     return f
 
 
-def _fmt_tokens(n: int) -> str:
-    if n < 1000:
-        return str(n)
-    if n < 1_000_000:
-        return f"{n/1000:.1f}K"
-    if n < 1_000_000_000:
-        return f"{n/1_000_000:.2f}M"
-    return f"{n/1_000_000_000:.2f}B"
-
-
-def _fmt_usd(amount: float) -> str:
-    if amount < 0.01:
-        return f"${amount:.4f}"
-    if amount < 1:
-        return f"${amount:.3f}"
-    return f"${amount:.2f}"
-
-
-# 0..255 affection split into 5 heart tiers — matches the Gen-2 friendship
-# scale, mapped onto the 5-heart UI used here.
-AFFECTION_HEARTS = 5
-AFFECTION_MAX = 255
-
-
-def _fmt_affection(value: int) -> str:
-    """Render affection as filled/empty hearts plus the raw count.
-
-    Example: ``_fmt_affection(102)`` → ``"♥♥♡♡♡  102 / 255"``.
-    """
-    v = max(0, min(int(value), AFFECTION_MAX))
-    # Round up so any non-zero affection lights at least one heart, but only
-    # full max gets all five.
-    if v == 0:
-        filled = 0
-    elif v >= AFFECTION_MAX:
-        filled = AFFECTION_HEARTS
-    else:
-        filled = max(1, (v * AFFECTION_HEARTS + AFFECTION_MAX - 1) // AFFECTION_MAX)
-    return "♥" * filled + "♡" * (AFFECTION_HEARTS - filled) + f"  {v} / {AFFECTION_MAX}"
+from tokenmon.ui_helpers import (
+    AFFECTION_HEARTS,
+    AFFECTION_MAX,
+    fmt_affection as _fmt_affection,
+    fmt_tokens as _fmt_tokens,
+    fmt_usd as _fmt_usd,
+)
 
 
 class _ContentVC(NSViewController):

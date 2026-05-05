@@ -922,14 +922,6 @@ def query_item_counts(
     return out
 
 
-def query_ball_counts(path: Path = DB_PATH) -> dict[str, int]:
-    """Backwards-compat shim — returns counts for the four ball items in the
-    legacy order. Delegates to :func:`query_item_counts`."""
-    return query_item_counts(
-        ["pokeball", "greatball", "ultraball", "masterball"], path=path
-    )
-
-
 def backfill_trained_pokemon_ids(
     tz_name: str = "Europe/Berlin", path: Path = DB_PATH
 ) -> int:

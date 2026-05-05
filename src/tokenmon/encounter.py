@@ -42,12 +42,6 @@ SPAWN_MIN_OUTPUT = 50                   # don't spawn from tiny calls
 CATCH_PROBABILITY_BASELINE = 0.7        # softener — 70% per ball at max catch_rate
 LEVEL_MIN, LEVEL_MAX = 1, 1  # wild Pokemon are always Lv 1; XP comes from training
 
-# Backwards-compat re-export — popover.py iterates this to render the per-ball
-# rows in the encounter card. Phase 3 will swap that for an items-pane that
-# pulls from ``tokenmon.items`` directly; until then we expose the same tuple
-# under the old name so encounter.py stays the single source of truth.
-BALL_TYPES: tuple[str, ...] = ("pokeball", "greatball", "ultraball", "masterball")
-
 _RNG = random.SystemRandom()
 
 
@@ -297,18 +291,6 @@ def _resolve_throw(
         "pokemon_id": None,
         "shakes": shakes,
     }
-
-
-def throw_ball(
-    encounter_id: int, ball_type: str, *, path: Path = DB_PATH
-) -> dict:
-    """Deprecated thin shim — delegates to :func:`use_item`.
-
-    Kept so callers (popover, menubar) that still speak in terms of "balls"
-    keep working until Phase 3 migrates them. New code should call
-    :func:`use_item` directly.
-    """
-    return use_item(encounter_id, ball_type, path=path)
 
 
 def run_away(encounter_id: int, *, path: Path = DB_PATH) -> None:

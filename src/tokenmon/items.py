@@ -75,9 +75,6 @@ BALL_CATCH_MODIFIERS: dict[str, float] = {
     "masterball": 255.0,
 }
 
-ITEM_CAP = 99  # legacy alias of Item.cap default
-
-
 def all_keys() -> list[str]:
     return list(ITEMS.keys())
 
