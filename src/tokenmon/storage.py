@@ -134,6 +134,18 @@ def _ensure_trained_pokemon_column(conn: sqlite3.Connection) -> None:
     )
 
 
+AFFECTION_MAX = 255  # Gen-2 friendship cap; we use the same scale.
+
+
+def _ensure_affection_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: adds ``affection`` to ``pokemon`` if missing."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(pokemon)")}
+    if "affection" not in cols:
+        conn.execute(
+            "ALTER TABLE pokemon ADD COLUMN affection INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 # Mapping of legacy ``encounters.<col>`` columns to the corresponding item key
 # in the new generic ``encounter_item_uses`` junction table. Used only by the
 # one-shot migration helper below.
@@ -190,6 +202,7 @@ def init_db(path: Path = DB_PATH) -> None:
     with _connect(path) as conn:
         conn.executescript(SCHEMA)
         _ensure_trained_pokemon_column(conn)
+        _ensure_affection_column(conn)
         _migrate_encounter_balls_to_items(conn)
 
 
@@ -408,6 +421,13 @@ class Pokemon:
     characteristic: str
     nickname: str | None
     is_shiny: bool
+    affection: int = 0
+
+
+_POKEMON_COLUMNS = (
+    "id, caught_date, species_dex_id, nature, characteristic, "
+    "nickname, is_shiny, affection"
+)
 
 
 def _row_to_pokemon(row: tuple) -> Pokemon:
@@ -419,6 +439,7 @@ def _row_to_pokemon(row: tuple) -> Pokemon:
         characteristic=row[4],
         nickname=row[5],
         is_shiny=bool(row[6]),
+        affection=int(row[7]) if len(row) > 7 and row[7] is not None else 0,
     )
 
 
@@ -464,12 +485,7 @@ def insert_pokemon(
 def get_pokemon_for_date(d: date, path: Path = DB_PATH) -> Pokemon | None:
     with _connect(path) as conn:
         row = conn.execute(
-            """
-            SELECT id, caught_date, species_dex_id, nature, characteristic,
-                   nickname, is_shiny
-            FROM pokemon
-            WHERE caught_date = ?
-            """,
+            f"SELECT {_POKEMON_COLUMNS} FROM pokemon WHERE caught_date = ?",
             (d.isoformat(),),
         ).fetchone()
     return _row_to_pokemon(row) if row else None
@@ -478,15 +494,45 @@ def get_pokemon_for_date(d: date, path: Path = DB_PATH) -> Pokemon | None:
 def get_pokemon_by_id(pokemon_id: int, path: Path = DB_PATH) -> Pokemon | None:
     with _connect(path) as conn:
         row = conn.execute(
-            """
-            SELECT id, caught_date, species_dex_id, nature, characteristic,
-                   nickname, is_shiny
-            FROM pokemon
-            WHERE id = ?
-            """,
+            f"SELECT {_POKEMON_COLUMNS} FROM pokemon WHERE id = ?",
             (pokemon_id,),
         ).fetchone()
     return _row_to_pokemon(row) if row else None
+
+
+def latest_request_ts(path: Path = DB_PATH) -> datetime | None:
+    """Timestamp of the most recent ``requests`` row (UTC), or None when the
+    table is empty. Used by the affection idle gate."""
+    with _connect(path) as conn:
+        row = conn.execute(
+            "SELECT ts_utc FROM requests ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return None
+    ts = datetime.fromisoformat(row[0])
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def bump_affection(
+    pokemon_id: int, amount: int = 1, *, path: Path = DB_PATH,
+) -> int:
+    """Increment ``pokemon.affection`` by ``amount``, capped at AFFECTION_MAX.
+
+    Returns the new affection value, or 0 if the row doesn't exist.
+    """
+    if amount <= 0:
+        return 0
+    with _connect(path) as conn:
+        conn.execute(
+            "UPDATE pokemon SET affection = MIN(?, affection + ?) WHERE id = ?",
+            (AFFECTION_MAX, int(amount), int(pokemon_id)),
+        )
+        row = conn.execute(
+            "SELECT affection FROM pokemon WHERE id = ?", (int(pokemon_id),),
+        ).fetchone()
+    return int(row[0]) if row is not None else 0
 
 
 def list_distinct_encounter_species(path: Path = DB_PATH) -> set[int]:
@@ -516,12 +562,7 @@ def list_pokemon(path: Path = DB_PATH) -> list[Pokemon]:
     """Sorted by caught_date desc (newest first)."""
     with _connect(path) as conn:
         rows = conn.execute(
-            """
-            SELECT id, caught_date, species_dex_id, nature, characteristic,
-                   nickname, is_shiny
-            FROM pokemon
-            ORDER BY caught_date DESC
-            """
+            f"SELECT {_POKEMON_COLUMNS} FROM pokemon ORDER BY caught_date DESC"
         ).fetchall()
     return [_row_to_pokemon(r) for r in rows]
 

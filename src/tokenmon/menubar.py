@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -41,7 +41,9 @@ from tokenmon.pricing import cost_for
 from tokenmon.proxy import HOST, PORT
 from tokenmon.storage import (
     Totals,
+    bump_affection,
     init_db,
+    latest_request_ts,
     query_today,
     query_today_by_model,
     query_xp_for_date,
@@ -51,6 +53,15 @@ from tokenmon.storage import (
 REFRESH_INTERVAL_SEC = 30
 HEALTH_INTERVAL_SEC = 10
 ACTIVITY_POLL_INTERVAL_SEC = 5
+# Affection grows while the active Pokemon stays the same. With a 5s poll,
+# 120 ticks = 10 minutes of "owning" time per +1 affection — at the 0..255
+# cap that's ~42h of cumulative active time to fully bond. Counter resets to
+# 0 when the active changes so partial progress doesn't carry across pets.
+AFFECTION_TICKS_PER_POINT = 120
+# Idle gate: if no requests landed in the last 30 minutes, pause growth so
+# leaving the laptop unattended doesn't bond a Pokemon to you for free. The
+# tick counter holds — when activity resumes, growth picks up where it left.
+AFFECTION_IDLE_GATE_SEC = 30 * 60
 TZ = "Europe/Berlin"
 EGG = "🥚"
 EGG_DOWN = "⚠️"
@@ -278,6 +289,10 @@ class TokenmonApp(rumps.App):
         # Level-up detection state. The overlay never appears outside of
         # level-up events, so we only need a "last seen level" to detect changes.
         self._last_known_level: int = self._compute_current_level()
+        # Affection growth bookkeeping — counts polls while the same Pokemon
+        # stays active. Resets when the active changes or becomes None.
+        self._affection_ticks: int = 0
+        self._affection_active_id: int | None = None
         # Wild-encounter spawn tracking — for every new requests row, we roll
         # encounter.maybe_spawn(). _last_seen_request_id holds the highest id
         # already considered, so we don't double-roll.
@@ -638,10 +653,49 @@ class TokenmonApp(rumps.App):
         prev_level = self._last_known_level
         self._check_level_up(now)
         self._maybe_roll_encounters()
+        self._tick_affection()
         if self._last_known_level != prev_level:
             # Refresh now so the menubar title picks up the new level immediately
             # (otherwise we'd wait up to 30s for the next refresh).
             self.refresh(None)
+
+    def _tick_affection(self) -> None:
+        """Grow the active Pokemon's affection by 1 every
+        AFFECTION_TICKS_PER_POINT polls. Counter resets when the active
+        Pokemon changes (or there's no active), so swapping pets doesn't
+        leak partial progress. While the proxy has been idle (no requests in
+        the last AFFECTION_IDLE_GATE_SEC) the counter is held in place — an
+        unattended laptop shouldn't bond a Pokemon for free."""
+        try:
+            active_id = box.get_active_pokemon_id()
+        except Exception:
+            log.exception("get_active_pokemon_id failed in affection tick")
+            return
+        if active_id is None:
+            self._affection_ticks = 0
+            self._affection_active_id = None
+            return
+        if active_id != self._affection_active_id:
+            self._affection_active_id = active_id
+            self._affection_ticks = 0
+        # Idle gate — no recent token activity means no growth this tick.
+        try:
+            last_ts = latest_request_ts()
+        except Exception:
+            log.exception("latest_request_ts failed in affection tick")
+            return
+        if last_ts is None:
+            return
+        idle_sec = (datetime.now(timezone.utc) - last_ts).total_seconds()
+        if idle_sec > AFFECTION_IDLE_GATE_SEC:
+            return
+        self._affection_ticks += 1
+        if self._affection_ticks >= AFFECTION_TICKS_PER_POINT:
+            self._affection_ticks = 0
+            try:
+                bump_affection(active_id)
+            except Exception:
+                log.exception("bump_affection failed")
 
     def restart_proxy(self, _sender) -> None:
         ok, msg = _restart_proxies_via_launchctl()

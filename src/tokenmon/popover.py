@@ -22,6 +22,7 @@ from AppKit import (
     NSButton,
     NSButtonTypeSwitch,
     NSColor,
+    NSCursor,
     NSEvent,
     NSEventMaskLeftMouseDown,
     NSEventMaskOtherMouseDown,
@@ -48,7 +49,7 @@ from AppKit import (
     NSView,
     NSViewController,
 )
-from Foundation import NSMakeRect, NSMakeSize, NSObject
+from Foundation import NSMakeRect, NSMakeSize, NSObject, NSPointInRect
 
 from tokenmon import config, encounter, items, items_remote, pokemon
 from tokenmon.overlay import _silhouette_image
@@ -107,6 +108,52 @@ class _CrispImageView(NSImageView):
         objc.super(_CrispImageView, self).drawRect_(rect)
 
 
+class _PatClickCatcher(NSView):
+    """Transparent NSView layered on top of the active sprite to catch clicks.
+
+    We had to abandon both NSClickGestureRecognizer and a mouseDown_ override
+    on NSImageView itself: NSImageView's internal image cell intercepts the
+    event before subclass overrides see it. A vanilla NSView in front,
+    however, reliably gets mouseDown_ — and since we never override drawRect_
+    on it, it stays fully transparent and the GIF animation underneath shows
+    through unmodified.
+    """
+
+    def initWithFrame_target_(self, frame, target):  # noqa: N802
+        self = objc.super(_PatClickCatcher, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._pat_target = target
+        return self
+
+    def acceptsFirstMouse_(self, _event):  # noqa: N802
+        return True
+
+    def resetCursorRects(self):  # noqa: N802
+        # macOS calls this whenever it needs to recompute cursor regions for
+        # the view; we register the pointing-hand cursor over our entire
+        # bounds so the user gets a "this is clickable" affordance.
+        self.addCursorRect_cursor_(self.bounds(), NSCursor.pointingHandCursor())
+
+    def hitTest_(self, point):  # noqa: N802
+        # Force ourselves to be the hit-test result inside our bounds, so a
+        # click never falls through to a sibling/parent view whose hit-test
+        # would otherwise win.
+        if NSPointInRect(self.convertPoint_fromView_(point, self.superview()),
+                         self.bounds()):
+            return self
+        return objc.super(_PatClickCatcher, self).hitTest_(point)
+
+    def mouseDown_(self, _event):  # noqa: N802
+        target = getattr(self, "_pat_target", None)
+        if target is None:
+            return
+        try:
+            target._begin_pat()
+        except Exception:
+            log.exception("pat handler failed in mouseDown_")
+
+
 def _crisp_image_view(frame) -> NSImageView:
     """Build a layer-backed NSImageView with nearest-neighbor magnification
     AND a draw-time interpolation override — belt-and-suspenders so pixel-art
@@ -154,6 +201,29 @@ def _fmt_usd(amount: float) -> str:
     if amount < 1:
         return f"${amount:.3f}"
     return f"${amount:.2f}"
+
+
+# 0..255 affection split into 5 heart tiers — matches the Gen-2 friendship
+# scale, mapped onto the 5-heart UI used here.
+AFFECTION_HEARTS = 5
+AFFECTION_MAX = 255
+
+
+def _fmt_affection(value: int) -> str:
+    """Render affection as filled/empty hearts plus the raw count.
+
+    Example: ``_fmt_affection(102)`` → ``"♥♥♡♡♡  102 / 255"``.
+    """
+    v = max(0, min(int(value), AFFECTION_MAX))
+    # Round up so any non-zero affection lights at least one heart, but only
+    # full max gets all five.
+    if v == 0:
+        filled = 0
+    elif v >= AFFECTION_MAX:
+        filled = AFFECTION_HEARTS
+    else:
+        filled = max(1, (v * AFFECTION_HEARTS + AFFECTION_MAX - 1) // AFFECTION_MAX)
+    return "♥" * filled + "♡" * (AFFECTION_HEARTS - filled) + f"  {v} / {AFFECTION_MAX}"
 
 
 class _ContentVC(NSViewController):
@@ -627,6 +697,80 @@ class _CatchAnimationHandler(NSObject):
         self._scheduleNext()
 
 
+# =============================================================================
+# Pat interaction — click the active sprite, sprite hops; hearts above 90%
+# =============================================================================
+
+
+PAT_HOP_PX = 10
+PAT_HEART_THRESHOLD = int(0.9 * AFFECTION_MAX)  # 90% of 255 = 229
+
+
+def _build_pat_steps(with_hearts: bool) -> list[tuple[float, str]]:
+    """Two-bounce sequence; hearts (when affection threshold met) appear at
+    each bounce apex so the burst feels tied to the motion."""
+    if with_hearts:
+        return [
+            (0.00, "hop_up"),
+            (0.05, "heart_1"),
+            (0.10, "hop_down"),
+            (0.10, "hop_up"),
+            (0.04, "heart_2"),
+            (0.06, "heart_3"),
+            (0.10, "hop_down"),
+            (0.04, "heart_4"),
+            (0.06, "heart_5"),
+            (0.90, "done"),
+        ]
+    return [
+        (0.00, "hop_up"),
+        (0.14, "hop_down"),
+        (0.10, "hop_up"),
+        (0.14, "hop_down"),
+        (0.20, "done"),
+    ]
+
+
+class _PatHandler(NSObject):
+    """NSTimer-driven step runner mirroring _CatchAnimationHandler."""
+
+    def initWithPopover_steps_(self, popover, steps):  # noqa: N802
+        self = objc.super(_PatHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        self._steps = list(steps)
+        self._idx = 0
+        return self
+
+    def start(self):
+        self._scheduleNext()
+
+    def _scheduleNext(self):
+        if self._idx >= len(self._steps):
+            return
+        delay, _ = self._steps[self._idx]
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            max(0.001, delay), self, b"fire:", None, False,
+        )
+
+    def fire_(self, _timer):  # noqa: N802
+        if self._idx >= len(self._steps):
+            return
+        _, action = self._steps[self._idx]
+        self._idx += 1
+        try:
+            self._popover._pat_step(action)
+        except Exception:
+            log.exception("pat step %s failed", action)
+            try:
+                self._popover._end_pat()
+            except Exception:
+                log.exception("pat teardown failed")
+            return
+        self._scheduleNext()
+
+
 class TokenmonPopover(NSObject):
     """Holds the NSPopover, builds panes, owns sidebar selection state."""
 
@@ -695,6 +839,15 @@ class TokenmonPopover(NSObject):
         self._catch_anim_geom: dict | None = None
         self._catch_anim_header: NSTextField | None = None
         self._catch_anim_sparkles: list[NSTextField] = []
+        # Pat-interaction state. A _PatClickCatcher NSView sits on top of the
+        # active sprite and forwards mouseDown_ to _begin_pat; the handler is
+        # spawned per-pat for the bounce animation.
+        self._pat_handler: _PatHandler | None = None
+        self._pat_catcher: _PatClickCatcher | None = None
+        self._pat_sprite: NSImageView | None = None
+        self._pat_sprite_rest_y: int = 0
+        self._pat_hearts: list[NSTextField] = []
+        self._pat_active: bool = False
         self._debug_spawn_handler: _DebugSpawnHandler | None = None
         self._already_pending_label = None
         self._already_pending_timer = None
@@ -830,6 +983,14 @@ class TokenmonPopover(NSObject):
         self._catch_anim_geom = None
         self._catch_anim_header = None
         self._catch_anim_sparkles = []
+        # Drop pat-interaction refs. The old _PatClickCatcher still has a
+        # ref back to self via _pat_target, but it's about to be removed
+        # from the view hierarchy and won't deliver more events.
+        self._pat_handler = None
+        self._pat_catcher = None
+        self._pat_sprite = None
+        self._pat_hearts = []
+        self._pat_active = False
         if self._catch_anim_flash is not None:
             try:
                 self._catch_anim_flash.removeFromSuperview()
@@ -1555,6 +1716,42 @@ class TokenmonPopover(NSObject):
         view.addSubview_(iv)
         self._animated_image_views.append(iv)
 
+        # --- Pat interaction: click the sprite to bounce it. ---
+        self._pat_sprite = iv
+        self._pat_sprite_rest_y = sprite_y
+        self._pat_active = False
+        self._pat_handler = None
+        # Pre-create hearts (hidden) at scattered offsets around the sprite.
+        # Only revealed when affection clears the 90% threshold.
+        heart_offsets: list[tuple[int, int, int]] = [
+            (-26, sprite_size - 24, 24),
+            (sprite_size // 2 - 12, sprite_size + 6, 22),
+            (sprite_size + 6, sprite_size - 30, 26),
+            (-18, int(sprite_size * 0.45), 20),
+            (sprite_size + 4, int(sprite_size * 0.55), 22),
+        ]
+        hearts: list[NSTextField] = []
+        for dx, dy, sz in heart_offsets:
+            hx = sprite_x + dx
+            hy = sprite_y + dy
+            ht = _label(
+                NSMakeRect(hx, hy, sz + 8, sz + 8),
+                "❤️",
+                font=NSFont.systemFontOfSize_(sz),
+                align=NSTextAlignmentCenter,
+            )
+            ht.setHidden_(True)
+            view.addSubview_(ht)
+            hearts.append(ht)
+        self._pat_hearts = hearts
+        # Transparent click-catcher on top of the sprite. Added LAST so it
+        # ends up above the sprite + any hearts in the subview z-order.
+        catcher = _PatClickCatcher.alloc().initWithFrame_target_(
+            NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size), self,
+        )
+        view.addSubview_(catcher)
+        self._pat_catcher = catcher
+
         name = pokemon.name_of(species)
         name_y = sprite_y - 32
         view.addSubview_(_label(
@@ -1593,7 +1790,16 @@ class TokenmonPopover(NSObject):
             align=NSTextAlignmentCenter,
         ))
 
-        nature_y = xp_y - 24
+        affection_y = xp_y - 22
+        view.addSubview_(_label(
+            NSMakeRect(0, affection_y, CONTENT_WIDTH, 16),
+            f"Zuneigung   {_fmt_affection(row.affection)}",
+            font=NSFont.systemFontOfSize_(12),
+            color=NSColor.labelColor(),
+            align=NSTextAlignmentCenter,
+        ))
+
+        nature_y = affection_y - 22
         view.addSubview_(_label(
             NSMakeRect(0, nature_y, CONTENT_WIDTH, 16),
             f"{row.nature} nature",
@@ -1612,6 +1818,71 @@ class TokenmonPopover(NSObject):
         ))
 
         return view
+
+    # =========================================================================
+    # Pat interaction (active-Pokemon hop + optional hearts)
+    # =========================================================================
+
+    def _begin_pat(self) -> None:
+        """Start a pat bounce. Hearts are added when current affection clears
+        the 90% threshold. Re-queries affection so growth that happened since
+        the pane was rendered counts."""
+        if self._pat_active or self._pat_sprite is None:
+            return
+        # Lazy import — popover.box isn't a module-level import (circular).
+        from tokenmon import box
+        try:
+            row = box.get_active_pokemon()
+        except Exception:
+            log.exception("get_active_pokemon failed in _begin_pat")
+            return
+        with_hearts = row is not None and int(row.affection) >= PAT_HEART_THRESHOLD
+        steps = _build_pat_steps(with_hearts)
+        self._pat_active = True
+        self._pat_handler = _PatHandler.alloc().initWithPopover_steps_(self, steps)
+        self._pat_handler.start()
+
+    def _pat_step(self, action: str) -> None:
+        sprite = self._pat_sprite
+        if sprite is None:
+            return
+        rest_y = self._pat_sprite_rest_y
+        if action == "hop_up":
+            f = sprite.frame()
+            sprite.setFrame_(NSMakeRect(
+                f.origin.x, rest_y + PAT_HOP_PX, f.size.width, f.size.height,
+            ))
+            return
+        if action == "hop_down":
+            f = sprite.frame()
+            sprite.setFrame_(NSMakeRect(
+                f.origin.x, rest_y, f.size.width, f.size.height,
+            ))
+            return
+        if action.startswith("heart_"):
+            idx = int(action.rsplit("_", 1)[-1]) - 1
+            if 0 <= idx < len(self._pat_hearts):
+                self._pat_hearts[idx].setHidden_(False)
+            return
+        if action == "done":
+            self._end_pat()
+            return
+
+    def _end_pat(self) -> None:
+        self._pat_active = False
+        self._pat_handler = None
+        # Hide hearts so the next pat (or pane re-render) starts clean.
+        for ht in self._pat_hearts:
+            try:
+                ht.setHidden_(True)
+            except Exception:
+                pass
+        # Snap sprite back to rest in case a hop step was the last to fire.
+        if self._pat_sprite is not None:
+            f = self._pat_sprite.frame()
+            self._pat_sprite.setFrame_(NSMakeRect(
+                f.origin.x, self._pat_sprite_rest_y, f.size.width, f.size.height,
+            ))
 
     # =========================================================================
     # Pane: Pokedex (species-counts from box)
@@ -2034,6 +2305,13 @@ class TokenmonPopover(NSObject):
             color=NSColor.tertiaryLabelColor(),
         ))
         y_cursor -= 22
+
+        view.addSubview_(_label(
+            NSMakeRect(col_x, y_cursor - 16, col_w, 16),
+            f"Zuneigung  {_fmt_affection(p.affection)}",
+            font=NSFont.systemFontOfSize_(12),
+        ))
+        y_cursor -= 20
 
         view.addSubview_(_label(
             NSMakeRect(col_x, y_cursor - 16, col_w, 16),
