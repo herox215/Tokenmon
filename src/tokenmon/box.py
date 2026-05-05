@@ -62,6 +62,11 @@ def ensure_today_pokemon(path: Path = DB_PATH) -> Pokemon:
         characteristic=characteristic,
         path=path,
     )
+    try:
+        from tokenmon.storage import mark_caught as _pokedex_mark_caught
+        _pokedex_mark_caught(species, path=path)
+    except Exception:  # pragma: no cover — non-fatal
+        pass
     row = get_pokemon_by_id(new_id, path=path)
     if row is None:  # pragma: no cover — insert just succeeded
         raise RuntimeError(f"failed to read back pokemon id={new_id}")
@@ -128,7 +133,7 @@ def add_caught_pokemon(
     is gone — the unique constraint was dropped in the source-column
     migration.
     """
-    return insert_pokemon(
+    new_id = insert_pokemon(
         caught_date=caught_date or _today_local(),
         species_dex_id=species_dex_id,
         nature=nature,
@@ -138,6 +143,15 @@ def add_caught_pokemon(
         source="wild",
         path=path,
     )
+    # Belt-and-suspenders Pokedex update — encounter._resolve_throw also
+    # promotes, but a future direct caller (e.g. CLI debug command) should
+    # still update the Pokedex.
+    try:
+        from tokenmon.storage import mark_caught as _pokedex_mark_caught
+        _pokedex_mark_caught(species_dex_id, path=path)
+    except Exception:  # pragma: no cover — non-fatal
+        pass
+    return new_id
 
 
 def maybe_evolve(pokemon_id: int, path: Path = DB_PATH) -> int | None:
@@ -168,6 +182,13 @@ def maybe_evolve(pokemon_id: int, path: Path = DB_PATH) -> int | None:
     except ValueError:
         return None
     update_pokemon_species(pokemon_id, new_species, path=path)
+    # Persistent Pokedex entry for the new form. The pre-evolution stays
+    # 'caught' on its own row from the original catch.
+    try:
+        from tokenmon.storage import mark_caught as _pokedex_mark_caught
+        _pokedex_mark_caught(new_species, path=path)
+    except Exception:  # pragma: no cover — non-fatal
+        pass
     return new_species
 
 

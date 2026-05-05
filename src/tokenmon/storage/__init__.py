@@ -63,6 +63,9 @@ from .pokedex import (
     PokedexEntry,
     query_pokedex,
     query_pokemon_xp,
+    mark_seen,
+    mark_caught,
+    query_pokedex_seen,
     _tokens_per_local_day,  # used by box.migrate_legacy_days
 )
 
@@ -86,4 +89,5 @@ __all__ = [
     "list_distinct_encounter_species",
     # pokedex
     "PokedexEntry", "query_pokedex", "query_pokemon_xp",
+    "mark_seen", "mark_caught", "query_pokedex_seen",
 ]

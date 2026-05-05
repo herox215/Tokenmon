@@ -67,6 +67,14 @@ CREATE TABLE IF NOT EXISTS encounter_item_uses (
 );
 CREATE INDEX IF NOT EXISTS idx_encounter_item_uses_encounter ON encounter_item_uses(encounter_id);
 CREATE INDEX IF NOT EXISTS idx_encounter_item_uses_key ON encounter_item_uses(item_key);
+
+CREATE TABLE IF NOT EXISTS pokedex_seen (
+    dex_id            INTEGER PRIMARY KEY,
+    status            TEXT    NOT NULL CHECK (status IN ('seen', 'caught')),
+    first_seen_utc    TEXT    NOT NULL,
+    first_caught_utc  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pokedex_seen_status ON pokedex_seen(status);
 """
 
 
@@ -180,6 +188,66 @@ def _migrate_encounter_balls_to_items(conn: sqlite3.Connection) -> None:
             )
 
 
+def _backfill_pokedex_seen(conn: sqlite3.Connection) -> None:
+    """One-shot population of ``pokedex_seen`` from existing rows.
+
+    For each encounter row's species_dex_id → 'seen' (with the encounter's
+    spawned_utc as the seen timestamp). For each pokemon row, expand via
+    the line — every pre-evolution stage gets marked 'caught' so a row
+    that has since evolved doesn't lose its earlier-form Pokedex entry,
+    and so this stays the source of truth even after a future "release"
+    feature deletes the pokemon row itself.
+
+    Idempotent — only runs while the table is empty.
+    """
+    existing = conn.execute("SELECT 1 FROM pokedex_seen LIMIT 1").fetchone()
+    if existing is not None:
+        return
+
+    # Lazy import — pokemon depends on storage, so we can't import at module
+    # load time without a cycle.
+    from tokenmon.pokemon import species_seen_through
+
+    # Step 1: every encounter species → 'seen'.
+    for row in conn.execute(
+        "SELECT species_dex_id, MIN(spawned_utc) FROM encounters GROUP BY species_dex_id"
+    ):
+        dex_id, ts = int(row[0]), row[1]
+        conn.execute(
+            """
+            INSERT INTO pokedex_seen (dex_id, status, first_seen_utc)
+            VALUES (?, 'seen', ?)
+            ON CONFLICT(dex_id) DO NOTHING
+            """,
+            (dex_id, ts),
+        )
+
+    # Step 2: every pokemon row's full chain up to its current form → 'caught'.
+    # This overwrites any 'seen' entry we just inserted for those species.
+    for row in conn.execute(
+        "SELECT species_dex_id, caught_date FROM pokemon"
+    ):
+        current, caught_date = int(row[0]), row[1]
+        # caught_date is a local-date ISO string; convert to a naive UTC
+        # ISO timestamp for the seen/caught fields. Off-by-a-few-hours is
+        # fine for this one-shot recovery.
+        ts = f"{caught_date}T00:00:00+00:00"
+        for dex in species_seen_through(current):
+            conn.execute(
+                """
+                INSERT INTO pokedex_seen
+                    (dex_id, status, first_seen_utc, first_caught_utc)
+                VALUES (?, 'caught', ?, ?)
+                ON CONFLICT(dex_id) DO UPDATE SET
+                    status = 'caught',
+                    first_caught_utc = COALESCE(
+                        first_caught_utc, excluded.first_caught_utc
+                    )
+                """,
+                (int(dex), ts, ts),
+            )
+
+
 def init_db(path: Path | None = None) -> None:
     """Apply schema + every idempotent migration. Safe to call repeatedly."""
     if path is None:
@@ -192,3 +260,4 @@ def init_db(path: Path | None = None) -> None:
         _ensure_gender_shiny_columns(conn)
         _ensure_pokemon_source_column(conn)
         _migrate_encounter_balls_to_items(conn)
+        _backfill_pokedex_seen(conn)

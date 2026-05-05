@@ -1588,25 +1588,22 @@ class TokenmonPopover(NSObject):
             return self._build_pane_pokedex_detail(self._pokedex_selected_dex)
         view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
 
-        # Pull caught species from the box and seen species from encounters.
-        from tokenmon.storage import list_distinct_encounter_species
+        # Pokedex state lives in the persistent ``pokedex_seen`` table.
+        # That keeps entries around even after evolution mutates a row's
+        # species_dex_id and (eventually) after a release feature deletes
+        # the row entirely.
+        from tokenmon.storage import query_pokedex_seen
         try:
-            box_rows = list_pokemon()
+            statuses = query_pokedex_seen()
         except Exception:
-            log.exception("list_pokemon failed")
-            box_rows = []
-        try:
-            seen_set = list_distinct_encounter_species()
-        except Exception:
-            log.exception("list_distinct_encounter_species failed")
-            seen_set = set()
-        # Expand each row's current species into "every stage reached so far"
-        # so pre-evolutions stay marked caught after box.maybe_evolve mutates
-        # the row in place. Without this, evolving Bulbasaur → Ivysaur would
-        # drop Bulbasaur from the Pokedex.
-        caught_set: set[int] = set()
-        for p in box_rows:
-            caught_set.update(pokemon.species_seen_through(p.species_dex_id))
+            log.exception("query_pokedex_seen failed")
+            statuses = {}
+        caught_set: set[int] = {
+            d for d, s in statuses.items() if s == "caught"
+        }
+        seen_set: set[int] = {
+            d for d, s in statuses.items() if s == "seen"
+        }
 
         # Walk the canonical 151 Gen-1 ids in dex order. ALL_NAMES covers them.
         all_ids = sorted(pokemon.ALL_NAMES.keys())

@@ -16,6 +16,9 @@ __all__ = [
     "PokedexEntry",
     "query_pokedex",
     "query_pokemon_xp",
+    "mark_seen",
+    "mark_caught",
+    "query_pokedex_seen",
 ]
 
 
@@ -90,3 +93,73 @@ def query_pokemon_xp(
         for day, tokens in _tokens_per_local_day(tz_name, path)
         if pick_for_today(day) == dex_id
     )
+
+
+# --- pokedex_seen — persistent dex-entry log -----------------------------
+#
+# This table is the source of truth for "have I seen / caught this species?".
+# It's append-only (never deleted), so a future "release" feature that
+# removes a pokemon row from the box will not lose the Pokedex entry.
+# Status promotes 'seen' → 'caught' when the user catches a previously-only-
+# encountered species, and once 'caught' it stays 'caught'.
+
+
+def mark_seen(dex_id: int, *, path: Path | None = None) -> None:
+    """Record that the user has encountered ``dex_id`` (no catch needed).
+
+    No-op if the species already has a 'seen' or 'caught' entry — only the
+    very first encounter timestamp is preserved.
+    """
+    if path is None:
+        path = DB_PATH
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    with _connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO pokedex_seen (dex_id, status, first_seen_utc)
+            VALUES (?, 'seen', ?)
+            ON CONFLICT(dex_id) DO NOTHING
+            """,
+            (int(dex_id), now),
+        )
+
+
+def mark_caught(dex_id: int, *, path: Path | None = None) -> None:
+    """Promote ``dex_id`` to 'caught'. If the species was previously only
+    'seen' (or wasn't tracked at all), the row is created or upgraded; the
+    earliest seen timestamp is preserved, and ``first_caught_utc`` is set
+    on the very first promotion."""
+    if path is None:
+        path = DB_PATH
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    with _connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO pokedex_seen
+                (dex_id, status, first_seen_utc, first_caught_utc)
+            VALUES (?, 'caught', ?, ?)
+            ON CONFLICT(dex_id) DO UPDATE SET
+                status = 'caught',
+                first_caught_utc = COALESCE(
+                    first_caught_utc, excluded.first_caught_utc
+                )
+            """,
+            (int(dex_id), now, now),
+        )
+
+
+def query_pokedex_seen(
+    path: Path | None = None,
+) -> dict[int, str]:
+    """Return ``{dex_id: status}`` for every Pokedex entry on file.
+
+    ``status`` is ``'seen'`` or ``'caught'``. The Pokedex pane reads from
+    this so it doesn't have to derive caught-state from live box rows.
+    """
+    if path is None:
+        path = DB_PATH
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT dex_id, status FROM pokedex_seen"
+        ).fetchall()
+    return {int(d): s for d, s in rows}

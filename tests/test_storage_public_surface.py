@@ -47,6 +47,9 @@ PUBLIC_NAMES = [
     "query_xp_for_date",
     "query_xp_for_pokemon",
     "backfill_trained_pokemon_ids",
+    "mark_seen",
+    "mark_caught",
+    "query_pokedex_seen",
 ]
 
 

@@ -25,8 +25,10 @@ from tokenmon.storage import (
     get_pending_encounter,
     increment_item_used,
     insert_encounter,
+    mark_caught as _pokedex_mark_caught,
     mark_encounter_caught,
     mark_encounter_ran,
+    mark_seen as _pokedex_mark_seen,
     query_item_counts,
     update_encounter_hint,
 )
@@ -110,6 +112,12 @@ def maybe_spawn(*, force: bool = False, path: Path = DB_PATH) -> Encounter | Non
         is_shiny=is_shiny,
         path=path,
     )
+    # Persistent Pokedex entry: 'seen' on every spawn, even if the user
+    # never throws a ball. mark_seen is a no-op when an entry already exists.
+    try:
+        _pokedex_mark_seen(species_dex_id, path=path)
+    except Exception:
+        log.exception("pokedex mark_seen failed")
     # Re-read so we return a fully-populated Encounter (with timestamps etc).
     pending = get_pending_encounter(path=path)
     if pending is None or pending.id != enc_id:  # pragma: no cover — defensive
@@ -276,6 +284,12 @@ def _resolve_throw(
                 path=path,
             )
         mark_encounter_caught(pending.id, new_pokemon_id, path=path)
+        # Promote Pokedex entry to 'caught' (the wild encounter is always at
+        # the base form, so no chain expansion needed here).
+        try:
+            _pokedex_mark_caught(pending.species_dex_id, path=path)
+        except Exception:
+            log.exception("pokedex mark_caught failed")
         return {
             "caught": True,
             "hint": None,
