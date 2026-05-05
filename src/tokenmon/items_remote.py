@@ -69,6 +69,28 @@ def _ensure_on_disk(sprite_name: str) -> Path | None:
     return path
 
 
+def get_sprite_by_name(sprite_name: str) -> NSImage | None:
+    """Generic loader: fetch (or read from cache) the PokeAPI item sprite
+    with the given name. Returns None on any failure (404, decode error,
+    network down). Used for sidebar / UI icons that aren't tied to a
+    registered ``Item``."""
+    if not sprite_name:
+        return None
+    cached = _image_cache.get(sprite_name)
+    if cached is not None:
+        return cached
+    path = _ensure_on_disk(sprite_name)
+    if path is None:
+        return None
+    img = NSImage.alloc().initWithContentsOfFile_(str(path))
+    if img is None:
+        log.warning("NSImage failed to decode %s", path)
+        _negative.add(sprite_name)
+        return None
+    _image_cache[sprite_name] = img
+    return img
+
+
 def get_item_image(item: Item) -> NSImage | None:
     """Return an NSImage for the given item's sprite, or None if unavailable.
 
@@ -76,19 +98,7 @@ def get_item_image(item: Item) -> NSImage | None:
     cached negatively for the rest of the session."""
     if item.sprite_name is None:
         return None
-    cached = _image_cache.get(item.sprite_name)
-    if cached is not None:
-        return cached
-    path = _ensure_on_disk(item.sprite_name)
-    if path is None:
-        return None
-    img = NSImage.alloc().initWithContentsOfFile_(str(path))
-    if img is None:
-        log.warning("NSImage failed to decode %s", path)
-        _negative.add(item.sprite_name)
-        return None
-    _image_cache[item.sprite_name] = img
-    return img
+    return get_sprite_by_name(item.sprite_name)
 
 
 def prefetch_all(items: list[Item]) -> None:
