@@ -1,0 +1,398 @@
+"""Inert Gen-1 data tables — names, evolution chains, catch + growth rates,
+gender restrictions, time-window restrictions, natures, characteristics.
+
+Pure-Python module: no I/O, no AppKit, safe to import from anywhere.
+"""
+from __future__ import annotations
+
+# --- Names ----------------------------------------------------------------
+
+ALL_NAMES: dict[int, str] = {
+    1: "Bulbasaur",    2: "Ivysaur",     3: "Venusaur",
+    4: "Charmander",   5: "Charmeleon",  6: "Charizard",
+    7: "Squirtle",     8: "Wartortle",   9: "Blastoise",
+    10: "Caterpie",   11: "Metapod",    12: "Butterfree",
+    13: "Weedle",     14: "Kakuna",     15: "Beedrill",
+    16: "Pidgey",     17: "Pidgeotto",  18: "Pidgeot",
+    19: "Rattata",    20: "Raticate",
+    21: "Spearow",    22: "Fearow",
+    23: "Ekans",      24: "Arbok",
+    25: "Pikachu",    26: "Raichu",
+    27: "Sandshrew",  28: "Sandslash",
+    29: "Nidoran♀",   30: "Nidorina",   31: "Nidoqueen",
+    32: "Nidoran♂",   33: "Nidorino",   34: "Nidoking",
+    35: "Clefairy",   36: "Clefable",
+    37: "Vulpix",     38: "Ninetales",
+    39: "Jigglypuff", 40: "Wigglytuff",
+    41: "Zubat",      42: "Golbat",
+    43: "Oddish",     44: "Gloom",      45: "Vileplume",
+    46: "Paras",      47: "Parasect",
+    48: "Venonat",    49: "Venomoth",
+    50: "Diglett",    51: "Dugtrio",
+    52: "Meowth",     53: "Persian",
+    54: "Psyduck",    55: "Golduck",
+    56: "Mankey",     57: "Primeape",
+    58: "Growlithe",  59: "Arcanine",
+    60: "Poliwag",    61: "Poliwhirl",  62: "Poliwrath",
+    63: "Abra",       64: "Kadabra",    65: "Alakazam",
+    66: "Machop",     67: "Machoke",    68: "Machamp",
+    69: "Bellsprout", 70: "Weepinbell", 71: "Victreebel",
+    72: "Tentacool",  73: "Tentacruel",
+    74: "Geodude",    75: "Graveler",   76: "Golem",
+    77: "Ponyta",     78: "Rapidash",
+    79: "Slowpoke",   80: "Slowbro",
+    81: "Magnemite",  82: "Magneton",
+    83: "Farfetch'd",
+    84: "Doduo",      85: "Dodrio",
+    86: "Seel",       87: "Dewgong",
+    88: "Grimer",     89: "Muk",
+    90: "Shellder",   91: "Cloyster",
+    92: "Gastly",     93: "Haunter",    94: "Gengar",
+    95: "Onix",
+    96: "Drowzee",    97: "Hypno",
+    98: "Krabby",     99: "Kingler",
+    100: "Voltorb",   101: "Electrode",
+    102: "Exeggcute", 103: "Exeggutor",
+    104: "Cubone",    105: "Marowak",
+    106: "Hitmonlee",
+    107: "Hitmonchan",
+    108: "Lickitung",
+    109: "Koffing",   110: "Weezing",
+    111: "Rhyhorn",   112: "Rhydon",
+    113: "Chansey",
+    114: "Tangela",
+    115: "Kangaskhan",
+    116: "Horsea",    117: "Seadra",
+    118: "Goldeen",   119: "Seaking",
+    120: "Staryu",    121: "Starmie",
+    122: "Mr. Mime",
+    123: "Scyther",
+    124: "Jynx",
+    125: "Electabuzz",
+    126: "Magmar",
+    127: "Pinsir",
+    128: "Tauros",
+    129: "Magikarp",  130: "Gyarados",
+    131: "Lapras",
+    132: "Ditto",
+    133: "Eevee",     134: "Vaporeon",
+    135: "Jolteon",   136: "Flareon",
+    137: "Porygon",
+    138: "Omanyte",   139: "Omastar",
+    140: "Kabuto",    141: "Kabutops",
+    142: "Aerodactyl",
+    143: "Snorlax",
+    144: "Articuno",
+    145: "Zapdos",
+    146: "Moltres",
+    147: "Dratini",   148: "Dragonair", 149: "Dragonite",
+    150: "Mewtwo",
+    151: "Mew",
+}
+
+
+# --- Evolution chains -----------------------------------------------------
+# {base_dex_id: [(level_threshold, evolved_dex_id), ...]}
+# Stone/trade/friendship evolutions are mapped to level 30 (mid-game when
+# stones are typically obtainable). Eevee defaults to Vaporeon for the branch.
+
+_STONE_TRADE_LEVEL = 30
+
+EVOLUTIONS: dict[int, list[tuple[int, int]]] = {
+    1:   [(16, 2), (32, 3)],
+    4:   [(16, 5), (36, 6)],
+    7:   [(16, 8), (36, 9)],
+    10:  [(7, 11), (10, 12)],
+    13:  [(7, 14), (10, 15)],
+    16:  [(18, 17), (36, 18)],
+    19:  [(20, 20)],
+    21:  [(20, 22)],
+    23:  [(22, 24)],
+    25:  [(_STONE_TRADE_LEVEL, 26)],
+    27:  [(22, 28)],
+    29:  [(16, 30), (_STONE_TRADE_LEVEL, 31)],
+    32:  [(16, 33), (_STONE_TRADE_LEVEL, 34)],
+    35:  [(_STONE_TRADE_LEVEL, 36)],
+    37:  [(_STONE_TRADE_LEVEL, 38)],
+    39:  [(_STONE_TRADE_LEVEL, 40)],
+    41:  [(22, 42)],
+    43:  [(21, 44), (_STONE_TRADE_LEVEL, 45)],
+    46:  [(24, 47)],
+    48:  [(31, 49)],
+    50:  [(26, 51)],
+    52:  [(28, 53)],
+    54:  [(33, 55)],
+    56:  [(28, 57)],
+    58:  [(_STONE_TRADE_LEVEL, 59)],
+    60:  [(25, 61), (_STONE_TRADE_LEVEL, 62)],
+    63:  [(16, 64), (_STONE_TRADE_LEVEL, 65)],
+    66:  [(28, 67), (_STONE_TRADE_LEVEL, 68)],
+    69:  [(21, 70), (_STONE_TRADE_LEVEL, 71)],
+    72:  [(30, 73)],
+    74:  [(25, 75), (_STONE_TRADE_LEVEL, 76)],
+    77:  [(40, 78)],
+    79:  [(37, 80)],
+    81:  [(30, 82)],
+    83:  [],
+    84:  [(31, 85)],
+    86:  [(34, 87)],
+    88:  [(38, 89)],
+    90:  [(_STONE_TRADE_LEVEL, 91)],
+    92:  [(25, 93), (_STONE_TRADE_LEVEL, 94)],
+    95:  [],
+    96:  [(26, 97)],
+    98:  [(28, 99)],
+    100: [(30, 101)],
+    102: [(_STONE_TRADE_LEVEL, 103)],
+    104: [(28, 105)],
+    106: [],
+    107: [],
+    108: [],
+    109: [(35, 110)],
+    111: [(42, 112)],
+    113: [],
+    114: [],
+    115: [],
+    116: [(32, 117)],
+    118: [(33, 119)],
+    120: [(_STONE_TRADE_LEVEL, 121)],
+    122: [],
+    123: [],
+    124: [],
+    125: [],
+    126: [],
+    127: [],
+    128: [],
+    129: [(20, 130)],
+    131: [],
+    132: [],
+    133: [(_STONE_TRADE_LEVEL, 134)],
+    137: [],
+    138: [(40, 139)],
+    140: [(40, 141)],
+    142: [],
+    143: [],
+    144: [],
+    145: [],
+    146: [],
+    147: [(30, 148), (55, 149)],
+    150: [],
+    151: [],
+}
+
+
+# Map every dex_id (base + every evolved form) back to its base_dex_id.
+GEN1_BASE_FORMS: dict[int, str] = {}
+_LINE_OF: dict[int, int] = {}
+for _base, _chain in EVOLUTIONS.items():
+    GEN1_BASE_FORMS[_base] = ALL_NAMES[_base]
+    _LINE_OF[_base] = _base
+    for _, _evo in _chain:
+        _LINE_OF[_evo] = _base
+
+_BASE_IDS: list[int] = sorted(GEN1_BASE_FORMS.keys())
+
+
+# --- Growth rates ---------------------------------------------------------
+
+GROWTH_RATES: dict[int, str] = {
+    1: "medium_slow",   4: "medium_slow",  7: "medium_slow",  10: "medium_fast",
+    13: "medium_fast", 16: "medium_slow", 19: "medium_fast", 21: "medium_fast",
+    23: "medium_fast", 25: "medium_fast", 27: "medium_fast", 29: "medium_slow",
+    32: "medium_slow", 35: "fast",        37: "medium_fast", 39: "fast",
+    41: "medium_fast", 43: "medium_slow", 46: "medium_fast", 48: "medium_fast",
+    50: "medium_fast", 52: "medium_fast", 54: "medium_fast", 56: "medium_fast",
+    58: "slow",        60: "medium_slow", 63: "medium_slow", 66: "medium_slow",
+    69: "medium_slow", 72: "slow",        74: "medium_slow", 77: "medium_fast",
+    79: "medium_fast", 81: "medium_fast", 83: "medium_fast", 84: "medium_fast",
+    86: "medium_fast", 88: "medium_fast", 90: "slow",        92: "medium_slow",
+    95: "medium_fast", 96: "medium_fast", 98: "medium_fast", 100: "medium_fast",
+    102: "slow",       104: "medium_fast", 106: "medium_fast", 107: "medium_fast",
+    108: "medium_fast", 109: "medium_fast", 111: "slow",      113: "fast",
+    114: "medium_fast", 115: "medium_fast", 116: "medium_fast", 118: "medium_fast",
+    120: "slow",       122: "medium_fast", 123: "medium_fast", 124: "medium_fast",
+    125: "medium_fast", 126: "medium_fast", 127: "slow",      128: "slow",
+    129: "slow",       131: "slow",       132: "medium_fast", 133: "medium_fast",
+    137: "medium_fast", 138: "medium_fast", 140: "medium_fast", 142: "slow",
+    143: "slow",       144: "slow",       145: "slow",       146: "slow",
+    147: "slow",       150: "slow",       151: "medium_slow",
+}
+
+
+# --- Catch rates ----------------------------------------------------------
+# Source: Bulbapedia "List of Pokémon by catch rate" (Gen-I column).
+
+GEN1_CATCH_RATES: dict[int, int] = {
+    1: 45,    2: 45,    3: 45,
+    4: 45,    5: 45,    6: 45,
+    7: 45,    8: 45,    9: 45,
+    10: 255,  11: 120,  12: 45,
+    13: 255,  14: 120,  15: 45,
+    16: 255,  17: 120,  18: 45,
+    19: 255,  20: 127,
+    21: 255,  22: 90,
+    23: 255,  24: 90,
+    25: 190,  26: 75,
+    27: 255,  28: 90,
+    29: 235,  30: 120,  31: 45,
+    32: 235,  33: 120,  34: 45,
+    35: 150,  36: 25,
+    37: 190,  38: 75,
+    39: 170,  40: 50,
+    41: 255,  42: 90,
+    43: 255,  44: 120,  45: 45,
+    46: 190,  47: 75,
+    48: 190,  49: 75,
+    50: 255,  51: 50,
+    52: 255,  53: 90,
+    54: 190,  55: 75,
+    56: 190,  57: 75,
+    58: 190,  59: 75,
+    60: 255,  61: 120,  62: 45,
+    63: 200,  64: 100,  65: 50,
+    66: 180,  67: 90,   68: 45,
+    69: 255,  70: 120,  71: 45,
+    72: 190,  73: 60,
+    74: 255,  75: 120,  76: 45,
+    77: 190,  78: 60,
+    79: 190,  80: 75,
+    81: 190,  82: 60,
+    83: 45,
+    84: 190,  85: 45,
+    86: 190,  87: 75,
+    88: 190,  89: 75,
+    90: 190,  91: 60,
+    92: 190,  93: 90,   94: 45,
+    95: 45,
+    96: 190,  97: 75,
+    98: 225,  99: 60,
+    100: 190, 101: 60,
+    102: 90,  103: 45,
+    104: 190, 105: 75,
+    106: 45,
+    107: 45,
+    108: 45,
+    109: 190, 110: 60,
+    111: 120, 112: 60,
+    113: 30,
+    114: 45,
+    115: 45,
+    116: 225, 117: 75,
+    118: 225, 119: 60,
+    120: 225, 121: 60,
+    122: 45,
+    123: 45,
+    124: 45,
+    125: 45,
+    126: 45,
+    127: 45,
+    128: 45,
+    129: 255, 130: 45,
+    131: 45,
+    132: 35,
+    133: 45,  134: 45,
+    135: 45,  136: 45,
+    137: 45,
+    138: 45,  139: 45,
+    140: 45,  141: 45,
+    142: 45,
+    143: 25,
+    144: 3,
+    145: 3,
+    146: 3,
+    147: 45,  148: 27,  149: 9,
+    150: 3,
+    151: 45,
+}
+
+
+# --- Gender + time-of-day restrictions ------------------------------------
+
+# Genderless: legendaries + canonically genderless lines.
+GEN1_GENDERLESS: frozenset[int] = frozenset({
+    81, 82,           # Magnemite, Magneton
+    100, 101,         # Voltorb, Electrode
+    120, 121,         # Staryu, Starmie
+    132,              # Ditto
+    137,              # Porygon
+    144, 145, 146,    # Articuno, Zapdos, Moltres
+    150, 151,         # Mewtwo, Mew
+})
+
+GEN1_NIGHT_ONLY: frozenset[int] = frozenset({
+    35, 36,           # Clefairy, Clefable
+    41, 42,           # Zubat, Golbat
+    92, 93, 94,       # Gastly, Haunter, Gengar
+    96, 97,           # Drowzee, Hypno
+    104, 105,         # Cubone, Marowak (Lavender Town)
+})
+
+GEN1_DAY_ONLY: frozenset[int] = frozenset({
+    16, 17, 18,       # Pidgey, Pidgeotto, Pidgeot
+    21, 22,           # Spearow, Fearow
+    84, 85,           # Doduo, Dodrio
+})
+
+
+# --- Natures + characteristics --------------------------------------------
+
+NATURES: list[dict] = [
+    {"name": "Hardy",   "plus_stat": None,         "minus_stat": None,         "flavor": None},
+    {"name": "Lonely",  "plus_stat": "attack",     "minus_stat": "defense",    "flavor": "spicy"},
+    {"name": "Brave",   "plus_stat": "attack",     "minus_stat": "speed",      "flavor": "spicy"},
+    {"name": "Adamant", "plus_stat": "attack",     "minus_stat": "sp_attack",  "flavor": "spicy"},
+    {"name": "Naughty", "plus_stat": "attack",     "minus_stat": "sp_defense", "flavor": "spicy"},
+    {"name": "Bold",    "plus_stat": "defense",    "minus_stat": "attack",     "flavor": "sour"},
+    {"name": "Docile",  "plus_stat": None,         "minus_stat": None,         "flavor": None},
+    {"name": "Relaxed", "plus_stat": "defense",    "minus_stat": "speed",      "flavor": "sour"},
+    {"name": "Impish",  "plus_stat": "defense",    "minus_stat": "sp_attack",  "flavor": "sour"},
+    {"name": "Lax",     "plus_stat": "defense",    "minus_stat": "sp_defense", "flavor": "sour"},
+    {"name": "Timid",   "plus_stat": "speed",      "minus_stat": "attack",     "flavor": "sweet"},
+    {"name": "Hasty",   "plus_stat": "speed",      "minus_stat": "defense",    "flavor": "sweet"},
+    {"name": "Serious", "plus_stat": None,         "minus_stat": None,         "flavor": None},
+    {"name": "Jolly",   "plus_stat": "speed",      "minus_stat": "sp_attack",  "flavor": "sweet"},
+    {"name": "Naive",   "plus_stat": "speed",      "minus_stat": "sp_defense", "flavor": "sweet"},
+    {"name": "Modest",  "plus_stat": "sp_attack",  "minus_stat": "attack",     "flavor": "dry"},
+    {"name": "Mild",    "plus_stat": "sp_attack",  "minus_stat": "defense",    "flavor": "dry"},
+    {"name": "Quiet",   "plus_stat": "sp_attack",  "minus_stat": "speed",      "flavor": "dry"},
+    {"name": "Bashful", "plus_stat": None,         "minus_stat": None,         "flavor": None},
+    {"name": "Rash",    "plus_stat": "sp_attack",  "minus_stat": "sp_defense", "flavor": "dry"},
+    {"name": "Calm",    "plus_stat": "sp_defense", "minus_stat": "attack",     "flavor": "bitter"},
+    {"name": "Gentle",  "plus_stat": "sp_defense", "minus_stat": "defense",    "flavor": "bitter"},
+    {"name": "Sassy",   "plus_stat": "sp_defense", "minus_stat": "speed",      "flavor": "bitter"},
+    {"name": "Careful", "plus_stat": "sp_defense", "minus_stat": "sp_attack",  "flavor": "bitter"},
+    {"name": "Quirky",  "plus_stat": None,         "minus_stat": None,         "flavor": None},
+]
+
+CHARACTERISTICS: list[str] = [
+    "Loves to eat",
+    "Often dozes off",
+    "Often scatters things",
+    "Scatters things often",
+    "Likes to relax",
+    "Proud of its power",
+    "Likes to thrash about",
+    "A little quick tempered",
+    "Likes to fight",
+    "Quick tempered",
+    "Sturdy body",
+    "Capable of taking hits",
+    "Highly persistent",
+    "Good endurance",
+    "Good perseverance",
+    "Highly curious",
+    "Mischievous",
+    "Thoroughly cunning",
+    "Often lost in thought",
+    "Very finicky",
+    "Strong willed",
+    "Somewhat vain",
+    "Strongly defiant",
+    "Hates to lose",
+    "Somewhat stubborn",
+    "Likes to run",
+    "Alert to sounds",
+    "Impetuous and silly",
+    "Somewhat of a clown",
+    "Quick to flee",
+]

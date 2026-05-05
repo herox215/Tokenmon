@@ -45,9 +45,16 @@ def test_can_spawn_now_day_only_blocked_at_night():
 
 def test_random_species_respects_window():
     """Patch current_time_window to force night, confirm no day-only species
-    appear in 500 draws."""
+    appear in 500 draws. Patches the rng submodule directly so the patch is
+    visible to ``random_species`` regardless of how the package is laid out."""
     day_only = pokemon.GEN1_DAY_ONLY
-    with patch.object(pokemon, "current_time_window", return_value="night"):
+    # Try the post-Wave-D submodule first; fall back to the package binding.
+    try:
+        from tokenmon.pokemon import rng as _rng_mod
+        target = _rng_mod
+    except ImportError:
+        target = pokemon
+    with patch.object(target, "current_time_window", return_value="night"):
         sample = {pokemon.random_species() for _ in range(500)}
     assert sample.isdisjoint(day_only), "Day-only species spawned at night"
 

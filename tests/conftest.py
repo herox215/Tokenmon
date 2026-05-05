@@ -47,8 +47,17 @@ def _isolate_sprites(tmp_path, monkeypatch):
 
     import tokenmon.pokemon as pkmn
 
+    # Patch BOTH the package namespace and the submodule (post-Wave-D split)
+    # so ensure_sprite — defined in tokenmon.pokemon.sprites — sees the
+    # redirected dirs when it does direct module-attribute lookups.
     monkeypatch.setattr(pkmn, "SPRITE_DIR", sprite_dir, raising=False)
     monkeypatch.setattr(pkmn, "SHINY_SPRITE_DIR", shiny_dir, raising=False)
+    try:
+        from tokenmon.pokemon import sprites as _sprites_mod
+        monkeypatch.setattr(_sprites_mod, "SPRITE_DIR", sprite_dir, raising=False)
+        monkeypatch.setattr(_sprites_mod, "SHINY_SPRITE_DIR", shiny_dir, raising=False)
+    except ImportError:
+        pass  # Pre-Wave-D layout — no sprites submodule yet.
 
     def _fake_ensure_sprite(dex_id, timeout=5.0, *, shiny=False):
         target = (shiny_dir if shiny else sprite_dir) / f"{int(dex_id)}.gif"
