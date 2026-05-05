@@ -65,6 +65,16 @@ def name_of(dex_id: int) -> str:
     return ALL_NAMES.get(dex_id, f"#{dex_id}")
 
 
+def display_name(nickname: str | None, dex_id: int) -> str:
+    """Per-instance display name. Falls back to the species name when the
+    Pokemon hasn't been given a nickname (or the nickname is whitespace).
+    Use this anywhere a captured Pokemon is shown to the user — the daily
+    pane header, menubar tooltip, evolution / level-up notifications,
+    detail-view title — so user-set nicknames stay consistent."""
+    nick = (nickname or "").strip()
+    return nick or name_of(int(dex_id))
+
+
 def line_of(dex_id: int) -> int:
     """Return the base-form dex_id for the evolution line containing dex_id."""
     return _LINE_OF.get(dex_id, dex_id)

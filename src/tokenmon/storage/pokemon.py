@@ -14,6 +14,7 @@ __all__ = [
     "get_pokemon_by_id",
     "list_pokemon",
     "update_pokemon_species",
+    "update_pokemon_nickname",
     "bump_affection",
 ]
 
@@ -29,11 +30,14 @@ class Pokemon:
     is_shiny: bool
     affection: int = 0
     gender: str | None = None  # 'M', 'F', or None for genderless species
+    # Per-instance IVs (0..31), order: HP, Attack, Defense, Sp.Atk, Sp.Def, Speed.
+    ivs: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0)
 
 
 _POKEMON_COLUMNS = (
     "id, caught_date, species_dex_id, nature, characteristic, "
-    "nickname, is_shiny, affection, gender"
+    "nickname, is_shiny, affection, gender, "
+    "iv_hp, iv_attack, iv_defense, iv_sp_attack, iv_sp_defense, iv_speed"
 )
 
 
@@ -48,6 +52,10 @@ def _row_to_pokemon(row: tuple) -> Pokemon:
         is_shiny=bool(row[6]),
         affection=int(row[7]) if len(row) > 7 and row[7] is not None else 0,
         gender=row[8] if len(row) > 8 else None,
+        ivs=(
+            int(row[9] or 0), int(row[10] or 0), int(row[11] or 0),
+            int(row[12] or 0), int(row[13] or 0), int(row[14] or 0),
+        ) if len(row) > 14 else (0, 0, 0, 0, 0, 0),
     )
 
 
@@ -61,6 +69,7 @@ def insert_pokemon(
     is_shiny: bool = False,
     gender: str | None = None,
     source: str = "daily",
+    ivs: tuple[int, int, int, int, int, int] | None = None,
     path: Path | None = None,
 ) -> int:
     """Insert a Pokemon row and return its id.
@@ -68,16 +77,25 @@ def insert_pokemon(
     Caller is responsible for "is the daily already inserted?" idempotency —
     we no longer rely on a UNIQUE(caught_date) constraint because wild
     catches can legitimately share a calendar day with the daily.
+
+    ``ivs`` is a 6-tuple in (HP, ATK, DEF, Sp.Atk, Sp.Def, Speed) order. When
+    omitted we roll a fresh set so legacy callers keep working without
+    silently inserting an all-zero stat sheet.
     """
     if path is None:
         path = DB_PATH
+    if ivs is None:
+        from tokenmon.pokemon.stats import roll_ivs  # lazy: avoid import cycle
+        ivs = roll_ivs()
     with _connect(path) as conn:
         cur = conn.execute(
             """
             INSERT INTO pokemon (
                 caught_date, species_dex_id, nature, characteristic,
-                nickname, is_shiny, gender, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                nickname, is_shiny, gender, source,
+                iv_hp, iv_attack, iv_defense,
+                iv_sp_attack, iv_sp_defense, iv_speed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 caught_date.isoformat(),
@@ -88,6 +106,8 @@ def insert_pokemon(
                 1 if is_shiny else 0,
                 gender,
                 source,
+                int(ivs[0]), int(ivs[1]), int(ivs[2]),
+                int(ivs[3]), int(ivs[4]), int(ivs[5]),
             ),
         )
     return int(cur.lastrowid)
@@ -138,6 +158,27 @@ def update_pokemon_species(
         conn.execute(
             "UPDATE pokemon SET species_dex_id = ? WHERE id = ?",
             (int(new_species_dex_id), int(pokemon_id)),
+        )
+
+
+def update_pokemon_nickname(
+    pokemon_id: int, nickname: str | None, path: Path | None = None,
+) -> None:
+    """Set or clear the per-instance nickname.
+
+    Empty / whitespace-only strings collapse to NULL so callers don't need
+    to special-case "user typed nothing" — the detail view treats NULL
+    nickname as "fall back to the species name".
+    """
+    if path is None:
+        path = DB_PATH
+    nick = nickname.strip() if isinstance(nickname, str) else None
+    if not nick:
+        nick = None
+    with _connect(path) as conn:
+        conn.execute(
+            "UPDATE pokemon SET nickname = ? WHERE id = ?",
+            (nick, int(pokemon_id)),
         )
 
 

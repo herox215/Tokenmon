@@ -239,6 +239,203 @@ class _TypeBadge(NSView):
         astr.drawAtPoint_((x, y))
 
 
+# --- Layout backdrops -----------------------------------------------------
+
+
+class _CardView(NSView):
+    """Soft-tinted rounded-rectangle backdrop used to visually group
+    related content inside a pane. Drawn first so labels and controls
+    layered on top read as living *inside* the card."""
+
+    def drawRect_(self, _rect):  # noqa: N802
+        bounds = self.bounds()
+        # 6 % gray fill — readable in both light and dark appearance
+        # because we use `colorWithCalibratedWhite_alpha_` rather than a
+        # fixed RGB triplet.
+        NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.06).set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            bounds, 10, 10,
+        ).fill()
+        # Hairline border at 18 % so the card edge stays legible against
+        # the popover background even in dark mode.
+        NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.18).set()
+        border = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            bounds, 10, 10,
+        )
+        border.setLineWidth_(0.5)
+        border.stroke()
+
+
+class _SeparatorView(NSView):
+    """1-pixel hairline divider — used inside a _CardView to split the
+    sprite column from the info column."""
+
+    def drawRect_(self, _rect):  # noqa: N802
+        NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.20).set()
+        NSBezierPath.fillRect_(self.bounds())
+
+
+# --- Stats radar ----------------------------------------------------------
+
+import math
+
+
+class _StatsRadarView(NSView):
+    """Hexagonal radar chart for the six IVs (0..31) of one Pokemon instance.
+
+    The polygon shape encodes per-instance *potential* — base stats are
+    species-wide, IVs are what make this particular Charmander unique.
+    Scale is fixed at IV_MAX (31) so each axis is comparable. The fill
+    color is taken from the species' primary type so the chart visually
+    matches the type badge above. Hovering near an axis label surfaces
+    that stat's IV via tooltip; the explicit numbers are kept hidden in
+    the main chrome so the chart reads as flavour, not min-max porn.
+    """
+
+    AXIS_LABELS_CW: tuple[str, ...] = ("HP", "ATK", "DEF", "SP.A", "SP.D", "SPD")
+    # Stat order in the storage layer: HP, Atk, Def, Sp.Atk, Sp.Def, Speed.
+    # We render them clockwise from the top: HP top, ATK upper-right, DEF
+    # lower-right, Sp.A bottom, Sp.D lower-left, Speed upper-left.
+
+    def initWithFrame_ivs_typeColor_(self, frame, ivs, type_color):  # noqa: N802
+        self = objc.super(_StatsRadarView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        if len(ivs) != 6:
+            raise ValueError(f"_StatsRadarView expects 6 ivs, got {len(ivs)}")
+        self._ivs = tuple(int(v) for v in ivs)
+        self._type_color = type_color  # (r, g, b) in 0..1, or None for accent
+        self._tooltip_views: list[NSView] = []
+        self._install_tooltip_zones()
+        return self
+
+    # ------------------------------------------------------------------
+    # Hover tooltips: one transparent subview per axis label, each with
+    # its own ``setToolTip_``. Going through the per-view tooltip path
+    # avoids the ``view:stringForToolTip:point:userData:`` protocol —
+    # PyObjC can't always bridge that selector's ``void *`` userData
+    # cleanly, so the override silently never fires. Subviews "just work"
+    # because AppKit installs a tracking area per setToolTip_ call.
+    # ------------------------------------------------------------------
+
+    def _axis_label_rect(self, idx: int):
+        bounds = self.bounds()
+        cx = bounds.size.width / 2
+        cy = bounds.size.height / 2
+        radius = min(cx, cy) - 18
+        theta = math.pi / 2 - (idx * math.pi / 3)
+        lx = cx + (radius + 8) * math.cos(theta)
+        ly = cy + (radius + 8) * math.sin(theta)
+        size = 36
+        return NSMakeRect(lx - size / 2, ly - size / 2, size, size)
+
+    def _install_tooltip_zones(self):
+        from tokenmon.pokemon.stats import IV_MAX
+
+        for sv in self._tooltip_views:
+            sv.removeFromSuperview()
+        self._tooltip_views = []
+        for i in range(6):
+            rect = self._axis_label_rect(i)
+            zone = NSView.alloc().initWithFrame_(rect)
+            zone.setToolTip_(
+                f"{self.AXIS_LABELS_CW[i]}  IV {self._ivs[i]}/{IV_MAX}"
+            )
+            self.addSubview_(zone)
+            self._tooltip_views.append(zone)
+
+    def _axis_points(self, cx: float, cy: float, radius: float) -> list[tuple[float, float]]:
+        """Six points evenly spaced clockwise from the top of the chart."""
+        out: list[tuple[float, float]] = []
+        for i in range(6):
+            theta = math.pi / 2 - (i * math.pi / 3)  # 90°, 30°, -30°, …
+            out.append((cx + radius * math.cos(theta),
+                        cy + radius * math.sin(theta)))
+        return out
+
+    def _polygon_path(self, points: list[tuple[float, float]]) -> NSBezierPath:
+        path = NSBezierPath.bezierPath()
+        first = points[0]
+        path.moveToPoint_((first[0], first[1]))
+        for pt in points[1:]:
+            path.lineToPoint_((pt[0], pt[1]))
+        path.closePath()
+        return path
+
+    def drawRect_(self, _rect):  # noqa: N802
+        from tokenmon.pokemon.stats import IV_MAX
+
+        bounds = self.bounds()
+        cx = bounds.size.width / 2
+        cy = bounds.size.height / 2
+        # Leave room for the axis labels around the rim.
+        radius = min(cx, cy) - 18
+
+        # 1. Concentric hex grid — four rings at 25/50/75/100 % of the radius.
+        grid_color = NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.20)
+        for frac in (0.25, 0.5, 0.75, 1.0):
+            ring_pts = self._axis_points(cx, cy, radius * frac)
+            ring = self._polygon_path(ring_pts)
+            grid_color.set()
+            ring.setLineWidth_(1.0)
+            ring.stroke()
+
+        # 2. Six axis spokes from center to rim.
+        outer = self._axis_points(cx, cy, radius)
+        for ox, oy in outer:
+            spoke = NSBezierPath.bezierPath()
+            spoke.moveToPoint_((cx, cy))
+            spoke.lineToPoint_((ox, oy))
+            grid_color.set()
+            spoke.setLineWidth_(1.0)
+            spoke.stroke()
+
+        # 3. IV polygon — fixed 0..IV_MAX scale.
+        scale = float(IV_MAX)
+        stat_pts: list[tuple[float, float]] = []
+        for i, value in enumerate(self._ivs):
+            frac = max(0.0, min(1.0, value / scale))
+            theta = math.pi / 2 - (i * math.pi / 3)
+            stat_pts.append((cx + radius * frac * math.cos(theta),
+                             cy + radius * frac * math.sin(theta)))
+        stat_path = self._polygon_path(stat_pts)
+
+        if self._type_color is not None:
+            r, g, b = self._type_color
+        else:
+            r, g, b = (0.36, 0.78, 0.20)  # fallback green
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 0.35).set()
+        stat_path.fill()
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 0.95).set()
+        stat_path.setLineWidth_(1.5)
+        stat_path.stroke()
+
+        # 4. Vertex dots so low-stat axes are still visible.
+        for px, py in stat_pts:
+            dot = NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(px - 2, py - 2, 4, 4)
+            )
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0).set()
+            dot.fill()
+
+        # 5. Axis labels just outside each rim vertex.
+        label_attrs = {
+            NSFontAttributeName: NSFont.systemFontOfSize_(9),
+            NSForegroundColorAttributeName: NSColor.secondaryLabelColor(),
+        }
+        for i, (ox, oy) in enumerate(outer):
+            text = self.AXIS_LABELS_CW[i]
+            astr = NSAttributedString.alloc().initWithString_attributes_(
+                text, label_attrs,
+            )
+            size = astr.size()
+            theta = math.pi / 2 - (i * math.pi / 3)
+            # Push the label outwards along the axis by ~half its size + a gap.
+            lx = cx + (radius + 8) * math.cos(theta) - size.width / 2
+            ly = cy + (radius + 8) * math.sin(theta) - size.height / 2
+            astr.drawAtPoint_((lx, ly))
+
+
 def _type_badge_row(
     cx: float, y: float, types: tuple[str, ...],
     *,

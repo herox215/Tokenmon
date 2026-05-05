@@ -135,3 +135,14 @@ def seeded_nature(date_iso: str, salt: str) -> dict:
 
 def seeded_characteristic(date_iso: str, salt: str) -> str:
     return CHARACTERISTICS[_seed_index(date_iso, salt, "characteristic", len(CHARACTERISTICS))]
+
+
+def seeded_ivs(date_iso: str, salt: str) -> tuple[int, int, int, int, int, int]:
+    """Deterministic six-IV roll for ``(date_iso, salt)`` — used by legacy-day
+    backfill so the historical attribution stays stable across reinstalls.
+    Each stat hashes its own subseed so they're independent of each other."""
+    out: list[int] = []
+    for stat in ("hp", "attack", "defense", "sp_attack", "sp_defense", "speed"):
+        h = hashlib.sha256(f"{date_iso}:{salt}:iv:{stat}".encode()).hexdigest()
+        out.append(int(h, 16) % 32)
+    return tuple(out)  # type: ignore[return-value]

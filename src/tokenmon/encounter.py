@@ -96,7 +96,8 @@ def maybe_spawn(*, force: bool = False, path: Path = DB_PATH) -> Encounter | Non
 
     species_dex_id = pokemon.random_species()
     nature = pokemon.random_nature()
-    characteristic = pokemon.random_characteristic()
+    ivs = pokemon.roll_ivs()
+    characteristic = pokemon.characteristic_for_ivs(ivs)
     level = _RNG.randint(LEVEL_MIN, LEVEL_MAX)
     catch_rate = pokemon.catch_rate_of(species_dex_id)
     gender = pokemon.roll_gender(species_dex_id)
@@ -110,6 +111,7 @@ def maybe_spawn(*, force: bool = False, path: Path = DB_PATH) -> Encounter | Non
         catch_rate=catch_rate,
         gender=gender,
         is_shiny=is_shiny,
+        ivs=ivs,
         path=path,
     )
     # Persistent Pokedex entry: 'seen' on every spawn, even if the user
@@ -269,6 +271,7 @@ def _resolve_throw(
                 pending.characteristic,
                 is_shiny=pending.is_shiny,
                 gender=pending.gender,
+                ivs=pending.ivs,
                 path=path,
             )
         except AttributeError:  # pragma: no cover — staging fallback
@@ -281,6 +284,7 @@ def _resolve_throw(
                 characteristic=pending.characteristic,
                 is_shiny=pending.is_shiny,
                 gender=pending.gender,
+                ivs=pending.ivs,
                 path=path,
             )
         mark_encounter_caught(pending.id, new_pokemon_id, path=path)

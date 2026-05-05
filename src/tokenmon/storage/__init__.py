@@ -41,6 +41,7 @@ from .pokemon import (
     get_pokemon_by_id,
     list_pokemon,
     update_pokemon_species,
+    update_pokemon_nickname,
     bump_affection,
 )
 
@@ -86,7 +87,8 @@ __all__ = [
     "backfill_trained_pokemon_ids",
     # pokemon
     "Pokemon", "insert_pokemon", "get_pokemon_for_date", "get_pokemon_by_id",
-    "list_pokemon", "update_pokemon_species", "bump_affection",
+    "list_pokemon", "update_pokemon_species", "update_pokemon_nickname",
+    "bump_affection",
     # encounter
     "Encounter", "insert_encounter", "get_pending_encounter",
     "mark_encounter_caught", "mark_encounter_ran", "update_encounter_hint",

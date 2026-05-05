@@ -190,6 +190,87 @@ class _PokedexBackHandler(NSObject):
         self._popover._show_pane(PANE_TOKENDEX)
 
 
+class _NicknameInlineHandler(NSObject):
+    """Inline nickname editor handlers: ✏️ enters edit mode, ✓ / Enter
+    saves, ✗ / Esc cancels. State lives on the popover (``_editing_nickname``)
+    so a re-render of the detail pane can swap label↔field without losing
+    intent. Empty/whitespace input collapses to NULL → original name."""
+
+    def initWithPopover_pokemonId_(self, popover, pokemon_id):  # noqa: N802
+        self = objc.super(_NicknameInlineHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        self._pokemon_id = int(pokemon_id)
+        self._field = None  # populated when the field is built
+        return self
+
+    def beginEdit_(self, _sender):  # noqa: N802 — pencil click
+        self._popover._editing_nickname = True
+        self._popover._show_pane(PANE_BOX)
+
+    @objc.python_method
+    def _commit(self, value):
+        from tokenmon.storage import update_pokemon_nickname
+        try:
+            update_pokemon_nickname(self._pokemon_id, value)
+        except Exception:
+            log.exception("update_pokemon_nickname failed")
+        # Refresh the menubar tooltip immediately — _update_tooltip reads
+        # the fresh Pokemon row from disk, so it'll pick up the nickname
+        # change right away. The 30 s auto_refresh would otherwise leave
+        # the old tooltip showing stale text.
+        try:
+            app = self._popover._app
+            if hasattr(app, "_update_tooltip"):
+                app._update_tooltip()
+        except Exception:
+            log.exception("tooltip refresh after nickname change failed")
+        self._popover._editing_nickname = False
+        self._popover._show_pane(PANE_BOX)
+
+    def saveField_(self, sender):  # noqa: N802 — NSTextField action (Enter)
+        self._commit(sender.stringValue().strip() or None)
+
+    def saveButton_(self, _sender):  # noqa: N802 — ✓ click
+        if self._field is None:
+            return
+        self._commit(self._field.stringValue().strip() or None)
+
+    def cancelButton_(self, _sender):  # noqa: N802 — ✗ click
+        self._popover._editing_nickname = False
+        self._popover._show_pane(PANE_BOX)
+
+    # NSTextField delegate: catch Esc to cancel without saving.
+    def control_textView_doCommandBySelector_(  # noqa: N802
+        self, _control, _text_view, command,
+    ):
+        sel = str(command) if command is not None else ""
+        if sel in ("cancelOperation:", "cancel:"):
+            self._popover._editing_nickname = False
+            self._popover._show_pane(PANE_BOX)
+            return True
+        return False
+
+
+class _StatsModeHandler(NSObject):
+    """NSSegmentedControl handler that toggles the Pokemon detail pane
+    between the final-stats grid and the IV radar / IV-numbers view.
+    Re-renders the detail pane on change."""
+
+    def initWithPopover_(self, popover):  # noqa: N802
+        self = objc.super(_StatsModeHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        return self
+
+    def modeChanged_(self, sender):  # noqa: N802
+        idx = int(sender.selectedSegment())
+        self._popover._stats_mode = "ivs" if idx == 1 else "stats"
+        self._popover._show_pane(PANE_BOX)
+
+
 class _SetActiveHandler(NSObject):
     """Box-detail "Set as active" button — pins the active Pokemon and re-renders."""
 
@@ -487,8 +568,8 @@ class _ItemsPaneRowHandler(NSObject):
                     title="Tokenmon",
                     subtitle=f"{item_name} hatte keinen Effekt",
                     message=(
-                        f"{pokemon.name_of(active.species_dex_id)} kann mit "
-                        f"{item_name} nicht entwickelt werden."
+                        f"{pokemon.display_name(active.nickname, active.species_dex_id)} "
+                        f"kann mit {item_name} nicht entwickelt werden."
                     ),
                 )
             except Exception:
@@ -511,8 +592,8 @@ class _ItemsPaneRowHandler(NSObject):
                 title="Tokenmon",
                 subtitle="Entwicklung!",
                 message=(
-                    f"{pokemon.name_of(active.species_dex_id)} entwickelte sich "
-                    f"zu {pokemon.name_of(evolved)}!"
+                    f"{pokemon.display_name(active.nickname, active.species_dex_id)} "
+                    f"entwickelte sich zu {pokemon.name_of(evolved)}!"
                 ),
             )
         except Exception:
@@ -670,6 +751,11 @@ class TokenmonPopover(NSObject):
         self._box_handlers: list[NSObject] = []
         self._box_back_handler: _BoxBackHandler | None = None
         self._set_active_handler: _SetActiveHandler | None = None
+        # Detail-pane stats segmented control: "stats" or "ivs".
+        self._stats_mode: str = "stats"
+        self._stats_mode_handler: _StatsModeHandler | None = None
+        self._nick_handler: _NicknameInlineHandler | None = None
+        self._editing_nickname: bool = False
 
         # Encounter-pane handler refs.
         self._encounter_bag_open: bool = False
@@ -826,6 +912,11 @@ class TokenmonPopover(NSObject):
         # throw) preserves the user's bag-open intent.
         if idx != PANE_ENCOUNTER:
             self._encounter_bag_open = False
+        # Leaving the box pane (or returning to the box grid) drops any
+        # in-flight nickname edit so the user doesn't get stuck in edit
+        # mode after navigating away.
+        if idx != PANE_BOX or self._box_selected_id is None:
+            self._editing_nickname = False
         # Cancel any pending reveal timer if we're transitioning panes manually.
         if self._reveal_timer is not None:
             try:
@@ -1584,7 +1675,7 @@ class TokenmonPopover(NSObject):
         header_y = POPOVER_HEIGHT - 28
         view.addSubview_(_label(
             NSMakeRect(0, header_y, CONTENT_WIDTH, 20),
-            f"Active: {pokemon.name_of(species)}",
+            f"Active: {pokemon.display_name(row.nickname, species)}",
             font=NSFont.boldSystemFontOfSize_(13),
             color=NSColor.secondaryLabelColor(),
             align=NSTextAlignmentCenter,
@@ -1639,13 +1730,24 @@ class TokenmonPopover(NSObject):
         view.addSubview_(catcher)
         self._pat_catcher = catcher
 
-        name = pokemon.name_of(species)
+        species_name = pokemon.name_of(species)
+        display_name = pokemon.display_name(row.nickname, species)
         sym = pokemon.gender_symbol(row.gender)
-        name_decoration = (
-            ("✨ " if row.is_shiny else "")
-            + f"#{species:03d}  {name}"
-            + (f"  {sym}" if sym else "")
-        )
+        # When the user has set a nickname, lead with it and keep the dex
+        # number + species name as a smaller subtitle below; otherwise the
+        # original "#001 Bulbasaur" header remains.
+        if row.nickname and row.nickname.strip():
+            name_decoration = (
+                ("✨ " if row.is_shiny else "")
+                + display_name
+                + (f"  {sym}" if sym else "")
+            )
+        else:
+            name_decoration = (
+                ("✨ " if row.is_shiny else "")
+                + f"#{species:03d}  {species_name}"
+                + (f"  {sym}" if sym else "")
+            )
         name_y = sprite_y - 32
         view.addSubview_(_label(
             NSMakeRect(0, name_y, CONTENT_WIDTH, 26),
@@ -1654,12 +1756,28 @@ class TokenmonPopover(NSObject):
             align=NSTextAlignmentCenter,
         ))
 
-        # Type badges, centred under the name.
+        # Subtitle row only when a nickname is set — gives "#001 Bulbasaur"
+        # underneath the nicknamed title without taking vertical space when
+        # there's nothing extra to show.
+        if row.nickname and row.nickname.strip():
+            subtitle_y = name_y - 14
+            view.addSubview_(_label(
+                NSMakeRect(0, subtitle_y, CONTENT_WIDTH, 14),
+                f"#{species:03d}  {species_name}",
+                font=NSFont.systemFontOfSize_(11),
+                color=NSColor.tertiaryLabelColor(),
+                align=NSTextAlignmentCenter,
+            ))
+            badge_anchor_y = subtitle_y
+        else:
+            badge_anchor_y = name_y
+
+        # Type badges, centred under the name (or subtitle when present).
         from tokenmon.popover.widgets import (
             TYPE_BADGE_HEIGHT, _type_badge_row,
         )
         types = pokemon.types_of(species)
-        badge_y = name_y - TYPE_BADGE_HEIGHT - 6
+        badge_y = badge_anchor_y - TYPE_BADGE_HEIGHT - 6
         for badge in _type_badge_row(CONTENT_WIDTH / 2, badge_y, types):
             view.addSubview_(badge)
 
@@ -2158,6 +2276,22 @@ class TokenmonPopover(NSObject):
         rate = pokemon.growth_rate_of(species)
         level, into, needed = pokemon.level_from_xp(xp, rate)
 
+        # Card backdrops — added FIRST so labels/buttons sit on top.
+        # Card 1 holds the sprite + identity column; card 2 holds the
+        # Stats / IVs split. A hairline divider between sprite and info
+        # column inside card 1 ties the two halves together.
+        from tokenmon.popover.widgets import _CardView, _SeparatorView
+
+        card1_rect = NSMakeRect(8, 252, CONTENT_WIDTH - 16, 208)
+        card2_rect = NSMakeRect(8, 52, CONTENT_WIDTH - 16, 188)
+        view.addSubview_(_CardView.alloc().initWithFrame_(card1_rect))
+        view.addSubview_(_CardView.alloc().initWithFrame_(card2_rect))
+        # Vertical hairline at x=152 (just right of the 128-px sprite),
+        # spanning most of card 1's interior height.
+        view.addSubview_(_SeparatorView.alloc().initWithFrame_(
+            NSMakeRect(152, 264, 1, 184)
+        ))
+
         # 2-column layout: left = big sprite, right = labels.
         sprite_size = 128
         sprite_x = 16
@@ -2177,17 +2311,92 @@ class TokenmonPopover(NSObject):
         y_cursor = POPOVER_HEIGHT - 60
 
         sym = pokemon.gender_symbol(p.gender)
-        name_decoration = (
+        species_name = pokemon.name_of(species)
+        display_name = (p.nickname or species_name).strip() or species_name
+        title_text = (
             ("✨ " if p.is_shiny else "")
-            + f"#{species:03d}  {pokemon.name_of(species)}"
+            + display_name
             + (f"  {sym}" if sym else "")
         )
+
+        # Persistent handler for the inline nickname editor — kept on the
+        # popover so the NSButton/field don't release it mid-flight.
+        self._nick_handler = (
+            _NicknameInlineHandler.alloc()
+            .initWithPopover_pokemonId_(self, p.id)
+        )
+
+        if self._editing_nickname:
+            # Inline edit row: text field + ✓ save + ✗ cancel.
+            from AppKit import NSTextField
+
+            field_w = col_w - 56
+            text_field = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(col_x, y_cursor - 24, field_w, 24)
+            )
+            text_field.setStringValue_(p.nickname or "")
+            text_field.setPlaceholderString_(species_name)
+            text_field.setFont_(NSFont.boldSystemFontOfSize_(14))
+            text_field.setTarget_(self._nick_handler)
+            text_field.setAction_(b"saveField:")
+            text_field.setDelegate_(self._nick_handler)
+            view.addSubview_(text_field)
+            self._nick_handler._field = text_field
+            # Defer focus to the next runloop tick so the field is in the
+            # window by the time selectText: runs.
+            text_field.performSelector_withObject_afterDelay_(
+                b"selectText:", None, 0.0,
+            )
+
+            save_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(col_x + col_w - 52, y_cursor - 24, 24, 24)
+            )
+            save_btn.setTitle_("✓")
+            save_btn.setBordered_(False)
+            save_btn.setToolTip_("Speichern (Enter)")
+            save_btn.setTarget_(self._nick_handler)
+            save_btn.setAction_(b"saveButton:")
+            view.addSubview_(save_btn)
+
+            cancel_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(col_x + col_w - 26, y_cursor - 24, 24, 24)
+            )
+            cancel_btn.setTitle_("✗")
+            cancel_btn.setBordered_(False)
+            cancel_btn.setToolTip_("Abbrechen (Esc)")
+            cancel_btn.setTarget_(self._nick_handler)
+            cancel_btn.setAction_(b"cancelButton:")
+            view.addSubview_(cancel_btn)
+        else:
+            # Title label + ✏️ edit button.
+            view.addSubview_(_label(
+                NSMakeRect(col_x, y_cursor - 22, col_w - 28, 22),
+                title_text,
+                font=NSFont.boldSystemFontOfSize_(15),
+            ))
+            edit_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(col_x + col_w - 26, y_cursor - 24, 26, 24)
+            )
+            edit_btn.setTitle_("✏️")
+            edit_btn.setBordered_(False)
+            edit_btn.setToolTip_("Spitznamen bearbeiten")
+            edit_btn.setTarget_(self._nick_handler)
+            edit_btn.setAction_(b"beginEdit:")
+            view.addSubview_(edit_btn)
+        y_cursor -= 24
+
+        # Subtitle: dex number + species + caught date. Always rendered so
+        # the layout is stable regardless of nickname presence.
+        subtitle_text = (
+            f"#{species:03d}  {species_name}  ·  {p.caught_date.isoformat()}"
+        )
         view.addSubview_(_label(
-            NSMakeRect(col_x, y_cursor - 22, col_w, 22),
-            name_decoration,
-            font=NSFont.boldSystemFontOfSize_(15),
+            NSMakeRect(col_x, y_cursor - 14, col_w, 14),
+            subtitle_text,
+            font=NSFont.systemFontOfSize_(11),
+            color=NSColor.tertiaryLabelColor(),
         ))
-        y_cursor -= 26
+        y_cursor -= 18
 
         # Type badges, smaller (52×16) so they fit the right column.
         from tokenmon.popover.widgets import _type_badge_row
@@ -2248,14 +2457,113 @@ class TokenmonPopover(NSObject):
             font=NSFont.systemFontOfSize_(11),
             color=NSColor.secondaryLabelColor(),
         ))
-        y_cursor -= 18
 
-        view.addSubview_(_label(
-            NSMakeRect(col_x, y_cursor - 16, col_w, 16),
-            f"Caught: {p.caught_date.isoformat()}",
-            font=NSFont.systemFontOfSize_(11),
-            color=NSColor.tertiaryLabelColor(),
-        ))
+        # Stats / IVs split — segmented control switches between the
+        # final-stat grid (default) and the IV radar + numeric IV grid.
+        # Both modes occupy the same vertical band so the layout below
+        # them (active button) doesn't shift when the user toggles.
+        from AppKit import NSSegmentedControl
+        from tokenmon.popover.widgets import _StatsRadarView
+        from tokenmon.pokemon import (
+            IV_MAX, STAT_LABELS, STAT_ORDER, TYPE_COLORS, final_stats,
+            nature_multipliers,
+        )
+
+        # Segmented control row.
+        seg_top = 210
+        seg_w = 160
+        seg_h = 22
+        self._stats_mode_handler = (
+            _StatsModeHandler.alloc().initWithPopover_(self)
+        )
+        seg = NSSegmentedControl.alloc().initWithFrame_(
+            NSMakeRect((CONTENT_WIDTH - seg_w) // 2, seg_top, seg_w, seg_h)
+        )
+        seg.setSegmentCount_(2)
+        seg.setLabel_forSegment_("Stats", 0)
+        seg.setLabel_forSegment_("IVs", 1)
+        seg.setSelectedSegment_(1 if self._stats_mode == "ivs" else 0)
+        seg.setTarget_(self._stats_mode_handler)
+        seg.setAction_(b"modeChanged:")
+        view.addSubview_(seg)
+
+        content_top = seg_top - 8  # below the segmented control
+
+        if self._stats_mode == "ivs":
+            # IV view: radar (left) + IV numbers grid (right).
+            radar_size = 140
+            radar_x = 24  # match card1's interior padding
+            radar_y = 62  # leave ~10 px breathing room above card2's bottom
+            primary_type = types[0] if types else "normal"
+            type_color = TYPE_COLORS.get(primary_type)
+            radar = _StatsRadarView.alloc().initWithFrame_ivs_typeColor_(
+                NSMakeRect(radar_x, radar_y, radar_size, radar_size),
+                p.ivs, type_color,
+            )
+            view.addSubview_(radar)
+
+            iv_x = radar_x + radar_size + 16
+            iv_w = CONTENT_WIDTH - iv_x - 16
+            row_h = 22
+            iv_top = radar_y + radar_size - 4
+            for i, key in enumerate(STAT_ORDER):
+                row_y = iv_top - (i + 1) * row_h
+                view.addSubview_(_label(
+                    NSMakeRect(iv_x, row_y, 50, row_h),
+                    STAT_LABELS[key],
+                    font=NSFont.systemFontOfSize_(11),
+                    color=NSColor.secondaryLabelColor(),
+                ))
+                view.addSubview_(_label(
+                    NSMakeRect(iv_x + 52, row_y, iv_w - 56, row_h),
+                    f"{p.ivs[i]} / {IV_MAX}",
+                    font=NSFont.boldSystemFontOfSize_(12),
+                ))
+        else:
+            # Stats view: final values (base + IV + nature + level), 2x3.
+            try:
+                stats = final_stats(species, p.ivs, level, p.nature)
+            except Exception:
+                log.exception("final_stats failed")
+                stats = (1, 1, 1, 1, 1, 1)
+            mults = nature_multipliers(p.nature)
+
+            # Vertical-center the 3×2 grid in the area between the seg
+            # control and the bottom of card 2 (which lives at y=52).
+            col_w = (CONTENT_WIDTH - 32) // 2
+            grid_x = 24
+            row_h = 28
+            grid_h_total = 3 * row_h
+            content_area_bottom = 52
+            grid_top = content_top - (content_top - content_area_bottom - grid_h_total) // 2
+            for i, key in enumerate(STAT_ORDER):
+                col = i % 2
+                row = i // 2
+                x = grid_x + col * col_w
+                y = grid_top - row_h - row * row_h
+                view.addSubview_(_label(
+                    NSMakeRect(x, y, 56, row_h),
+                    STAT_LABELS[key],
+                    font=NSFont.systemFontOfSize_(12),
+                    color=NSColor.secondaryLabelColor(),
+                ))
+                mult = mults[key]
+                if mult > 1.0:
+                    color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                        0.86, 0.40, 0.20, 1.0,
+                    )
+                elif mult < 1.0:
+                    color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                        0.30, 0.55, 0.85, 1.0,
+                    )
+                else:
+                    color = NSColor.labelColor()
+                view.addSubview_(_label(
+                    NSMakeRect(x + 60, y, col_w - 64, row_h),
+                    f"{stats[i]}",
+                    font=NSFont.boldSystemFontOfSize_(14),
+                    color=color,
+                ))
 
         # "Set as active" / "✓ Active" button at the bottom.
         try:

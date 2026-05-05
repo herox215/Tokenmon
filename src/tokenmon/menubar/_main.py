@@ -317,7 +317,10 @@ class TokenmonApp(rumps.App):
                 rumps.notification(
                     title="Tokenmon",
                     subtitle="Entwicklung!",
-                    message=f"{pokemon.name_of(old_id)} entwickelt sich zu {pokemon.name_of(new_id)}!",
+                    message=(
+                        f"{pokemon.display_name(active.nickname, old_id)} "
+                        f"entwickelt sich zu {pokemon.name_of(new_id)}!"
+                    ),
                 )
             except Exception:
                 log.exception("evolution notification failed")
@@ -407,10 +410,18 @@ class TokenmonApp(rumps.App):
         if new_level > self._last_known_level:
             self._last_known_level = new_level
             try:
+                active = box.get_active_pokemon()
+            except Exception:
+                active = None
+            display = pokemon.display_name(
+                active.nickname if active is not None else None,
+                self._pokemon_dex_id,
+            )
+            try:
                 rumps.notification(
                     title="Tokenmon",
                     subtitle="Level up!",
-                    message=f"{pokemon.name_of(self._pokemon_dex_id)} ist aufgestiegen!",
+                    message=f"{display} ist aufgestiegen!",
                 )
             except Exception:
                 log.exception("level-up notification failed")
@@ -453,7 +464,10 @@ class TokenmonApp(rumps.App):
             xp = 0
         rate = pokemon.growth_rate_of(self._line_base_id)
         level, into, needed = pokemon.level_from_xp(xp, rate)
-        name = pokemon.name_of(self._pokemon_dex_id)
+        name = pokemon.display_name(
+            active.nickname if active is not None else None,
+            self._pokemon_dex_id,
+        )
         if level >= pokemon.MAX_LEVEL:
             tooltip = f"{name} — Lv MAX • {xp:,} XP"
         else:

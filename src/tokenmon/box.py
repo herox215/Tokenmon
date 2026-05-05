@@ -53,13 +53,15 @@ def ensure_today_pokemon(path: Path = DB_PATH) -> Pokemon:
 
     species = pokemon.random_species()
     nature = pokemon.random_nature()
-    characteristic = pokemon.random_characteristic()
+    ivs = pokemon.roll_ivs()
+    characteristic = pokemon.characteristic_for_ivs(ivs)
 
     new_id = insert_pokemon(
         caught_date=today,
         species_dex_id=species,
         nature=nature["name"],
         characteristic=characteristic,
+        ivs=ivs,
         path=path,
     )
     try:
@@ -124,6 +126,7 @@ def add_caught_pokemon(
     caught_date: date | None = None,
     is_shiny: bool = False,
     gender: str | None = None,
+    ivs: tuple[int, int, int, int, int, int] | None = None,
     path: Path = DB_PATH,
 ) -> int:
     """Insert a Pokemon row for a wild encounter that the user just caught.
@@ -132,6 +135,10 @@ def add_caught_pokemon(
     pick. The legacy "backdate one day at a time on UNIQUE collision" kludge
     is gone — the unique constraint was dropped in the source-column
     migration.
+
+    ``ivs`` should be the encounter's IVs so the caught Pokemon's stats
+    match what the encounter UI showed before the throw. Falls through to a
+    fresh roll inside ``insert_pokemon`` when omitted.
     """
     new_id = insert_pokemon(
         caught_date=caught_date or _today_local(),
@@ -140,6 +147,7 @@ def add_caught_pokemon(
         characteristic=characteristic,
         is_shiny=is_shiny,
         gender=gender,
+        ivs=ivs,
         source="wild",
         path=path,
     )
@@ -242,12 +250,14 @@ def migrate_legacy_days(path: Path = DB_PATH) -> int:
         date_iso = day.isoformat()
         species = pokemon.seeded_species(date_iso, salt)
         nature = pokemon.seeded_nature(date_iso, salt)
-        characteristic = pokemon.seeded_characteristic(date_iso, salt)
+        ivs = pokemon.seeded_ivs(date_iso, salt)
+        characteristic = pokemon.characteristic_for_ivs(ivs)
         insert_pokemon(
             caught_date=day,
             species_dex_id=species,
             nature=nature["name"],
             characteristic=characteristic,
+            ivs=ivs,
             path=path,
         )
         inserted += 1

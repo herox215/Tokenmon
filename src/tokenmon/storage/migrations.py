@@ -35,7 +35,13 @@ CREATE TABLE IF NOT EXISTS pokemon (
     nature TEXT NOT NULL,
     characteristic TEXT NOT NULL,
     nickname TEXT,
-    is_shiny INTEGER NOT NULL DEFAULT 0
+    is_shiny INTEGER NOT NULL DEFAULT 0,
+    iv_hp INTEGER NOT NULL DEFAULT 0,
+    iv_attack INTEGER NOT NULL DEFAULT 0,
+    iv_defense INTEGER NOT NULL DEFAULT 0,
+    iv_sp_attack INTEGER NOT NULL DEFAULT 0,
+    iv_sp_defense INTEGER NOT NULL DEFAULT 0,
+    iv_speed INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pokemon_caught_date ON pokemon(caught_date);
 CREATE INDEX IF NOT EXISTS idx_pokemon_species ON pokemon(species_dex_id);
@@ -55,7 +61,13 @@ CREATE TABLE IF NOT EXISTS encounters (
     resolved TEXT,
     resolved_utc TEXT,
     pokemon_id INTEGER,
-    last_hint TEXT
+    last_hint TEXT,
+    iv_hp INTEGER NOT NULL DEFAULT 0,
+    iv_attack INTEGER NOT NULL DEFAULT 0,
+    iv_defense INTEGER NOT NULL DEFAULT 0,
+    iv_sp_attack INTEGER NOT NULL DEFAULT 0,
+    iv_sp_defense INTEGER NOT NULL DEFAULT 0,
+    iv_speed INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_encounters_resolved ON encounters(resolved);
 
@@ -262,6 +274,41 @@ def _backfill_pokedex_seen(conn: sqlite3.Connection) -> None:
             )
 
 
+_IV_COLUMNS: tuple[str, ...] = (
+    "iv_hp", "iv_attack", "iv_defense",
+    "iv_sp_attack", "iv_sp_defense", "iv_speed",
+)
+
+
+def _ensure_iv_columns(conn: sqlite3.Connection) -> None:
+    """Add the six IV columns to pokemon + encounters and backfill any rows
+    that pre-date the column with a deterministic id-seeded roll. Idempotent.
+    """
+    from tokenmon.pokemon.stats import ivs_from_id  # lazy — pokemon -> storage cycle
+
+    for table in ("pokemon", "encounters"):
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for col in _IV_COLUMNS:
+            if col not in cols:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
+                )
+        # Backfill rows that still have the all-zero default. A real roll
+        # rarely produces six zeros (1 / 32**6 ≈ 1e-9), so using "all zero"
+        # as the sentinel for "never backfilled" is safe in practice.
+        zero_clause = " AND ".join(f"{c} = 0" for c in _IV_COLUMNS)
+        rows = conn.execute(
+            f"SELECT id FROM {table} WHERE {zero_clause}"
+        ).fetchall()
+        for (row_id,) in rows:
+            ivs = ivs_from_id(int(row_id))
+            set_clause = ", ".join(f"{c} = ?" for c in _IV_COLUMNS)
+            conn.execute(
+                f"UPDATE {table} SET {set_clause} WHERE id = ?",
+                (*ivs, int(row_id)),
+            )
+
+
 _INVENTORY_BACKFILL_SENTINEL = "__backfilled__"
 
 
@@ -325,6 +372,7 @@ def init_db(path: Path | None = None) -> None:
         _ensure_affection_column(conn)
         _ensure_gender_shiny_columns(conn)
         _ensure_pokemon_source_column(conn)
+        _ensure_iv_columns(conn)
         _migrate_encounter_balls_to_items(conn)
         _backfill_pokedex_seen(conn)
         _backfill_inventory(conn)

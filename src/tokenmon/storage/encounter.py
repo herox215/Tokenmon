@@ -45,6 +45,7 @@ class Encounter:
     last_hint: str | None
     gender: str | None = None
     is_shiny: bool = False
+    ivs: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0)
 
 
 def _parse_utc(ts: str | None) -> datetime | None:
@@ -75,6 +76,10 @@ def _row_to_encounter(row: tuple) -> Encounter:
         last_hint=row[14],
         gender=row[15] if len(row) > 15 else None,
         is_shiny=bool(row[16]) if len(row) > 16 and row[16] is not None else False,
+        ivs=(
+            int(row[17] or 0), int(row[18] or 0), int(row[19] or 0),
+            int(row[20] or 0), int(row[21] or 0), int(row[22] or 0),
+        ) if len(row) > 22 else (0, 0, 0, 0, 0, 0),
     )
 
 
@@ -82,7 +87,8 @@ _ENCOUNTER_COLS = (
     "id, spawned_utc, species_dex_id, nature, characteristic, level, "
     "catch_rate, pokeballs_used, greatballs_used, ultraballs_used, "
     "masterballs_used, resolved, resolved_utc, pokemon_id, last_hint, "
-    "gender, is_shiny"
+    "gender, is_shiny, "
+    "iv_hp, iv_attack, iv_defense, iv_sp_attack, iv_sp_defense, iv_speed"
 )
 
 
@@ -95,22 +101,30 @@ def insert_encounter(
     *,
     gender: str | None = None,
     is_shiny: bool = False,
+    ivs: tuple[int, int, int, int, int, int] | None = None,
     path: Path | None = None,
 ) -> int:
     if path is None:
         path = DB_PATH
+    if ivs is None:
+        from tokenmon.pokemon.stats import roll_ivs  # lazy: avoid import cycle
+        ivs = roll_ivs()
     spawned = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     with _connect(path) as conn:
         cur = conn.execute(
             """
             INSERT INTO encounters (
                 spawned_utc, species_dex_id, nature, characteristic,
-                level, catch_rate, gender, is_shiny
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                level, catch_rate, gender, is_shiny,
+                iv_hp, iv_attack, iv_defense,
+                iv_sp_attack, iv_sp_defense, iv_speed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 spawned, species_dex_id, nature, characteristic,
                 level, catch_rate, gender, 1 if is_shiny else 0,
+                int(ivs[0]), int(ivs[1]), int(ivs[2]),
+                int(ivs[3]), int(ivs[4]), int(ivs[5]),
             ),
         )
         return int(cur.lastrowid)
