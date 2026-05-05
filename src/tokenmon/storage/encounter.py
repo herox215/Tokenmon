@@ -380,10 +380,11 @@ def query_pending_drops(path: Path | None = None) -> dict[str, int]:
 
 
 def claim_pending_drops(path: Path | None = None) -> dict[str, int]:
-    """Atomically move every pending drop into the inventory (capped at the
+    """Atomically move pending drops into the inventory (capped at the
     item's ``cap``), returning ``{item_key: count}`` of what was actually
-    transferred. Pending entries are zeroed out — anything in excess of the
-    inventory cap is discarded.
+    transferred. Overflow that doesn't fit under the cap stays in
+    ``pending_drops`` so a full bag doesn't silently destroy loot — the
+    user can claim it after using items down to free up space.
     """
     from tokenmon.items import ITEMS
 
@@ -399,12 +400,14 @@ def claim_pending_drops(path: Path | None = None) -> dict[str, int]:
             if item is None:
                 continue
             cap = int(item.cap)
+            pending = int(pending)
             cur_row = conn.execute(
                 "SELECT count FROM inventory WHERE item_key = ?", (key,),
             ).fetchone()
             cur = int(cur_row[0]) if cur_row else 0
-            target = min(cap, cur + int(pending))
+            target = min(cap, cur + pending)
             granted = max(0, target - cur)
+            leftover = pending - granted
             if granted > 0:
                 conn.execute(
                     """
@@ -413,6 +416,14 @@ def claim_pending_drops(path: Path | None = None) -> dict[str, int]:
                     """,
                     (key, target, target),
                 )
-            transferred[key] = int(pending)  # show user what they "found"
-        conn.execute("DELETE FROM pending_drops")
+                transferred[key] = granted
+            if leftover > 0:
+                conn.execute(
+                    "UPDATE pending_drops SET count = ? WHERE item_key = ?",
+                    (leftover, key),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM pending_drops WHERE item_key = ?", (key,),
+                )
     return transferred

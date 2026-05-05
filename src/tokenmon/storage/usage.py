@@ -91,7 +91,12 @@ def insert_usage(usage: Usage, path: Path | None = None) -> None:
     # After the request lands, roll drops for every item with a tok_chance.
     # Lives outside the request-insert connection so a drop failure can't
     # roll back the usage record.
-    drops = roll_item_drops(usage.output_tokens or 0)
+    import logging
+    log = logging.getLogger("tokenmon.proxy")
+    out_tokens = usage.output_tokens or 0
+    drops = roll_item_drops(out_tokens)
+    log.info("item-drop roll: model=%s output_tokens=%s drops=%s",
+             usage.model, out_tokens, drops or "{}")
     for key, count in drops.items():
         try:
             # Drops park in pending_drops until the user opens the Items
@@ -99,10 +104,7 @@ def insert_usage(usage: Usage, path: Path | None = None) -> None:
             # they found via the claim animation.
             add_to_pending(key, count, path=path)
         except Exception:
-            import logging
-            logging.getLogger("tokenmon.storage.usage").exception(
-                "add_to_pending(%s, %s) failed", key, count,
-            )
+            log.exception("add_to_pending(%s, %s) failed", key, count)
 
 
 def _today_utc_bounds(tz_name: str) -> tuple[str, str]:

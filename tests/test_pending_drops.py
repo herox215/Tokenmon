@@ -39,15 +39,26 @@ def test_claim_moves_to_inventory(db_path):
 
 
 def test_claim_caps_inventory(db_path):
-    """Existing 95 + pending 50 → inventory ends at cap=99, pending cleared."""
+    """Existing 95 + pending 50 → inventory fills to cap=99 (4 granted),
+    the remaining 46 stay in pending so they aren't silently destroyed
+    when the bag is full."""
     storage.add_to_inventory("pokeball", 95, path=db_path)
     storage.add_to_pending("pokeball", 50, path=db_path)
     transferred = storage.claim_pending_drops(path=db_path)
-    # We report what was found, even if not all fit.
-    assert transferred == {"pokeball": 50}
+    assert transferred == {"pokeball": 4}
     counts = storage.query_item_counts(["pokeball"], path=db_path)
     assert counts["pokeball"] == 99
-    assert storage.query_pending_drops(path=db_path) == {}
+    assert storage.query_pending_drops(path=db_path) == {"pokeball": 46}
+
+
+def test_claim_full_bag_preserves_pending(db_path):
+    """Bag already at cap → claim is a no-op and nothing is lost."""
+    storage.add_to_inventory("pokeball", 99, path=db_path)
+    storage.add_to_pending("pokeball", 7, path=db_path)
+    transferred = storage.claim_pending_drops(path=db_path)
+    assert transferred == {}
+    assert storage.query_pending_drops(path=db_path) == {"pokeball": 7}
+    assert storage.query_item_counts(["pokeball"], path=db_path)["pokeball"] == 99
 
 
 def test_claim_noop_when_empty(db_path):
