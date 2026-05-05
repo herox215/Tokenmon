@@ -417,7 +417,7 @@ class PokemonOverlay:
             return
         # Lazy import — overlay is a leaf module that pokemon imports;
         # items_remote depends on storage, which is fine here.
-        from tokenmon import items_remote
+        from tokenmon import items as items_registry, items_remote
 
         MAX_FLOATERS_PER_ITEM = 5
         MAX_FLOATERS_TOTAL = 8
@@ -449,7 +449,14 @@ class PokemonOverlay:
             queue = queue[:MAX_FLOATERS_TOTAL]
 
         for i, key in enumerate(queue):
-            sprite = items_remote.get_sprite_by_name(key)
+            # Item KEY (e.g. "pokeball") and PokeAPI sprite NAME (e.g.
+            # "poke-ball") are two different fields on the registry — use
+            # the dedicated helper that already understands this mapping.
+            item = items_registry.get(key)
+            sprite = (
+                items_remote.get_item_image(item) if item is not None
+                else items_remote.get_sprite_by_name(key)
+            )
             if sprite is None:
                 continue
             # Slight horizontal jitter so a stack of identical items
