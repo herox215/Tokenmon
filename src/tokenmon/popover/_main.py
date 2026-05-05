@@ -644,8 +644,11 @@ def _sf_symbol(name: str) -> NSImage | None:
     if img is None:
         return None
     try:
+        # NSImageSymbolWeight: 3 = Light, 4 = Regular, 5 = Medium.
+        # 4 (Regular) is the right "match the surrounding label-weight
+        # text" target — the previous 5 looked oversized/bold.
         config = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
-            float(_SIDEBAR_SYMBOL_POINT_SIZE), 5,  # 5 = NSFontWeightRegular
+            float(_SIDEBAR_SYMBOL_POINT_SIZE), 4,
         )
         sized = img.imageWithSymbolConfiguration_(config)
         if sized is not None:
@@ -807,7 +810,10 @@ class TokenmonPopover(NSObject):
             symbol_img = _sf_symbol(symbol_name) if symbol_name else None
             if symbol_img is not None:
                 btn.setImage_(symbol_img)
-                btn.setImagePosition_(2)  # NSImageOnly
+                # NSCellImagePosition: 1 = NSImageOnly (centered).
+                # The earlier 2 was NSImageLeft, hence the off-centre look.
+                btn.setImagePosition_(1)
+                btn.setImageScaling_(NSImageScaleProportionallyUpOrDown)
                 btn.setTitle_("")
                 # Subtle tint so the symbol matches the popover label color
                 # in both light and dark mode.
