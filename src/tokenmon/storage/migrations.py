@@ -1,0 +1,194 @@
+"""Schema definition + idempotent migration helpers.
+
+``init_db()`` runs the full migration ladder. Each ``_ensure_*`` and
+``_migrate_*`` helper is idempotent so repeat calls are cheap and safe.
+"""
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+from ._db import DB_PATH, _connect
+
+__all__ = ["SCHEMA", "init_db"]
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_utc TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    stop_reason TEXT,
+    request_id TEXT,
+    duration_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_requests_ts_utc ON requests(ts_utc);
+CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
+
+CREATE TABLE IF NOT EXISTS pokemon (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    caught_date TEXT NOT NULL,
+    species_dex_id INTEGER NOT NULL,
+    nature TEXT NOT NULL,
+    characteristic TEXT NOT NULL,
+    nickname TEXT,
+    is_shiny INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pokemon_caught_date ON pokemon(caught_date);
+CREATE INDEX IF NOT EXISTS idx_pokemon_species ON pokemon(species_dex_id);
+
+CREATE TABLE IF NOT EXISTS encounters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    spawned_utc TEXT NOT NULL,
+    species_dex_id INTEGER NOT NULL,
+    nature TEXT NOT NULL,
+    characteristic TEXT NOT NULL,
+    level INTEGER NOT NULL,
+    catch_rate INTEGER NOT NULL,
+    pokeballs_used INTEGER NOT NULL DEFAULT 0,
+    greatballs_used INTEGER NOT NULL DEFAULT 0,
+    ultraballs_used INTEGER NOT NULL DEFAULT 0,
+    masterballs_used INTEGER NOT NULL DEFAULT 0,
+    resolved TEXT,
+    resolved_utc TEXT,
+    pokemon_id INTEGER,
+    last_hint TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_encounters_resolved ON encounters(resolved);
+
+CREATE TABLE IF NOT EXISTS encounter_item_uses (
+    encounter_id INTEGER NOT NULL,
+    item_key     TEXT NOT NULL,
+    count        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (encounter_id, item_key)
+);
+CREATE INDEX IF NOT EXISTS idx_encounter_item_uses_encounter ON encounter_item_uses(encounter_id);
+CREATE INDEX IF NOT EXISTS idx_encounter_item_uses_key ON encounter_item_uses(item_key);
+"""
+
+
+def _ensure_trained_pokemon_column(conn: sqlite3.Connection) -> None:
+    """SQLite ALTER TABLE has no IF NOT EXISTS, so we check pragma first."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(requests)")}
+    if "trained_pokemon_id" not in cols:
+        conn.execute("ALTER TABLE requests ADD COLUMN trained_pokemon_id INTEGER")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_requests_trained "
+        "ON requests(trained_pokemon_id)"
+    )
+
+
+def _ensure_affection_column(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(pokemon)")}
+    if "affection" not in cols:
+        conn.execute(
+            "ALTER TABLE pokemon ADD COLUMN affection INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def _ensure_gender_shiny_columns(conn: sqlite3.Connection) -> None:
+    """Adds ``gender`` to pokemon/encounters and ``is_shiny`` to encounters.
+    ``pokemon.is_shiny`` already exists in the original schema."""
+    pcols = {row[1] for row in conn.execute("PRAGMA table_info(pokemon)")}
+    if "gender" not in pcols:
+        conn.execute("ALTER TABLE pokemon ADD COLUMN gender TEXT")
+    ecols = {row[1] for row in conn.execute("PRAGMA table_info(encounters)")}
+    if "gender" not in ecols:
+        conn.execute("ALTER TABLE encounters ADD COLUMN gender TEXT")
+    if "is_shiny" not in ecols:
+        conn.execute(
+            "ALTER TABLE encounters ADD COLUMN is_shiny INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def _ensure_pokemon_source_column(conn: sqlite3.Connection) -> None:
+    """Add ``pokemon.source`` ('daily' vs 'wild') and drop the legacy
+    UNIQUE(caught_date) index so multiple wild catches share a date.
+    Backfills oldest-per-date as 'daily'; tries to recover real catch dates
+    for wilds via the encounters table."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(pokemon)")}
+    if "source" in cols:
+        return
+    conn.execute(
+        "ALTER TABLE pokemon ADD COLUMN source TEXT NOT NULL DEFAULT 'wild'"
+    )
+    conn.execute(
+        """
+        UPDATE pokemon SET source = 'daily'
+        WHERE id IN (
+            SELECT MIN(id) FROM pokemon GROUP BY caught_date
+        )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE pokemon SET caught_date = (
+            SELECT date(e.resolved_utc) FROM encounters e
+            WHERE e.pokemon_id = pokemon.id AND e.resolved_utc IS NOT NULL
+        )
+        WHERE source = 'wild' AND id IN (
+            SELECT pokemon_id FROM encounters
+            WHERE pokemon_id IS NOT NULL AND resolved_utc IS NOT NULL
+        )
+        """
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_pokemon_caught_date")
+    conn.execute("CREATE INDEX idx_pokemon_caught_date ON pokemon(caught_date)")
+
+
+_LEGACY_BALL_COLUMNS: dict[str, str] = {
+    "pokeballs_used": "pokeball",
+    "greatballs_used": "greatball",
+    "ultraballs_used": "ultraball",
+    "masterballs_used": "masterball",
+}
+
+
+def _migrate_encounter_balls_to_items(conn: sqlite3.Connection) -> None:
+    """Copy the legacy per-ball columns on ``encounters`` into the generic
+    ``encounter_item_uses`` junction table. Idempotent — only runs while
+    the new table is empty."""
+    existing = conn.execute(
+        "SELECT 1 FROM encounter_item_uses LIMIT 1"
+    ).fetchone()
+    if existing is not None:
+        return
+
+    enc_cols = {row[1] for row in conn.execute("PRAGMA table_info(encounters)")}
+    legacy_cols = [c for c in _LEGACY_BALL_COLUMNS if c in enc_cols]
+    if not legacy_cols:
+        return
+
+    select_sql = "SELECT id, " + ", ".join(legacy_cols) + " FROM encounters"
+    for row in conn.execute(select_sql).fetchall():
+        enc_id = int(row[0])
+        for idx, col in enumerate(legacy_cols, start=1):
+            count = int(row[idx] or 0)
+            if count <= 0:
+                continue
+            item_key = _LEGACY_BALL_COLUMNS[col]
+            conn.execute(
+                """
+                INSERT INTO encounter_item_uses (encounter_id, item_key, count)
+                VALUES (?, ?, ?)
+                ON CONFLICT(encounter_id, item_key) DO NOTHING
+                """,
+                (enc_id, item_key, count),
+            )
+
+
+def init_db(path: Path | None = None) -> None:
+    """Apply schema + every idempotent migration. Safe to call repeatedly."""
+    if path is None:
+        path = DB_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _connect(path) as conn:
+        conn.executescript(SCHEMA)
+        _ensure_trained_pokemon_column(conn)
+        _ensure_affection_column(conn)
+        _ensure_gender_shiny_columns(conn)
+        _ensure_pokemon_source_column(conn)
+        _migrate_encounter_balls_to_items(conn)
