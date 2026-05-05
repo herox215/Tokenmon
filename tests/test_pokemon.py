@@ -153,3 +153,38 @@ def test_catch_rate_of_legendaries():
 
 def test_catch_rate_of_unknown_returns_default():
     assert pokemon.catch_rate_of(99999) == 100  # default fallback
+
+
+# ---- species_seen_through (post-evolution Pokedex retention) -------------
+
+
+def test_species_seen_through_base_form():
+    # A Bulbasaur that hasn't evolved yet: only itself.
+    assert pokemon.species_seen_through(1) == (1,)
+
+
+def test_species_seen_through_first_evolution():
+    # Ivysaur should expose both Bulbasaur (base) and itself.
+    assert pokemon.species_seen_through(2) == (1, 2)
+
+
+def test_species_seen_through_final_evolution():
+    # Venusaur exposes the full chain.
+    assert pokemon.species_seen_through(3) == (1, 2, 3)
+
+
+def test_species_seen_through_unknown_dex_id():
+    assert pokemon.species_seen_through(99999) == (99999,)
+
+
+# ---- types_of ------------------------------------------------------------
+
+
+def test_types_of_known():
+    assert pokemon.types_of(1) == ("grass", "poison")
+    assert pokemon.types_of(150) == ("psychic",)
+    assert pokemon.types_of(94) == ("ghost", "poison")
+
+
+def test_types_of_unknown_returns_normal_default():
+    assert pokemon.types_of(99999) == ("normal",)

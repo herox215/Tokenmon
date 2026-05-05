@@ -43,6 +43,7 @@ from .level import (
     level_from_xp,
     line_of,
     name_of,
+    species_seen_through,
     stage_thresholds,
     types_of,
     unlocked_stages_of,
@@ -82,7 +83,7 @@ __all__ = [
     # level
     "MAX_LEVEL", "catch_rate_of", "current_stage_of",
     "evolution_chain", "growth_rate_of", "level_from_xp",
-    "line_of", "name_of", "stage_thresholds",
+    "line_of", "name_of", "species_seen_through", "stage_thresholds",
     "types_of", "unlocked_stages_of", "xp_for_level",
     # rng
     "DAY_HOUR_END", "DAY_HOUR_START", "SHINY_RATE",

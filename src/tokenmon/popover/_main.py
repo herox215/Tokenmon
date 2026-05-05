@@ -1600,7 +1600,13 @@ class TokenmonPopover(NSObject):
         except Exception:
             log.exception("list_distinct_encounter_species failed")
             seen_set = set()
-        caught_set: set[int] = {p.species_dex_id for p in box_rows}
+        # Expand each row's current species into "every stage reached so far"
+        # so pre-evolutions stay marked caught after box.maybe_evolve mutates
+        # the row in place. Without this, evolving Bulbasaur → Ivysaur would
+        # drop Bulbasaur from the Pokedex.
+        caught_set: set[int] = set()
+        for p in box_rows:
+            caught_set.update(pokemon.species_seen_through(p.species_dex_id))
 
         # Walk the canonical 151 Gen-1 ids in dex order. ALL_NAMES covers them.
         all_ids = sorted(pokemon.ALL_NAMES.keys())

@@ -119,6 +119,24 @@ def current_stage_of(base_dex_id: int, xp: int) -> int:
     return current
 
 
+def species_seen_through(current_dex_id: int) -> tuple[int, ...]:
+    """Every species this instance has been at some point — base form plus
+    any earlier-stage evolutions up to and including ``current_dex_id``.
+
+    Used by the Pokedex to keep pre-evolutions marked as caught after
+    ``box.maybe_evolve`` mutates the pokemon row in place. If the dex_id
+    isn't part of any known line, returns just ``(current_dex_id,)`` so
+    callers don't lose the entry.
+    """
+    current = int(current_dex_id)
+    base = line_of(current)
+    chain = evolution_chain(base)
+    if current not in chain:
+        return (current,)
+    idx = chain.index(current)
+    return tuple(chain[: idx + 1])
+
+
 def unlocked_stages_of(base_dex_id: int, xp: int) -> list[int]:
     """All evolution stages reached so far (always includes the base)."""
     rate = GROWTH_RATES.get(base_dex_id, "medium_fast")
