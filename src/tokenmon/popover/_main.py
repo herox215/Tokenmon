@@ -2179,10 +2179,24 @@ class TokenmonPopover(NSObject):
             log.exception("query_item_counts failed")
             counts = {}
 
-        # Per-item rows — driven by the items registry, in registry (insertion)
-        # order.
+        # Per-item rows — only render items the user actually owns. Empty
+        # slots clutter the pane, especially with all five evolution stones
+        # added to the registry. The footer below still surfaces drop rates
+        # for every registry item so the user can see what's earnable.
+        owned_items = [
+            (key, item) for key, item in items.ITEMS.items()
+            if int(counts.get(key, 0) or 0) > 0
+        ]
+        if not owned_items:
+            view.addSubview_(_label(
+                NSMakeRect(16, POPOVER_HEIGHT // 2 - 10, CONTENT_WIDTH - 32, 20),
+                "Inventar leer — generiere Tokens, um Items zu erhalten.",
+                font=NSFont.systemFontOfSize_(12),
+                color=NSColor.secondaryLabelColor(),
+                align=NSTextAlignmentCenter,
+            ))
         y_cursor = POPOVER_HEIGHT - 50
-        for key, item in items.ITEMS.items():
+        for key, item in owned_items:
             count = int(counts.get(key, 0) or 0)
             row_h = 56
 
