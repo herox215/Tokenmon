@@ -36,7 +36,6 @@ from AppKit import (
     NSImageInterpolationNone,
     NSImageLeft,
     NSImageScaleProportionallyUpOrDown,
-    NSImageSymbolConfiguration,
     NSImageView,
     NSMenu,
     NSMenuItem,
@@ -624,41 +623,6 @@ from tokenmon.popover.animation import (
 )
 
 
-# --- SF Symbols helper ----------------------------------------------------
-
-# macOS 11+ ships a full SF Symbol set; the popover targets recent macOS
-# anyway (rumps + pyobjc 10.x) so this is fine without a runtime check.
-_SIDEBAR_SYMBOL_POINT_SIZE = 22
-
-
-def _sf_symbol(name: str) -> NSImage | None:
-    """Look up an SF Symbol by name and return an NSImage sized for the
-    sidebar. Returns ``None`` when the symbol isn't available so callers
-    fall back to an emoji glyph."""
-    try:
-        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            name, None,
-        )
-    except Exception:
-        return None
-    if img is None:
-        return None
-    try:
-        # NSImageSymbolWeight: 1 = UltraLight (lightest), 2 = Thin,
-        # 3 = Light, 4 = Regular. UltraLight gives the airiest stroke
-        # the SF Symbol engine will draw — appropriate for sidebar
-        # chrome that should disappear into the layout.
-        config = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
-            float(_SIDEBAR_SYMBOL_POINT_SIZE), 1,
-        )
-        sized = img.imageWithSymbolConfiguration_(config)
-        if sized is not None:
-            return sized
-    except Exception:
-        pass
-    return img
-
-
 class TokenmonPopover(NSObject):
     """Holds the NSPopover, builds panes, owns sidebar selection state."""
 
@@ -762,12 +726,9 @@ class TokenmonPopover(NSObject):
     def _rebuild_sidebar(self) -> None:
         """Rebuild the sidebar buttons based on current pending-encounter state.
 
-        Each slot tries to render an SF Symbol for its pane (book / archive
-        box / bag / chart) and falls back to an emoji when the symbol isn't
-        available (older macOS, unknown name). The Today slot has its icon
-        replaced post-hoc by ``_refresh_sidebar_pokemon_icon`` with the
-        active Pokémon's sprite, so the egg fallback only ever shows pre-
-        first-spawn.
+        Called once per popover open (and after a successful catch/run-away
+        when the encounter slot needs to disappear). Idempotent — wipes any
+        existing buttons and rebuilds from the current slot list.
         """
         # Wipe existing buttons.
         for btn in self._sidebar_buttons:
@@ -781,53 +742,33 @@ class TokenmonPopover(NSObject):
             log.exception("get_pending_encounter failed")
             pending = None
 
-        # Each entry: (pane_id, sf_symbol_name_or_None, emoji_fallback).
-        # Outline variants (no .fill) at Thin weight = the light, airy
-        # look you see in macOS sidebars.
-        slots: list[tuple[int, str | None, str]] = []
+        items: list[tuple[int, str]] = []
         if pending is not None:
-            slots.append((PANE_ENCOUNTER, "exclamationmark.triangle", "⚡"))
-        slots += [
-            (PANE_POKEMON, None,                "🥚"),  # overwritten by sprite
-            (PANE_TOKENDEX, "book.closed",      "📖"),
-            (PANE_BOX,      "archivebox",       "📦"),
-            (PANE_ITEMS,    "bag",              "🎒"),
-            (PANE_USAGE,    "chart.bar",        "$"),
+            items.append((PANE_ENCOUNTER, "⚡"))
+        items += [
+            (PANE_POKEMON, "🥚"),
+            (PANE_TOKENDEX, "📖"),
+            (PANE_BOX, "📦"),
+            (PANE_ITEMS, "🎒"),
+            (PANE_USAGE, "$"),
         ]
-        self._sidebar_pane_ids = [pane_id for pane_id, *_ in slots]
+        self._sidebar_pane_ids = [pane_id for pane_id, _ in items]
         self._sidebar.setPaneIds_(self._sidebar_pane_ids)
 
         slot_h = _SidebarView.SLOT_HEIGHT
-        for slot_idx, (pane_id, symbol_name, fallback) in enumerate(slots):
+        for slot_idx, (pane_id, fallback) in enumerate(items):
             y = POPOVER_HEIGHT - (slot_idx + 1) * slot_h
             btn = NSButton.alloc().initWithFrame_(
                 NSMakeRect(8, y + 8, SIDEBAR_WIDTH - 16, slot_h - 16)
             )
+            btn.setTitle_(fallback)
             btn.setBezelStyle_(NSBezelStyleRegularSquare)
             btn.setBordered_(False)
+            btn.setFont_(NSFont.systemFontOfSize_(20))
             # tag() is a 32-bit signed int — PANE_ENCOUNTER = -1 is fine.
             btn.setTag_(pane_id)
             btn.setTarget_(self)
             btn.setAction_(b"sidebarClicked:")
-
-            symbol_img = _sf_symbol(symbol_name) if symbol_name else None
-            if symbol_img is not None:
-                btn.setImage_(symbol_img)
-                # NSCellImagePosition: 1 = NSImageOnly (centered).
-                # The earlier 2 was NSImageLeft, hence the off-centre look.
-                btn.setImagePosition_(1)
-                btn.setImageScaling_(NSImageScaleProportionallyUpOrDown)
-                btn.setTitle_("")
-                # Subtle tint so the symbol matches the popover label color
-                # in both light and dark mode.
-                try:
-                    btn.setContentTintColor_(NSColor.labelColor())
-                except Exception:
-                    pass
-            else:
-                btn.setTitle_(fallback)
-                btn.setFont_(NSFont.systemFontOfSize_(20))
-
             self._sidebar.addSubview_(btn)
             self._sidebar_buttons.append(btn)
 
