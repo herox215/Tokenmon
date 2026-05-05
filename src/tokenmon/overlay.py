@@ -8,6 +8,7 @@ or interfere with what's underneath), and just animates the GIF.
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import objc
@@ -126,12 +127,17 @@ class _FloatingItemHandler(NSObject):
     PokemonOverlay creates one handler per dropped item and staggers
     their starts so a multi-item drop arrives as a small shower."""
 
-    FLOAT_FRAMES = 24
-    FRAME_INTERVAL = 0.05  # → 1.2 s total
-    STEP_DY = 3.0           # px per frame; ~72 px float distance
-    FADE_IN_FRAMES = 4
-    FADE_OUT_FRAMES = 6
+    FLOAT_FRAMES = 40
+    FRAME_INTERVAL = 0.05  # → 2.0 s total
+    STEP_DY = 4.5           # px per frame; ~180 px float distance
+    FADE_IN_FRAMES = 5
+    FADE_OUT_FRAMES = 9
     SIZE = 32
+    # Side-to-side wobble — sinusoidal x-offset around the start column
+    # gives the floater a "balloon drifting upward" feel rather than a
+    # rigid vertical slide.
+    WOBBLE_AMPLITUDE = 11.0  # px to either side of the start x
+    WOBBLE_PERIOD = 14       # frames per full sine cycle (~0.7 s)
 
     def initWithSprite_x_y_delay_(  # noqa: N802
         self, sprite, x, y, initial_delay,
@@ -211,7 +217,11 @@ class _FloatingItemHandler(NSObject):
             return
         self._frame += 1
         new_y = self._start_y + self._frame * _FloatingItemHandler.STEP_DY
-        self._window.setFrameOrigin_((self._start_x, new_y))
+        # Sinusoidal x-wobble around the start column.
+        wobble = _FloatingItemHandler.WOBBLE_AMPLITUDE * math.sin(
+            2.0 * math.pi * self._frame / _FloatingItemHandler.WOBBLE_PERIOD
+        )
+        self._window.setFrameOrigin_((self._start_x + wobble, new_y))
         # Fade in the first FADE_IN_FRAMES, hold, fade out the last FADE_OUT_FRAMES.
         fi = _FloatingItemHandler.FADE_IN_FRAMES
         fo = _FloatingItemHandler.FADE_OUT_FRAMES
