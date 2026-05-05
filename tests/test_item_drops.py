@@ -117,21 +117,25 @@ def test_insert_usage_zero_output_no_drops(db_path):
 
 
 def test_inventory_backfill_seeds_from_legacy_formula(_isolate_db):
-    """Build a DB with traffic but no inventory rows, force backfill, confirm
-    the resulting inventory matches the legacy earned − used calculation."""
+    """Build a DB with traffic and *no* prior init_db call, then init_db,
+    confirm the backfill computed counts match the legacy formula."""
     from datetime import datetime, timezone
 
     db_path = _isolate_db
-    storage.init_db(db_path)
-    # Wipe inventory so we can re-trigger the backfill cleanly.
+    # Seed traffic *before* init_db so the very first backfill pass picks
+    # it up. 12_000 output tokens → 12 pokéballs, 1 greatball.
     import sqlite3
     conn = sqlite3.connect(db_path)
-    # 12_000 output tokens → 12 pokéballs, 1 greatball, 0 ultraball, 0 master.
+    conn.execute(
+        "CREATE TABLE requests ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "ts_utc TEXT NOT NULL, model TEXT NOT NULL, "
+        "output_tokens INTEGER NOT NULL DEFAULT 0)"
+    )
     conn.execute(
         "INSERT INTO requests (ts_utc, model, output_tokens) VALUES (?, 'x', 12000)",
         (datetime.now(timezone.utc).isoformat(),),
     )
-    conn.execute("DELETE FROM inventory")
     conn.commit()
     conn.close()
     storage.init_db(db_path)
@@ -149,3 +153,25 @@ def test_inventory_backfill_idempotent(db_path):
     storage.init_db(db_path)
     counts = storage.query_item_counts(["ultraball"], path=db_path)
     assert counts["ultraball"] == 7
+
+
+def test_manual_wipe_does_not_re_trigger_backfill(db_path):
+    """Deleting the user's inventory rows by hand must NOT cause init_db
+    to re-snapshot from token history. The sentinel row protects against
+    accidental "helpful" restocks."""
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    # Inject 100k output tokens — a re-triggered backfill would mint
+    # 99 pokéballs.
+    from datetime import datetime, timezone
+    conn.execute(
+        "INSERT INTO requests (ts_utc, model, output_tokens) VALUES (?, 'x', 100000)",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    # Wipe user-facing rows (leave the sentinel).
+    conn.execute("DELETE FROM inventory WHERE item_key NOT LIKE '\\_\\_%' ESCAPE '\\'")
+    conn.commit()
+    conn.close()
+    storage.init_db(db_path)
+    counts = storage.query_item_counts(path=db_path)
+    assert all(c == 0 for c in counts.values())

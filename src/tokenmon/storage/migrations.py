@@ -262,15 +262,21 @@ def _backfill_pokedex_seen(conn: sqlite3.Connection) -> None:
             )
 
 
+_INVENTORY_BACKFILL_SENTINEL = "__backfilled__"
+
+
 def _backfill_inventory(conn: sqlite3.Connection) -> None:
     """One-shot snapshot of the legacy "earned − used" formula into the new
-    ``inventory`` table. Runs while the table is empty so users don't lose
-    the items they've already accumulated when we switch to lottery drops.
-
-    Idempotent — once any inventory row exists we skip.
+    ``inventory`` table. Seeds existing players' counts when the lottery
+    refactor lands; afterwards never runs again — a sentinel row records
+    that we've done it, so a user wiping inventory by hand isn't met with
+    a "helpful" auto-restock from token history.
     """
-    existing = conn.execute("SELECT 1 FROM inventory LIMIT 1").fetchone()
-    if existing is not None:
+    sentinel = conn.execute(
+        "SELECT 1 FROM inventory WHERE item_key = ?",
+        (_INVENTORY_BACKFILL_SENTINEL,),
+    ).fetchone()
+    if sentinel is not None:
         return
 
     from tokenmon.items import ITEMS  # lazy — items doesn't depend on storage
@@ -297,6 +303,15 @@ def _backfill_inventory(conn: sqlite3.Connection) -> None:
             "ON CONFLICT(item_key) DO NOTHING",
             (key, count),
         )
+
+    # Record that the backfill has run. The sentinel uses an item_key that
+    # doesn't exist in the registry, so query_item_counts naturally ignores
+    # it (the registry-driven WHERE filter never asks for it).
+    conn.execute(
+        "INSERT INTO inventory (item_key, count) VALUES (?, 0) "
+        "ON CONFLICT(item_key) DO NOTHING",
+        (_INVENTORY_BACKFILL_SENTINEL,),
+    )
 
 
 def init_db(path: Path | None = None) -> None:
