@@ -56,54 +56,14 @@ class Totals:
         )
 
 
-def _resolve_trained_pokemon_id(
-    conn: sqlite3.Connection, tz_name: str = "Europe/Berlin"
-) -> int | None:
-    """Best-effort lookup for the Pokemon a request should be attributed to.
-
-    Tries (in order): config['active_pokemon_id'] → today's daily row.
-    Returns None if neither resolves.
-    """
-    try:
-        from tokenmon import config
-        active = config.get("active_pokemon_id")
-    except Exception:
-        active = None
-    if isinstance(active, int):
-        return active
-
-    try:
-        from tokenmon.box import get_today_pokemon_id
-        try:
-            tid = get_today_pokemon_id()
-        except TypeError:
-            tid = None
-        if isinstance(tid, int):
-            return tid
-    except (ImportError, AttributeError):
-        pass
-    except Exception:
-        pass
-
-    try:
-        today_iso = datetime.now(ZoneInfo(tz_name)).date().isoformat()
-        row = conn.execute(
-            "SELECT id FROM pokemon WHERE caught_date = ?",
-            (today_iso,),
-        ).fetchone()
-        if row is not None:
-            return int(row[0])
-    except Exception:
-        pass
-    return None
-
-
 def insert_usage(usage: Usage, path: Path | None = None) -> None:
+    from tokenmon.active import resolve_trained_pokemon_id
+
     if path is None:
         path = DB_PATH
     ts = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     with _connect(path) as conn:
-        trained_id = _resolve_trained_pokemon_id(conn)
+        trained_id = resolve_trained_pokemon_id(conn)
         conn.execute(
             """
             INSERT INTO requests (

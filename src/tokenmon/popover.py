@@ -51,7 +51,7 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSMakeSize, NSObject, NSPointInRect
 
-from tokenmon import config, encounter, items, items_remote, pokemon
+from tokenmon import box, config, encounter, items, items_remote, pokemon
 from tokenmon.overlay import _silhouette_image
 from tokenmon.pricing import cost_for
 from tokenmon.storage import (
@@ -347,7 +347,6 @@ class _SetActiveHandler(NSObject):
 
     def setActiveClicked_(self, _sender):  # noqa: N802
         try:
-            from tokenmon import box
             box.set_active_pokemon(self._pokemon_id)
         except Exception:
             log.exception("set_active_pokemon failed")
@@ -1642,9 +1641,6 @@ class TokenmonPopover(NSObject):
     # =========================================================================
 
     def _build_pane_pokemon(self) -> NSView:
-        # Lazy import to avoid a circular import (box → storage → ...).
-        from tokenmon import box
-
         view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
 
         # Make sure today's row exists so a fresh install isn't blank, then
@@ -1818,8 +1814,6 @@ class TokenmonPopover(NSObject):
         the pane was rendered counts."""
         if self._pat_active or self._pat_sprite is None:
             return
-        # Lazy import — popover.box isn't a module-level import (circular).
-        from tokenmon import box
         try:
             row = box.get_active_pokemon()
         except Exception:
@@ -2331,7 +2325,6 @@ class TokenmonPopover(NSObject):
         ))
 
         # "Set as active" / "✓ Active" button at the bottom.
-        from tokenmon import box
         try:
             active_id = box.get_active_pokemon_id()
         except Exception:
