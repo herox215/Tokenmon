@@ -641,7 +641,12 @@ class TokenmonApp(rumps.App):
             if delta > 0:
                 new_drops[key] = delta
         self._last_pending_snapshot = current
-        if new_drops and self._show_overlay and self._overlay.visible:
+        # Note: not gating on self._overlay.visible — the Pokémon overlay
+        # only pops up briefly for level-ups, but the user's mental model
+        # of "overlay aktiv" is the config flag. Floaters appear at the
+        # overlay's nominal position regardless of whether the window is
+        # currently shown.
+        if new_drops and self._show_overlay:
             try:
                 self._overlay.show_floating_items(new_drops)
             except Exception:

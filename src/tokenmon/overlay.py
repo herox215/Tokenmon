@@ -403,15 +403,17 @@ class PokemonOverlay:
 
     def show_floating_items(self, drops: dict[str, int]) -> None:
         """For each new drop, spawn a small click-through window above the
-        Pokemon overlay that drifts upward and fades out. Stagger the
-        spawns so a multi-item drop reads as a quick shower rather than
-        a synchronised pop-in.
+        nominal Pokemon-overlay position that drifts upward and fades out.
+
+        Works even when the overlay window itself isn't on screen — the
+        anchor is computed from the configured corner so floaters always
+        appear in the spot the user mentally associates with the overlay.
 
         ``drops`` maps item_key → count. Multi-count items emit one
         floater per unit (capped at MAX_FLOATERS_PER_ITEM so a 50-pokeball
         haul doesn't spawn 50 windows).
         """
-        if not drops or self._window is None or not self._visible:
+        if not drops:
             return
         # Lazy import — overlay is a leaf module that pokemon imports;
         # items_remote depends on storage, which is fine here.
@@ -421,10 +423,20 @@ class PokemonOverlay:
         MAX_FLOATERS_TOTAL = 8
         STAGGER_SEC = 0.18
 
-        # Anchor: directly above the Pokemon overlay window.
-        frame = self._window.frame()
-        base_x = frame.origin.x + frame.size.width / 2 - _FloatingItemHandler.SIZE / 2
-        base_y = frame.origin.y + frame.size.height + 4
+        # Compute the anchor from the configured corner regardless of
+        # whether the overlay window is currently shown.
+        screen = None
+        if self._window is not None:
+            screen = self._window.screen()
+        if screen is None:
+            screen = NSScreen.mainScreen()
+        if screen is None:
+            return
+        anchor_x, anchor_y = _position_for(
+            self._corner, screen.visibleFrame(), self._size, self._margin,
+        )
+        base_x = anchor_x + self._size / 2 - _FloatingItemHandler.SIZE / 2
+        base_y = anchor_y + self._size + 4
 
         # Expand drops into a flat queue, capped per-item and overall.
         queue: list[str] = []
