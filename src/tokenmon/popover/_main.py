@@ -644,12 +644,12 @@ def _sf_symbol(name: str) -> NSImage | None:
     if img is None:
         return None
     try:
-        # NSImageSymbolWeight: 2 = Thin, 3 = Light, 4 = Regular.
-        # Sidebar icons read best at Thin — they're decorative chrome
-        # rather than primary content, so the lighter stroke matches the
-        # popover's calm, low-contrast aesthetic.
+        # NSImageSymbolWeight: 1 = UltraLight (lightest), 2 = Thin,
+        # 3 = Light, 4 = Regular. UltraLight gives the airiest stroke
+        # the SF Symbol engine will draw — appropriate for sidebar
+        # chrome that should disappear into the layout.
         config = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
-            float(_SIDEBAR_SYMBOL_POINT_SIZE), 2,
+            float(_SIDEBAR_SYMBOL_POINT_SIZE), 1,
         )
         sized = img.imageWithSymbolConfiguration_(config)
         if sized is not None:
