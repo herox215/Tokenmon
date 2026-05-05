@@ -49,13 +49,13 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSMakeSize, NSObject
 
-from tokenmon import config, encounter, pokemon
+from tokenmon import config, encounter, items, pokemon
 from tokenmon.overlay import _silhouette_image
 from tokenmon.pricing import cost_for
 from tokenmon.storage import (
     get_pending_encounter,
     list_pokemon,
-    query_ball_counts,
+    query_item_counts,
     query_pokemon_xp,
     query_today,
     query_today_by_model,
@@ -81,15 +81,17 @@ PANE_BOX = 2
 PANE_ITEMS = 3
 PANE_USAGE = 4
 
-# Pretty-print labels for ball selector buttons.
-BALL_LABELS: dict[str, str] = {
-    "pokeball": "🔴 PokeBall",
-    "greatball": "🔵 Great Ball",
-    "ultraball": "🟡 Ultra Ball",
-    "masterball": "💜 Master Ball",
-}
-
 ROW_HEIGHT = 100  # mirrors tokendex.ROW_HEIGHT
+
+
+# Pretty per-action menu titles for the bag's right-click-style flyout. The
+# ``{name}`` placeholder gets formatted with the Item.display_name. Items in
+# Item.actions that aren't in this dict simply get omitted from the menu.
+ACTION_TITLES: dict[str, str] = {
+    "throw": "Throw at wild Pokemon",
+    "use": "Use {name}",
+    "evolve": "Use on a Pokemon",
+}
 
 
 class _CrispImageView(NSImageView):
@@ -336,30 +338,112 @@ class _SetActiveHandler(NSObject):
 # =============================================================================
 
 
-class _BallButtonHandler(NSObject):
-    """Per-ball-row click target — throws the ball, then either triggers a
-    catch reveal or rebuilds the encounter pane with the updated counts/hint."""
+class _BagOpenHandler(NSObject):
+    """[🎒 Bag] click target — flips the popover into bag-open mode."""
 
-    def initWithPopover_encounterId_ballType_(self, popover, encounter_id, ball_type):  # noqa: N802
-        self = objc.super(_BallButtonHandler, self).init()
+    def initWithPopover_(self, popover):  # noqa: N802
+        self = objc.super(_BagOpenHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        return self
+
+    def openClicked_(self, _sender):  # noqa: N802
+        self._popover._encounter_bag_open = True
+        self._popover._show_pane(PANE_ENCOUNTER)
+
+
+class _BagBackHandler(NSObject):
+    """[← Back] click target inside the bag-open view."""
+
+    def initWithPopover_(self, popover):  # noqa: N802
+        self = objc.super(_BagBackHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        return self
+
+    def backClicked_(self, _sender):  # noqa: N802
+        self._popover._encounter_bag_open = False
+        self._popover._show_pane(PANE_ENCOUNTER)
+
+
+class _ItemRowHandler(NSObject):
+    """Per-row click target inside the bag-open inventory list.
+
+    Click on the row → opens a native NSMenu anchored to the row's NSButton,
+    with one item per ``Item.actions`` entry. Selecting a menu item dispatches
+    based on the action key — currently only ``throw`` is implemented.
+    """
+
+    def initWithPopover_encounterId_itemKey_(self, popover, encounter_id, item_key):  # noqa: N802
+        self = objc.super(_ItemRowHandler, self).init()
         if self is None:
             return None
         self._popover = popover
         self._encounter_id = int(encounter_id)
-        self._ball_type = str(ball_type)
+        self._item_key = str(item_key)
         return self
 
-    def ballClicked_(self, _sender):  # noqa: N802
+    def _title_for_action(self, action: str) -> str:
+        item = items.get(self._item_key)
+        name = item.display_name if item is not None else self._item_key
+        template = ACTION_TITLES.get(action, action)
         try:
-            result = encounter.throw_ball(self._encounter_id, self._ball_type)
-        except Exception:
-            log.exception("throw_ball failed")
+            return template.format(name=name)
+        except (KeyError, IndexError):
+            return template
+
+    def itemRowClicked_(self, sender):  # noqa: N802
+        item = items.get(self._item_key)
+        if item is None or not item.actions:
             return
-        if result.get("caught"):
-            self._popover._begin_catch_reveal()
-        else:
-            # Failed throw — rebuild pane to refresh ball counts + hint.
-            self._popover._show_pane(PANE_ENCOUNTER)
+        menu = NSMenu.alloc().initWithTitle_("")
+        for action in item.actions:
+            title = self._title_for_action(action)
+            mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, b"actionSelected:", "",
+            )
+            mi.setTarget_(self)
+            mi.setRepresentedObject_(action)
+            menu.addItem_(mi)
+        try:
+            from AppKit import NSApp
+            event = NSApp.currentEvent()
+        except Exception:
+            event = None
+        try:
+            if event is not None:
+                NSMenu.popUpContextMenuWithEvent_forView_(menu, event, sender)
+            else:
+                # Fallback when no current event is available — anchor at the
+                # button's origin via popUpMenuPositioningItem.
+                menu.popUpMenuPositioningItem_atLocation_inView_(
+                    None, NSMakeRect(0, 0, 0, 0).origin, sender,
+                )
+        except Exception:
+            log.exception("item-row context menu failed")
+
+    def actionSelected_(self, sender):  # noqa: N802
+        try:
+            action = str(sender.representedObject())
+        except Exception:
+            return
+        if action == "throw":
+            try:
+                result = encounter.use_item(self._encounter_id, self._item_key)
+            except Exception:
+                log.exception("use_item(throw) failed")
+                return
+            if result.get("caught"):
+                # Close the bag and trigger the existing reveal flow.
+                self._popover._encounter_bag_open = False
+                self._popover._begin_catch_reveal()
+            else:
+                # Stay in bag-open so the user can throw again. Refresh the
+                # pane to update counts and surface the new last_hint.
+                self._popover._show_pane(PANE_ENCOUNTER)
+        # Future actions ('use', 'evolve') get their branches here.
 
 
 class _RunAwayHandler(NSObject):
@@ -469,7 +553,10 @@ class TokenmonPopover(NSObject):
         self._set_active_handler: _SetActiveHandler | None = None
 
         # Encounter-pane handler refs.
-        self._ball_button_handlers: list[NSObject] = []
+        self._encounter_bag_open: bool = False
+        self._bag_open_handler: _BagOpenHandler | None = None
+        self._bag_back_handler: _BagBackHandler | None = None
+        self._item_row_handlers: list[_ItemRowHandler] = []
         self._run_away_handler: _RunAwayHandler | None = None
         self._reveal_timer_handler: _RevealTimerHandler | None = None
         self._reveal_timer = None
@@ -576,10 +663,17 @@ class TokenmonPopover(NSObject):
         self._box_handlers = []
         self._box_back_handler = None
         self._set_active_handler = None
-        self._ball_button_handlers = []
+        self._bag_open_handler = None
+        self._bag_back_handler = None
+        self._item_row_handlers = []
         self._run_away_handler = None
         self._pokedex_handlers = []
         self._pokedex_back_handler = None
+        # Bag-open is part of the *encounter* state machine — leaving the
+        # encounter pane drops it; staying inside it (e.g. after a failed
+        # throw) preserves the user's bag-open intent.
+        if idx != PANE_ENCOUNTER:
+            self._encounter_bag_open = False
         # Cancel any pending reveal timer if we're transitioning panes manually.
         if self._reveal_timer is not None:
             try:
@@ -674,15 +768,18 @@ class TokenmonPopover(NSObject):
         info_y = sprite_y - 24
         view.addSubview_(_label(
             NSMakeRect(0, info_y, CONTENT_WIDTH, 18),
-            f"Level: ~{enc.level}        Type: ???",
+            f"Lv {enc.level}     Type: ???",
             font=NSFont.systemFontOfSize_(12),
             color=NSColor.secondaryLabelColor(),
             align=NSTextAlignmentCenter,
         ))
 
-        # --- Last hint (italic, only if present) ---
+        # --- Last hint (italic, only when not in default-mode AND present).
+        # Hide the hint in the *default* view so the layout stays tight, but
+        # surface it in the bag-open view where the user is mid-throw and
+        # needs the feedback.
         hint_y = info_y - 22
-        if enc.last_hint:
+        if enc.last_hint and self._encounter_bag_open:
             hint_label = _label(
                 NSMakeRect(16, hint_y, CONTENT_WIDTH - 32, 16),
                 enc.last_hint,
@@ -690,7 +787,6 @@ class TokenmonPopover(NSObject):
                 color=NSColor.secondaryLabelColor(),
                 align=NSTextAlignmentCenter,
             )
-            # Italicise the hint via NSAttributedString.
             try:
                 from Foundation import NSAttributedString
                 italic = NSFont.fontWithName_size_("HelveticaNeue-Italic", 11)
@@ -705,60 +801,48 @@ class TokenmonPopover(NSObject):
                 hint_label.setTextColor_(NSColor.secondaryLabelColor())
                 hint_label.setAlignment_(NSTextAlignmentCenter)
             except Exception:
-                pass  # plain text is fine as a fallback
+                pass
             view.addSubview_(hint_label)
         else:
-            hint_y = info_y  # no gap if no hint
+            hint_y = info_y  # no gap when no hint shown
 
-        # --- Separator ---
+        # --- Separator above either action area or inventory.
         sep1_y = hint_y - 8
         sep1 = NSView.alloc().initWithFrame_(NSMakeRect(16, sep1_y, CONTENT_WIDTH - 32, 1))
         sep1.setWantsLayer_(True)
         sep1.layer().setBackgroundColor_(NSColor.separatorColor().CGColor())
         view.addSubview_(sep1)
 
-        # --- Ball rows ---
-        try:
-            counts = query_ball_counts()
-        except Exception:
-            log.exception("query_ball_counts failed")
-            counts = {b: 0 for b in encounter.BALL_TYPES}
+        if self._encounter_bag_open:
+            self._build_encounter_bag_open(view, enc, sep1_y)
+        else:
+            self._build_encounter_actions(view, enc, sep1_y)
 
-        row_h = 28
-        rows_top = sep1_y - 8
-        for i, ball_type in enumerate(encounter.BALL_TYPES):
-            count = int(counts.get(ball_type, 0))
-            prob = encounter.catch_probability(enc.catch_rate, ball_type)
-            label_text = BALL_LABELS.get(ball_type, ball_type)
-            if count <= 0:
-                row_text = f"{label_text}    × 0    — (out)"
-            else:
-                row_text = f"{label_text}    × {count}    ~{int(round(prob * 100))}%"
-            y = rows_top - (i + 1) * row_h
-            btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(16, y, CONTENT_WIDTH - 32, row_h - 4)
-            )
-            btn.setTitle_(row_text)
-            btn.setBezelStyle_(1)  # NSBezelStyleRounded
-            btn.setEnabled_(count > 0)
-            handler = _BallButtonHandler.alloc().initWithPopover_encounterId_ballType_(
-                self, enc.id, ball_type,
-            )
-            self._ball_button_handlers.append(handler)
-            btn.setTarget_(handler)
-            btn.setAction_(b"ballClicked:")
-            view.addSubview_(btn)
+        return view
 
-        # --- Separator + Run away ---
-        sep2_y = rows_top - len(encounter.BALL_TYPES) * row_h - 8
-        sep2 = NSView.alloc().initWithFrame_(NSMakeRect(16, sep2_y, CONTENT_WIDTH - 32, 1))
-        sep2.setWantsLayer_(True)
-        sep2.layer().setBackgroundColor_(NSColor.separatorColor().CGColor())
-        view.addSubview_(sep2)
+    # --- Encounter pane: default action row (Bag / Run away) ---
 
-        run_btn_w = 140
+    def _build_encounter_actions(self, view: NSView, enc, top_y: int) -> None:
+        """Bottom action bar for the default (non-bag-open) encounter pane.
+        Two equal-width buttons: [🎒 Bag]  [Run away]."""
+        margin = 16
+        gap = 12
+        btn_y = top_y - 16 - 32
+        btn_w = (CONTENT_WIDTH - 2 * margin - gap) // 2
+        btn_h = 32
+
+        bag_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin, btn_y, btn_w, btn_h)
+        )
+        bag_btn.setTitle_("🎒 Bag")
+        bag_btn.setBezelStyle_(1)
+        self._bag_open_handler = _BagOpenHandler.alloc().initWithPopover_(self)
+        bag_btn.setTarget_(self._bag_open_handler)
+        bag_btn.setAction_(b"openClicked:")
+        view.addSubview_(bag_btn)
+
         run_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect((CONTENT_WIDTH - run_btn_w) // 2, sep2_y - 36, run_btn_w, 28)
+            NSMakeRect(margin + btn_w + gap, btn_y, btn_w, btn_h)
         )
         run_btn.setTitle_("Run away")
         run_btn.setBezelStyle_(1)
@@ -769,7 +853,103 @@ class TokenmonPopover(NSObject):
         run_btn.setAction_(b"runAwayClicked:")
         view.addSubview_(run_btn)
 
-        return view
+    # --- Encounter pane: bag-open inventory list ---
+
+    def _build_encounter_bag_open(self, view: NSView, enc, top_y: int) -> None:
+        """Inventory list rendered below the silhouette/info block. Each item
+        in the registry gets a row showing emoji + display name + count.
+        Rows for items with non-empty Item.actions and a positive count are
+        clickable and pop a native NSMenu of actions on click."""
+        # "Inventory" header.
+        inv_header_y = top_y - 8 - 18
+        view.addSubview_(_label(
+            NSMakeRect(16, inv_header_y, CONTENT_WIDTH - 32, 18),
+            "Inventory",
+            font=NSFont.boldSystemFontOfSize_(13),
+            color=NSColor.secondaryLabelColor(),
+        ))
+
+        try:
+            counts = query_item_counts()
+        except Exception:
+            log.exception("query_item_counts failed")
+            counts = {}
+
+        row_h = 26
+        rows_top = inv_header_y - 4
+        registry_keys = list(items.ITEMS.keys())
+        for i, key in enumerate(registry_keys):
+            item = items.ITEMS[key]
+            count = int(counts.get(key, 0) or 0)
+            has_action = bool(item.actions)
+            enabled = has_action and count > 0
+
+            y = rows_top - (i + 1) * row_h
+            btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(16, y, CONTENT_WIDTH - 32, row_h - 2)
+            )
+            chevron = "  ›" if enabled else ""
+            btn.setTitle_(
+                f"{item.emoji}  {item.display_name}     × {count}{chevron}"
+            )
+            btn.setBezelStyle_(1)
+            btn.setAlignment_(0)  # left
+            btn.setEnabled_(enabled)
+            if not enabled:
+                # Greyed-out look for disabled rows. setEnabled_(False) already
+                # gives macOS-standard styling but the row title stays at
+                # default colour — we set an attributed title for the faint
+                # tertiary look the spec asks for.
+                try:
+                    from Foundation import NSAttributedString
+                    attrs = {
+                        NSFontAttributeName: NSFont.systemFontOfSize_(13),
+                    }
+                    title = btn.title()
+                    btn.setAttributedTitle_(
+                        NSAttributedString.alloc().initWithString_attributes_(
+                            title, attrs,
+                        )
+                    )
+                except Exception:
+                    pass
+            else:
+                handler = _ItemRowHandler.alloc().initWithPopover_encounterId_itemKey_(
+                    self, enc.id, key,
+                )
+                self._item_row_handlers.append(handler)
+                btn.setTarget_(handler)
+                btn.setAction_(b"itemRowClicked:")
+            view.addSubview_(btn)
+
+        # --- Bottom action bar: [← Back]  [Run away] ---
+        margin = 16
+        gap = 12
+        btn_y = 16
+        btn_w = (CONTENT_WIDTH - 2 * margin - gap) // 2
+        btn_h = 32
+
+        back_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin, btn_y, btn_w, btn_h)
+        )
+        back_btn.setTitle_("← Back")
+        back_btn.setBezelStyle_(1)
+        self._bag_back_handler = _BagBackHandler.alloc().initWithPopover_(self)
+        back_btn.setTarget_(self._bag_back_handler)
+        back_btn.setAction_(b"backClicked:")
+        view.addSubview_(back_btn)
+
+        run_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin + btn_w + gap, btn_y, btn_w, btn_h)
+        )
+        run_btn.setTitle_("Run away")
+        run_btn.setBezelStyle_(1)
+        self._run_away_handler = _RunAwayHandler.alloc().initWithPopover_encounterId_(
+            self, enc.id,
+        )
+        run_btn.setTarget_(self._run_away_handler)
+        run_btn.setAction_(b"runAwayClicked:")
+        view.addSubview_(run_btn)
 
     # --- Encounter pane: catch reveal animation ---
 
@@ -1475,14 +1655,6 @@ class TokenmonPopover(NSObject):
     # Pane: Items (PokeBall inventory + earn rates)
     # =========================================================================
 
-    _ITEM_DEFS: list[tuple[str, str, str, str, int]] = [
-        # (key, emoji, display name, description, threshold-per-ball)
-        ("pokeball",   "🔴", "Poké Ball",   "Standard ball — works best on common Pokémon.",                1_000),
-        ("greatball",  "🔵", "Great Ball",  "1.5× catch rate — better odds against tougher Pokémon.",     10_000),
-        ("ultraball",  "🟡", "Ultra Ball",  "2× catch rate — for the rare ones.",                         50_000),
-        ("masterball", "💜", "Master Ball", "Catches anything, no questions asked. Save it for Mewtwo.", 500_000),
-    ]
-
     def _build_pane_items(self) -> NSView:
         view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
 
@@ -1494,21 +1666,22 @@ class TokenmonPopover(NSObject):
         ))
 
         try:
-            counts = query_ball_counts()
+            counts = query_item_counts()
         except Exception:
-            log.exception("query_ball_counts failed")
+            log.exception("query_item_counts failed")
             counts = {}
 
-        # Per-item rows.
+        # Per-item rows — driven by the items registry, in registry (insertion)
+        # order.
         y_cursor = POPOVER_HEIGHT - 50
-        for key, emoji, name, description, threshold in self._ITEM_DEFS:
+        for key, item in items.ITEMS.items():
             count = int(counts.get(key, 0) or 0)
             row_h = 56
 
             # Emoji on the left.
             view.addSubview_(_label(
                 NSMakeRect(16, y_cursor - row_h + 14, 36, 30),
-                emoji,
+                item.emoji,
                 font=NSFont.systemFontOfSize_(24),
                 align=NSTextAlignmentCenter,
             ))
@@ -1521,10 +1694,9 @@ class TokenmonPopover(NSObject):
                 NSColor.tertiaryLabelColor() if count == 0
                 else NSColor.labelColor()
             )
-            # Name (left), count (right).
             name_field = _label(
                 NSMakeRect(text_x, y_cursor - 22, text_w - 50, 18),
-                name,
+                item.display_name,
                 font=NSFont.boldSystemFontOfSize_(13),
             )
             view.addSubview_(name_field)
@@ -1541,7 +1713,7 @@ class TokenmonPopover(NSObject):
             desc_field = NSTextField.alloc().initWithFrame_(
                 NSMakeRect(text_x, y_cursor - row_h + 4, text_w, 32)
             )
-            desc_field.setStringValue_(description)
+            desc_field.setStringValue_(item.description)
             desc_field.setBezeled_(False)
             desc_field.setDrawsBackground_(False)
             desc_field.setEditable_(False)
@@ -1560,7 +1732,7 @@ class TokenmonPopover(NSObject):
         # Footer hint about earn rates.
         footer_y = 16
         rates_lines = "  ·  ".join(
-            f"{e} 1 / {t:,}" for _, e, _, _, t in self._ITEM_DEFS
+            f"{it.emoji} 1 / {it.threshold:,}" for it in items.ITEMS.values()
         )
         view.addSubview_(_label(
             NSMakeRect(16, footer_y, CONTENT_WIDTH - 32, 14),

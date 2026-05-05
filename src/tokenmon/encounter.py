@@ -1,4 +1,4 @@
-"""Wild-encounter brain: spawn rolls, catch math, ball throws, hints.
+"""Wild-encounter brain: spawn rolls, catch math, item use, hints.
 
 This module is purely transactional logic — UI lives in popover.py and the
 periodic tick is wired in by menubar.py / proxy.py callers. We import lazily
@@ -14,15 +14,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tokenmon import box, pokemon
+from tokenmon.items import (
+    BALL_CATCH_MODIFIERS,
+    is_throwable,
+)
+from tokenmon.items import get as get_item
 from tokenmon.storage import (
     DB_PATH,
     Encounter,
     get_pending_encounter,
-    increment_ball_used,
+    increment_item_used,
     insert_encounter,
     mark_encounter_caught,
     mark_encounter_ran,
-    query_ball_counts,
+    query_item_counts,
     update_encounter_hint,
 )
 
@@ -34,15 +39,14 @@ SPAWN_PROBABILITY = 0.03                # 3% per output-bearing call
 SPAWN_COOLDOWN_SECONDS = 30 * 60        # 30 min between spawn attempts
 SPAWN_MIN_OUTPUT = 50                   # don't spawn from tiny calls
 
-BALL_TYPES = ("pokeball", "greatball", "ultraball", "masterball")
-BALL_MODIFIERS = {
-    "pokeball": 1.0,
-    "greatball": 1.5,
-    "ultraball": 2.0,
-    "masterball": 255.0,                # = guaranteed catch
-}
 CATCH_PROBABILITY_BASELINE = 0.7        # softener — 70% per ball at max catch_rate
 LEVEL_MIN, LEVEL_MAX = 1, 1  # wild Pokemon are always Lv 1; XP comes from training
+
+# Backwards-compat re-export — popover.py iterates this to render the per-ball
+# rows in the encounter card. Phase 3 will swap that for an items-pane that
+# pulls from ``tokenmon.items`` directly; until then we expose the same tuple
+# under the old name so encounter.py stays the single source of truth.
+BALL_TYPES: tuple[str, ...] = ("pokeball", "greatball", "ultraball", "masterball")
 
 _RNG = random.SystemRandom()
 
@@ -118,25 +122,25 @@ def maybe_spawn(*, force: bool = False, path: Path = DB_PATH) -> Encounter | Non
 # --- Catch math ------------------------------------------------------------
 
 
-def catch_probability(catch_rate: int, ball_type: str) -> float:
-    """Probability in [0, 1] for a single throw of `ball_type` at a wild
-    Pokemon with the given Gen-1 ``catch_rate`` (0..255).
+def catch_probability(catch_rate: int, item_key: str) -> float:
+    """Returns 0..1 probability for a single throw of ``item_key`` against a
+    Pokemon with the given ``catch_rate``.
 
-    Formula: clamp((catch_rate / 255) * BALL_MODIFIERS[ball] *
-    CATCH_PROBABILITY_BASELINE, 0.0, 1.0). Masterball is hard-coded to 1.0
-    (the modifier alone would drag every species over 1.0 anyway, but being
-    explicit keeps the floor obvious for readers).
+    Master Ball is hard-coded to 1.0; non-throwable or unknown items return
+    0.0. Otherwise: ``clamp((catch_rate / 255) * BALL_CATCH_MODIFIERS[key] *
+    CATCH_PROBABILITY_BASELINE, 0.0, 1.0)``.
     """
-    if ball_type not in BALL_MODIFIERS:
-        raise ValueError(f"unknown ball_type: {ball_type!r}")
-    if ball_type == "masterball":
-        return 1.0
-    raw = (catch_rate / 255.0) * BALL_MODIFIERS[ball_type] * CATCH_PROBABILITY_BASELINE
-    if raw < 0.0:
+    if not is_throwable(item_key):
         return 0.0
-    if raw > 1.0:
+    if item_key == "masterball":
         return 1.0
-    return raw
+    modifier = BALL_CATCH_MODIFIERS.get(item_key, 1.0)
+    p = (catch_rate / 255.0) * modifier * CATCH_PROBABILITY_BASELINE
+    if p < 0.0:
+        return 0.0
+    if p > 1.0:
+        return 1.0
+    return p
 
 
 # --- Hints -----------------------------------------------------------------
@@ -163,7 +167,7 @@ def _hint_for_species(dex_id: int) -> str:
     return "Hard to read…"
 
 
-# --- Ball throws -----------------------------------------------------------
+# --- Item use --------------------------------------------------------------
 
 
 def _validate_pending(enc: Encounter) -> None:
@@ -173,22 +177,43 @@ def _validate_pending(enc: Encounter) -> None:
         )
 
 
-def throw_ball(
-    encounter_id: int, ball_type: str, *, path: Path = DB_PATH
+def use_item(
+    encounter_id: int, item_key: str, *, path: Path = DB_PATH
 ) -> dict:
-    """Resolve a single ball throw. See module docstring for return shape.
+    """Generic item-use against an encounter. Dispatches based on the item's
+    actions:
+      - 'throw': consumes 1 of the item, runs catch math with the item's
+        modifier, marks encounter caught/updates hint accordingly.
+      - any other action / no actions: raises ``ValueError`` ("item not usable
+        in encounter").
+
+    Returns the same shape the legacy ``throw_ball`` returned:
+      ``{'caught': bool, 'hint': str|None, 'pokemon_id': int|None}``.
+
+    Raises ``ValueError`` if ``item_key`` is unknown or the item has no
+    encounter-applicable action.
+    """
+    item = get_item(item_key)
+    if item is None:
+        raise ValueError(f"unknown item: {item_key!r}")
+    if "throw" in item.actions:
+        return _resolve_throw(encounter_id, item_key, path=path)
+    raise ValueError(f"item not usable in encounter: {item_key!r}")
+
+
+def _resolve_throw(
+    encounter_id: int, item_key: str, *, path: Path = DB_PATH
+) -> dict:
+    """Resolve a single throw of ``item_key`` against the pending encounter.
 
     Side effects:
-      - increments per-ball counter on the encounter,
+      - increments per-item usage counter on the encounter,
       - on success: inserts a new pokemon row + marks encounter caught,
       - on failure: writes a new ``last_hint`` to the encounter.
 
-    Raises ``ValueError`` if the encounter is already resolved, the ball type
-    is unknown, or the user has zero of that ball available.
+    Raises ``ValueError`` if the encounter is already resolved or the user has
+    zero of the item available.
     """
-    if ball_type not in BALL_MODIFIERS:
-        raise ValueError(f"unknown ball_type: {ball_type!r}")
-
     pending = get_pending_encounter(path=path)
     if pending is None or pending.id != encounter_id:
         # Either resolved or doesn't exist — both are user errors here.
@@ -197,14 +222,14 @@ def throw_ball(
         )
     _validate_pending(pending)
 
-    counts = query_ball_counts(path=path)
-    if counts.get(ball_type, 0) <= 0:
-        raise ValueError(f"no {ball_type}s available")
+    counts = query_item_counts([item_key], path=path)
+    if counts.get(item_key, 0) <= 0:
+        raise ValueError(f"out of {item_key}")
 
-    # Spend the ball regardless of outcome.
-    increment_ball_used(pending.id, ball_type, path=path)
+    # Spend the item regardless of outcome.
+    increment_item_used(pending.id, item_key, path=path)
 
-    p = catch_probability(pending.catch_rate, ball_type)
+    p = catch_probability(pending.catch_rate, item_key)
     if _RNG.random() < p:
         # Caught — insert a Pokemon row.
         try:
@@ -230,6 +255,18 @@ def throw_ball(
     hint = _hint_for_species(pending.species_dex_id)
     update_encounter_hint(pending.id, hint, path=path)
     return {"caught": False, "hint": hint, "pokemon_id": None}
+
+
+def throw_ball(
+    encounter_id: int, ball_type: str, *, path: Path = DB_PATH
+) -> dict:
+    """Deprecated thin shim — delegates to :func:`use_item`.
+
+    Kept so callers (popover, menubar) that still speak in terms of "balls"
+    keep working until Phase 3 migrates them. New code should call
+    :func:`use_item` directly.
+    """
+    return use_item(encounter_id, ball_type, path=path)
 
 
 def run_away(encounter_id: int, *, path: Path = DB_PATH) -> None:

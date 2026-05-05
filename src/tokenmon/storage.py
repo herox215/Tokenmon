@@ -57,23 +57,31 @@ CREATE TABLE IF NOT EXISTS encounters (
     last_hint TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_encounters_resolved ON encounters(resolved);
+
+CREATE TABLE IF NOT EXISTS encounter_item_uses (
+    encounter_id INTEGER NOT NULL,
+    item_key     TEXT NOT NULL,
+    count        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (encounter_id, item_key)
+);
+CREATE INDEX IF NOT EXISTS idx_encounter_item_uses_encounter ON encounter_item_uses(encounter_id);
+CREATE INDEX IF NOT EXISTS idx_encounter_item_uses_key ON encounter_item_uses(item_key);
 """
 
 
-BALL_THRESHOLDS: dict[str, int] = {
-    "pokeball": 1_000,
-    "greatball": 10_000,
-    "ultraball": 50_000,
-    "masterball": 500_000,
-}
-BALL_CAP = 99
+def _build_ball_thresholds() -> dict[str, int]:
+    """Re-exported for compat — derived from the items registry so a single
+    edit in ``tokenmon.items`` propagates everywhere."""
+    from tokenmon.items import ITEMS  # local import to avoid cycle
+    return {
+        k: ITEMS[k].threshold
+        for k in ("pokeball", "greatball", "ultraball", "masterball")
+        if k in ITEMS
+    }
 
-_BALL_COLUMN: dict[str, str] = {
-    "pokeball": "pokeballs_used",
-    "greatball": "greatballs_used",
-    "ultraball": "ultraballs_used",
-    "masterball": "masterballs_used",
-}
+
+BALL_THRESHOLDS: dict[str, int] = _build_ball_thresholds()
+BALL_CAP = 99
 
 
 @dataclass(slots=True)
@@ -126,11 +134,63 @@ def _ensure_trained_pokemon_column(conn: sqlite3.Connection) -> None:
     )
 
 
+# Mapping of legacy ``encounters.<col>`` columns to the corresponding item key
+# in the new generic ``encounter_item_uses`` junction table. Used only by the
+# one-shot migration helper below.
+_LEGACY_BALL_COLUMNS: dict[str, str] = {
+    "pokeballs_used": "pokeball",
+    "greatballs_used": "greatball",
+    "ultraballs_used": "ultraball",
+    "masterballs_used": "masterball",
+}
+
+
+def _migrate_encounter_balls_to_items(conn: sqlite3.Connection) -> None:
+    """One-shot migration: copy legacy ``encounters.*_used`` columns into
+    ``encounter_item_uses`` rows.
+
+    Idempotent: only runs when ``encounter_item_uses`` is empty AND the legacy
+    columns still exist. Skips zero-count entries and never overwrites an
+    existing (encounter_id, item_key) row. Old columns stay in place — we
+    don't ALTER TABLE DROP COLUMN; they simply go unused.
+    """
+    # If anything has been written to the new table, the migration has
+    # effectively already happened — bail to keep things idempotent.
+    existing = conn.execute(
+        "SELECT 1 FROM encounter_item_uses LIMIT 1"
+    ).fetchone()
+    if existing is not None:
+        return
+
+    enc_cols = {row[1] for row in conn.execute("PRAGMA table_info(encounters)")}
+    legacy_cols = [c for c in _LEGACY_BALL_COLUMNS if c in enc_cols]
+    if not legacy_cols:
+        return
+
+    select_sql = "SELECT id, " + ", ".join(legacy_cols) + " FROM encounters"
+    for row in conn.execute(select_sql).fetchall():
+        enc_id = int(row[0])
+        for idx, col in enumerate(legacy_cols, start=1):
+            count = int(row[idx] or 0)
+            if count <= 0:
+                continue
+            item_key = _LEGACY_BALL_COLUMNS[col]
+            conn.execute(
+                """
+                INSERT INTO encounter_item_uses (encounter_id, item_key, count)
+                VALUES (?, ?, ?)
+                ON CONFLICT(encounter_id, item_key) DO NOTHING
+                """,
+                (enc_id, item_key, count),
+            )
+
+
 def init_db(path: Path = DB_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with _connect(path) as conn:
         conn.executescript(SCHEMA)
         _ensure_trained_pokemon_column(conn)
+        _migrate_encounter_balls_to_items(conn)
 
 
 def _resolve_trained_pokemon_id(
@@ -611,18 +671,34 @@ def get_pending_encounter(path: Path = DB_PATH) -> Encounter | None:
     return _row_to_encounter(row) if row else None
 
 
+def increment_item_used(
+    encounter_id: int, item_key: str, n: int = 1, path: Path = DB_PATH
+) -> None:
+    """Add ``n`` to the count of ``item_key`` used against ``encounter_id``.
+
+    Inserts a row on first use and increments thereafter. Raises ``ValueError``
+    if ``item_key`` is unknown to the items registry.
+    """
+    from tokenmon.items import ITEMS  # local import to avoid cycle
+    if item_key not in ITEMS:
+        raise ValueError(f"unknown item_key: {item_key!r}")
+    with _connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO encounter_item_uses (encounter_id, item_key, count)
+            VALUES (?, ?, ?)
+            ON CONFLICT(encounter_id, item_key)
+            DO UPDATE SET count = count + excluded.count
+            """,
+            (encounter_id, item_key, int(n)),
+        )
+
+
 def increment_ball_used(
     encounter_id: int, ball_type: str, path: Path = DB_PATH
 ) -> None:
-    """Bumps the per-ball counter on an encounter row."""
-    col = _BALL_COLUMN.get(ball_type)
-    if col is None:
-        raise ValueError(f"unknown ball_type: {ball_type!r}")
-    with _connect(path) as conn:
-        conn.execute(
-            f"UPDATE encounters SET {col} = {col} + 1 WHERE id = ?",
-            (encounter_id,),
-        )
+    """Backwards-compat shim — delegates to :func:`increment_item_used`."""
+    increment_item_used(encounter_id, ball_type, n=1, path=path)
 
 
 def mark_encounter_caught(
@@ -666,45 +742,64 @@ def update_encounter_hint(
         )
 
 
-def query_ball_counts(path: Path = DB_PATH) -> dict[str, int]:
-    """Return ``{ball_type: count}`` clamped to ``[0, BALL_CAP]``.
+def query_item_counts(
+    item_keys: list[str] | None = None, path: Path = DB_PATH
+) -> dict[str, int]:
+    """Return ``{item_key: count}`` clamped to ``[0, item.cap]``.
 
-    Earned balls = floor(SUM(output_tokens) / threshold) summed across the
-    entire ``requests`` table. Used balls = sum of the matching ``*_used``
-    column on every encounter row (resolved or pending). The remainder is
-    capped at :data:`BALL_CAP`.
+    Earned = ``floor(SUM(output_tokens) / item.threshold)`` over all requests.
+    Used  = ``SUM(count)`` over ``encounter_item_uses`` for that key. Result =
+    earned − used, clamped to the item's cap.
+
+    If ``item_keys`` is None, returns counts for every key registered in
+    :mod:`tokenmon.items`.
     """
+    from tokenmon.items import ITEMS  # local import to avoid cycle
+
+    keys = list(item_keys) if item_keys is not None else list(ITEMS.keys())
+    out: dict[str, int] = {}
+    if not keys:
+        return out
+
     with _connect(path) as conn:
         total_out_row = conn.execute(
             "SELECT COALESCE(SUM(output_tokens), 0) FROM requests"
         ).fetchone()
         total_out = int(total_out_row[0] or 0)
-        used_row = conn.execute(
-            """
-            SELECT
-                COALESCE(SUM(pokeballs_used), 0),
-                COALESCE(SUM(greatballs_used), 0),
-                COALESCE(SUM(ultraballs_used), 0),
-                COALESCE(SUM(masterballs_used), 0)
-            FROM encounters
-            """
-        ).fetchone()
-    used = {
-        "pokeball": int(used_row[0] or 0),
-        "greatball": int(used_row[1] or 0),
-        "ultraball": int(used_row[2] or 0),
-        "masterball": int(used_row[3] or 0),
-    }
-    out: dict[str, int] = {}
-    for ball, threshold in BALL_THRESHOLDS.items():
-        earned = total_out // threshold
-        remaining = earned - used[ball]
+        # One query per key keeps the SQL trivial and avoids dynamic IN-list
+        # binding gymnastics. Item lists are tiny (<10 entries today).
+        used_by_key: dict[str, int] = {}
+        for key in keys:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(count), 0) FROM encounter_item_uses "
+                "WHERE item_key = ?",
+                (key,),
+            ).fetchone()
+            used_by_key[key] = int(row[0] or 0)
+
+    for key in keys:
+        item = ITEMS.get(key)
+        if item is None:
+            # Unknown key — surface 0 rather than raise; lets callers query
+            # legacy keys safely during transitions.
+            out[key] = 0
+            continue
+        earned = total_out // item.threshold if item.threshold > 0 else 0
+        remaining = earned - used_by_key.get(key, 0)
         if remaining < 0:
             remaining = 0
-        if remaining > BALL_CAP:
-            remaining = BALL_CAP
-        out[ball] = remaining
+        if remaining > item.cap:
+            remaining = item.cap
+        out[key] = remaining
     return out
+
+
+def query_ball_counts(path: Path = DB_PATH) -> dict[str, int]:
+    """Backwards-compat shim — returns counts for the four ball items in the
+    legacy order. Delegates to :func:`query_item_counts`."""
+    return query_item_counts(
+        ["pokeball", "greatball", "ultraball", "masterball"], path=path
+    )
 
 
 def backfill_trained_pokemon_ids(
