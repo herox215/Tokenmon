@@ -20,6 +20,9 @@ __all__ = [
     "list_distinct_encounter_species",
     "add_to_inventory",
     "decrement_inventory",
+    "add_to_pending",
+    "query_pending_drops",
+    "claim_pending_drops",
 ]
 
 
@@ -313,3 +316,89 @@ def list_distinct_encounter_species(path: Path | None = None) -> set[int]:
             "SELECT DISTINCT species_dex_id FROM encounters"
         ).fetchall()
     return {int(row[0]) for row in rows}
+
+
+# --- Pending drops --------------------------------------------------------
+# Loot from the per-token lottery first lands in ``pending_drops`` so the
+# user can see what they found via the Items-pane claim animation, then
+# claim it into the regular inventory.
+
+
+def add_to_pending(
+    item_key: str, n: int = 1, *, path: Path | None = None,
+) -> int:
+    """Add ``n`` of ``item_key`` to ``pending_drops``. No cap here — caps
+    apply on claim, when items move into the real inventory. Returns the
+    new pending count, or 0 for unknown items / non-positive n."""
+    if n <= 0:
+        return 0
+    from tokenmon.items import ITEMS
+
+    if item_key not in ITEMS:
+        return 0
+    if path is None:
+        path = DB_PATH
+    with _connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO pending_drops (item_key, count) VALUES (?, ?)
+            ON CONFLICT(item_key) DO UPDATE SET
+                count = count + excluded.count
+            """,
+            (item_key, int(n)),
+        )
+        row = conn.execute(
+            "SELECT count FROM pending_drops WHERE item_key = ?", (item_key,),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def query_pending_drops(path: Path | None = None) -> dict[str, int]:
+    """Return ``{item_key: count}`` of everything currently waiting to be
+    claimed. Empty dict when there's nothing pending."""
+    if path is None:
+        path = DB_PATH
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT item_key, count FROM pending_drops WHERE count > 0"
+        ).fetchall()
+    return {k: int(c or 0) for k, c in rows}
+
+
+def claim_pending_drops(path: Path | None = None) -> dict[str, int]:
+    """Atomically move every pending drop into the inventory (capped at the
+    item's ``cap``), returning ``{item_key: count}`` of what was actually
+    transferred. Pending entries are zeroed out — anything in excess of the
+    inventory cap is discarded.
+    """
+    from tokenmon.items import ITEMS
+
+    if path is None:
+        path = DB_PATH
+    transferred: dict[str, int] = {}
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT item_key, count FROM pending_drops WHERE count > 0"
+        ).fetchall()
+        for key, pending in rows:
+            item = ITEMS.get(key)
+            if item is None:
+                continue
+            cap = int(item.cap)
+            cur_row = conn.execute(
+                "SELECT count FROM inventory WHERE item_key = ?", (key,),
+            ).fetchone()
+            cur = int(cur_row[0]) if cur_row else 0
+            target = min(cap, cur + int(pending))
+            granted = max(0, target - cur)
+            if granted > 0:
+                conn.execute(
+                    """
+                    INSERT INTO inventory (item_key, count) VALUES (?, ?)
+                    ON CONFLICT(item_key) DO UPDATE SET count = ?
+                    """,
+                    (key, target, target),
+                )
+            transferred[key] = int(pending)  # show user what they "found"
+        conn.execute("DELETE FROM pending_drops")
+    return transferred

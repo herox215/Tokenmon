@@ -54,10 +54,13 @@ from Foundation import NSMakeRect, NSMakeSize, NSObject, NSPointInRect
 from tokenmon import box, config, encounter, items, items_remote, pokemon
 from tokenmon.overlay import _silhouette_image
 from tokenmon.pricing import cost_for
+from tokenmon import storage
 from tokenmon.storage import (
+    claim_pending_drops,
     get_pending_encounter,
     list_pokemon,
     query_item_counts,
+    query_pending_drops,
     query_pokemon_xp,
     query_today,
     query_today_by_model,
@@ -517,6 +520,72 @@ class _ItemsPaneRowHandler(NSObject):
         self._popover._show_pane(PANE_ITEMS)
 
 
+class _ClaimDropsButtonHandler(NSObject):
+    """Top-right gift button on the Items pane — kicks off the claim
+    animation when the user has at least one pending drop waiting."""
+
+    def initWithPopover_(self, popover):  # noqa: N802
+        self = objc.super(_ClaimDropsButtonHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        return self
+
+    def claimClicked_(self, _sender):  # noqa: N802
+        try:
+            pending = storage.query_pending_drops()
+        except Exception:
+            log.exception("query_pending_drops failed")
+            return
+        if not pending:
+            return
+        self._popover._begin_drop_claim_animation(pending)
+
+
+class _ClaimAnimationHandler(NSObject):
+    """NSTimer-driven step runner for the items-claim animation. Same
+    pattern as _CatchAnimationHandler / _PatHandler.
+
+    The popover knows how to interpret each (delay, action) step — this
+    object just paces them."""
+
+    def initWithPopover_steps_(self, popover, steps):  # noqa: N802
+        self = objc.super(_ClaimAnimationHandler, self).init()
+        if self is None:
+            return None
+        self._popover = popover
+        self._steps = list(steps)
+        self._idx = 0
+        return self
+
+    def start(self):
+        self._scheduleNext()
+
+    def _scheduleNext(self):
+        if self._idx >= len(self._steps):
+            return
+        delay, _ = self._steps[self._idx]
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            max(0.001, delay), self, b"fire:", None, False,
+        )
+
+    def fire_(self, _timer):  # noqa: N802
+        if self._idx >= len(self._steps):
+            return
+        _, action = self._steps[self._idx]
+        self._idx += 1
+        try:
+            self._popover._claim_step(action)
+        except Exception:
+            log.exception("claim step %s failed", action)
+            try:
+                self._popover._end_drop_claim_animation()
+            except Exception:
+                log.exception("claim teardown failed")
+            return
+        self._scheduleNext()
+
+
 class _DebugSpawnHandler(NSObject):
     """Usage-pane debug button — force-spawns an encounter or shows '(already pending)'."""
 
@@ -608,6 +677,14 @@ class TokenmonPopover(NSObject):
         self._bag_back_handler: _BagBackHandler | None = None
         self._item_row_handlers: list[_ItemRowHandler] = []
         self._stone_use_handlers: list = []
+        # Drop-claim animation state. ``_claim_active`` flips True from the
+        # moment the user clicks the gift button until the step sequence
+        # finishes, gating the Items-pane builder onto the claim view.
+        self._claim_active: bool = False
+        self._claim_handler: _ClaimAnimationHandler | None = None
+        self._claim_button_handler: _ClaimDropsButtonHandler | None = None
+        self._claim_payload: dict[str, int] = {}
+        self._claim_views: list = []  # NSImageView per pending item — moved per step
         self._run_away_handler: _RunAwayHandler | None = None
         self._reveal_timer_handler: _RevealTimerHandler | None = None
         self._reveal_timer = None
@@ -738,6 +815,9 @@ class TokenmonPopover(NSObject):
         self._bag_back_handler = None
         self._item_row_handlers = []
         self._stone_use_handlers = []
+        # Drop-claim animation refs are intentionally NOT reset here — they
+        # need to survive across the in-pane re-render (begin → animate →
+        # end). _end_drop_claim_animation clears them itself.
         self._run_away_handler = None
         self._pokedex_handlers = []
         self._pokedex_back_handler = None
@@ -2214,6 +2294,11 @@ class TokenmonPopover(NSObject):
     # =========================================================================
 
     def _build_pane_items(self) -> NSView:
+        # Mid-claim-animation: the dedicated builder takes over until the
+        # animation step sequence finishes and clears _claim_active.
+        if self._claim_active:
+            return self._build_pane_items_claim()
+
         view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
 
         # Header.
@@ -2222,6 +2307,25 @@ class TokenmonPopover(NSObject):
             "Items",
             font=NSFont.boldSystemFontOfSize_(15),
         ))
+
+        # "Found N items" gift button — top-right. Only rendered when there's
+        # something pending; click triggers the claim animation.
+        try:
+            pending = query_pending_drops()
+        except Exception:
+            log.exception("query_pending_drops failed")
+            pending = {}
+        pending_total = sum(pending.values())
+        if pending_total > 0:
+            claim_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(CONTENT_WIDTH - 110, POPOVER_HEIGHT - 36, 96, 28)
+            )
+            claim_btn.setTitle_(f"🎁  ×{pending_total}")
+            claim_btn.setBezelStyle_(1)
+            self._claim_button_handler = _ClaimDropsButtonHandler.alloc().initWithPopover_(self)
+            claim_btn.setTarget_(self._claim_button_handler)
+            claim_btn.setAction_(b"claimClicked:")
+            view.addSubview_(claim_btn)
 
         try:
             counts = query_item_counts()
@@ -2344,6 +2448,161 @@ class TokenmonPopover(NSObject):
         ))
 
         return view
+
+    # =========================================================================
+    # Drop-claim animation — top-down stagger of pending items, then auto-claim
+    # =========================================================================
+
+    def _begin_drop_claim_animation(self, pending: dict[str, int]) -> None:
+        """Snapshot pending drops, flip the pane into claim mode, build the
+        animation view, kick off the step sequence."""
+        if self._claim_active or not pending:
+            return
+        # Stable order: registry order, then by item key.
+        ordered = [
+            (k, pending[k]) for k in items.ITEMS if k in pending
+        ]
+        self._claim_payload = dict(ordered)
+        self._claim_active = True
+        self._show_pane(PANE_ITEMS)  # re-render → claim builder takes over
+        steps = self._build_claim_steps(ordered)
+        self._claim_handler = _ClaimAnimationHandler.alloc().initWithPopover_steps_(
+            self, steps,
+        )
+        self._claim_handler.start()
+
+    def _build_claim_steps(
+        self, ordered: list[tuple[str, int]],
+    ) -> list[tuple[float, str]]:
+        """Stagger: each item drops over 3 frames; next item starts after a
+        short delay; final hold then auto-claim."""
+        steps: list[tuple[float, str]] = []
+        for i, _ in enumerate(ordered):
+            steps.extend([
+                (0.10, f"drop_{i}_1"),
+                (0.06, f"drop_{i}_2"),
+                (0.06, f"drop_{i}_3"),
+            ])
+        steps.append((0.80, "done"))
+        return steps
+
+    def _build_pane_items_claim(self) -> NSView:
+        """Render the claim animation view: header + a row per pending item
+        (sprite stacked, count label). The sprites get repositioned per
+        ``_claim_step`` action to produce the top-down drop motion."""
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))
+
+        view.addSubview_(_label(
+            NSMakeRect(16, POPOVER_HEIGHT - 36, CONTENT_WIDTH - 32, 24),
+            "🎁  You found:",
+            font=NSFont.boldSystemFontOfSize_(15),
+            align=NSTextAlignmentCenter,
+        ))
+
+        ordered = list(self._claim_payload.items())
+        if not ordered:
+            return view
+
+        # Lay out one row per item. Each row holds a sprite (which animates
+        # in via _claim_step) plus a "× N" label that materialises when the
+        # sprite lands on the third frame.
+        n = len(ordered)
+        row_h = 56
+        gap = 4
+        total_h = n * row_h + (n - 1) * gap
+        top_y = (POPOVER_HEIGHT - 60 - total_h) // 2 + total_h
+        sprite_size = 40
+        sprite_x = (CONTENT_WIDTH - sprite_size) // 2 - 60
+
+        self._claim_views = []
+        for i, (key, count) in enumerate(ordered):
+            slot_y = top_y - (i + 1) * row_h - i * gap
+
+            # Sprite — start off-screen above; the step handler moves it down.
+            iv = NSImageView.alloc().initWithFrame_(
+                NSMakeRect(sprite_x, POPOVER_HEIGHT + 10, sprite_size, sprite_size)
+            )
+            iv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+            iv.setWantsLayer_(True)
+            if iv.layer() is not None:
+                iv.layer().setMagnificationFilter_("nearest")
+                iv.layer().setMinificationFilter_("nearest")
+            item = items.get(key)
+            if item is not None:
+                sprite = items_remote.get_item_image(item)
+                if sprite is not None:
+                    iv.setImage_(sprite)
+            view.addSubview_(iv)
+
+            # Count + name label — to the right of the sprite, hidden until
+            # the sprite lands.
+            label = _label(
+                NSMakeRect(sprite_x + sprite_size + 16, slot_y, 220, sprite_size),
+                f"+{count}  {item.display_name if item else key}",
+                font=NSFont.boldSystemFontOfSize_(14),
+                align=2,  # left
+            )
+            label.setHidden_(True)
+            view.addSubview_(label)
+
+            # Stash refs the step handler needs.
+            self._claim_views.append({
+                "sprite": iv,
+                "label": label,
+                "slot_y": slot_y,
+                "sprite_x": sprite_x,
+                "sprite_size": sprite_size,
+                "drop_height": POPOVER_HEIGHT - slot_y,
+            })
+
+        return view
+
+    def _claim_step(self, action: str) -> None:
+        if action == "done":
+            self._end_drop_claim_animation()
+            return
+        # Step actions look like ``drop_<i>_<frame>`` where frame is 1..3.
+        if action.startswith("drop_"):
+            try:
+                _, idx_str, frame_str = action.split("_")
+                idx = int(idx_str)
+                frame = int(frame_str)
+            except ValueError:
+                return
+            if idx >= len(self._claim_views):
+                return
+            slot = self._claim_views[idx]
+            sprite = slot["sprite"]
+            slot_y = slot["slot_y"]
+            drop_h = slot["drop_height"]
+            x = slot["sprite_x"]
+            size = slot["sprite_size"]
+            # Three drop positions: ¾ of the way down → ½ below slot →
+            # final slot y. Gives a quick "fall + thump" feel without a
+            # bounce path.
+            if frame == 1:
+                y = slot_y + drop_h * 0.6
+            elif frame == 2:
+                y = slot_y + 8
+            else:
+                y = slot_y
+                slot["label"].setHidden_(False)
+            sprite.setFrame_(NSMakeRect(x, y, size, size))
+
+    def _end_drop_claim_animation(self) -> None:
+        try:
+            claimed = claim_pending_drops()
+        except Exception:
+            log.exception("claim_pending_drops failed at animation end")
+            claimed = {}
+        # Clear animation state and re-render the regular Items pane (now
+        # with the new counts merged in).
+        self._claim_active = False
+        self._claim_handler = None
+        self._claim_payload = {}
+        self._claim_views = []
+        self._show_pane(PANE_ITEMS)
+        log.info("claim_drops: transferred %s", claimed)
 
     def _build_pane_usage(self) -> NSView:
         view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT))

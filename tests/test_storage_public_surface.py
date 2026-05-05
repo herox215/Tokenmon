@@ -52,6 +52,9 @@ PUBLIC_NAMES = [
     "query_pokedex_seen",
     "add_to_inventory",
     "decrement_inventory",
+    "add_to_pending",
+    "query_pending_drops",
+    "claim_pending_drops",
 ]
 
 

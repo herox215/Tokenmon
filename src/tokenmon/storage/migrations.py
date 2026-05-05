@@ -80,6 +80,15 @@ CREATE TABLE IF NOT EXISTS inventory (
     item_key TEXT PRIMARY KEY,
     count    INTEGER NOT NULL DEFAULT 0
 );
+
+-- Items dropped via the per-token lottery land here first; the user sees a
+-- "you found N items" badge and a small claim animation surfaces them
+-- before they merge into the regular inventory. Persistent so a restart
+-- doesn't swallow drops the user hasn't seen yet.
+CREATE TABLE IF NOT EXISTS pending_drops (
+    item_key TEXT PRIMARY KEY,
+    count    INTEGER NOT NULL DEFAULT 0
+);
 """
 
 

@@ -58,6 +58,9 @@ from .encounter import (
     list_distinct_encounter_species,
     add_to_inventory,
     decrement_inventory,
+    add_to_pending,
+    query_pending_drops,
+    claim_pending_drops,
 )
 
 # Pokedex
@@ -90,6 +93,7 @@ __all__ = [
     "increment_item_used", "increment_ball_used", "query_item_counts",
     "list_distinct_encounter_species",
     "add_to_inventory", "decrement_inventory",
+    "add_to_pending", "query_pending_drops", "claim_pending_drops",
     # pokedex
     "PokedexEntry", "query_pokedex", "query_pokemon_xp",
     "mark_seen", "mark_caught", "query_pokedex_seen",

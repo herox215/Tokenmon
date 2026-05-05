@@ -59,7 +59,7 @@ class Totals:
 def insert_usage(usage: Usage, path: Path | None = None) -> None:
     from tokenmon.active import resolve_trained_pokemon_id
     from tokenmon.items import roll_item_drops
-    from .encounter import add_to_inventory
+    from .encounter import add_to_pending
 
     if path is None:
         path = DB_PATH
@@ -94,11 +94,14 @@ def insert_usage(usage: Usage, path: Path | None = None) -> None:
     drops = roll_item_drops(usage.output_tokens or 0)
     for key, count in drops.items():
         try:
-            add_to_inventory(key, count, path=path)
+            # Drops park in pending_drops until the user opens the Items
+            # pane and claims them — gives them a chance to see what
+            # they found via the claim animation.
+            add_to_pending(key, count, path=path)
         except Exception:
             import logging
             logging.getLogger("tokenmon.storage.usage").exception(
-                "add_to_inventory(%s, %s) failed", key, count,
+                "add_to_pending(%s, %s) failed", key, count,
             )
 
 

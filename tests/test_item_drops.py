@@ -92,13 +92,16 @@ def test_increment_item_used_decrements_inventory(db_path):
 # --- insert_usage triggers drops -----------------------------------------
 
 
-def test_insert_usage_adds_pokeballs_to_inventory(db_path):
-    """A 5000-token request should add ~5 pokéballs (deterministic floor)."""
+def test_insert_usage_adds_pokeballs_to_pending(db_path):
+    """A 5000-token request lands ~5 pokéballs in pending_drops (not the
+    live inventory — they wait there until the user claims)."""
     storage.insert_usage(
         storage.Usage(model="x", output_tokens=5000), path=db_path,
     )
+    pending = storage.query_pending_drops(path=db_path)
+    assert pending.get("pokeball", 0) >= 5
     counts = storage.query_item_counts(["pokeball"], path=db_path)
-    assert counts["pokeball"] >= 5
+    assert counts["pokeball"] == 0
 
 
 def test_insert_usage_zero_output_no_drops(db_path):
@@ -107,6 +110,7 @@ def test_insert_usage_zero_output_no_drops(db_path):
     )
     counts = storage.query_item_counts(["pokeball"], path=db_path)
     assert counts["pokeball"] == 0
+    assert storage.query_pending_drops(path=db_path) == {}
 
 
 # --- migration backfill snapshot -----------------------------------------
