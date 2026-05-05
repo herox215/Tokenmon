@@ -75,6 +75,11 @@ CREATE TABLE IF NOT EXISTS pokedex_seen (
     first_caught_utc  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pokedex_seen_status ON pokedex_seen(status);
+
+CREATE TABLE IF NOT EXISTS inventory (
+    item_key TEXT PRIMARY KEY,
+    count    INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -248,6 +253,43 @@ def _backfill_pokedex_seen(conn: sqlite3.Connection) -> None:
             )
 
 
+def _backfill_inventory(conn: sqlite3.Connection) -> None:
+    """One-shot snapshot of the legacy "earned − used" formula into the new
+    ``inventory`` table. Runs while the table is empty so users don't lose
+    the items they've already accumulated when we switch to lottery drops.
+
+    Idempotent — once any inventory row exists we skip.
+    """
+    existing = conn.execute("SELECT 1 FROM inventory LIMIT 1").fetchone()
+    if existing is not None:
+        return
+
+    from tokenmon.items import ITEMS  # lazy — items doesn't depend on storage
+
+    total_out_row = conn.execute(
+        "SELECT COALESCE(SUM(output_tokens), 0) FROM requests"
+    ).fetchone()
+    total_out = int(total_out_row[0] or 0)
+
+    for key, item in ITEMS.items():
+        if item.threshold <= 0:
+            count = 0
+        else:
+            earned = total_out // item.threshold
+            used_row = conn.execute(
+                "SELECT COALESCE(SUM(count), 0) FROM encounter_item_uses "
+                "WHERE item_key = ?",
+                (key,),
+            ).fetchone()
+            used = int(used_row[0] or 0)
+            count = max(0, min(item.cap, earned - used))
+        conn.execute(
+            "INSERT INTO inventory (item_key, count) VALUES (?, ?) "
+            "ON CONFLICT(item_key) DO NOTHING",
+            (key, count),
+        )
+
+
 def init_db(path: Path | None = None) -> None:
     """Apply schema + every idempotent migration. Safe to call repeatedly."""
     if path is None:
@@ -261,3 +303,4 @@ def init_db(path: Path | None = None) -> None:
         _ensure_pokemon_source_column(conn)
         _migrate_encounter_balls_to_items(conn)
         _backfill_pokedex_seen(conn)
+        _backfill_inventory(conn)

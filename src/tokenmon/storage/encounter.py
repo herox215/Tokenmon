@@ -18,6 +18,8 @@ __all__ = [
     "increment_ball_used",
     "query_item_counts",
     "list_distinct_encounter_species",
+    "add_to_inventory",
+    "decrement_inventory",
 ]
 
 
@@ -131,13 +133,18 @@ def get_pending_encounter(path: Path | None = None) -> Encounter | None:
 def increment_item_used(
     encounter_id: int, item_key: str, n: int = 1, path: Path | None = None,
 ) -> None:
-    """Add ``n`` to the count of ``item_key`` used against ``encounter_id``."""
-    from tokenmon.items import ITEMS  # lazy — items would import storage's Pokemon
+    """Add ``n`` to the count of ``item_key`` used against ``encounter_id``,
+    AND decrement the live inventory by the same amount.
+
+    The encounter ledger is kept for stats / hindsight; the inventory row
+    is now load-bearing for "how many do I have"."""
+    from tokenmon.items import ITEMS
 
     if item_key not in ITEMS:
         raise ValueError(f"unknown item_key: {item_key!r}")
     if path is None:
         path = DB_PATH
+    n_int = int(n)
     with _connect(path) as conn:
         conn.execute(
             """
@@ -146,8 +153,75 @@ def increment_item_used(
             ON CONFLICT(encounter_id, item_key)
             DO UPDATE SET count = count + excluded.count
             """,
-            (encounter_id, item_key, int(n)),
+            (encounter_id, item_key, n_int),
         )
+        conn.execute(
+            """
+            INSERT INTO inventory (item_key, count) VALUES (?, 0)
+            ON CONFLICT(item_key) DO NOTHING
+            """,
+            (item_key,),
+        )
+        conn.execute(
+            "UPDATE inventory SET count = MAX(0, count - ?) WHERE item_key = ?",
+            (n_int, item_key),
+        )
+
+
+def add_to_inventory(
+    item_key: str, n: int = 1, *, path: Path | None = None,
+) -> int:
+    """Add ``n`` of ``item_key`` to the inventory, capped at ``Item.cap``.
+    Returns the new count, or 0 if the item is unknown / n <= 0."""
+    if n <= 0:
+        return 0
+    from tokenmon.items import ITEMS
+
+    item = ITEMS.get(item_key)
+    if item is None:
+        return 0
+    if path is None:
+        path = DB_PATH
+    cap = int(item.cap)
+    with _connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO inventory (item_key, count) VALUES (?, ?)
+            ON CONFLICT(item_key) DO UPDATE SET
+                count = MIN(?, count + excluded.count)
+            """,
+            (item_key, min(cap, int(n)), cap),
+        )
+        row = conn.execute(
+            "SELECT count FROM inventory WHERE item_key = ?", (item_key,),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def decrement_inventory(
+    item_key: str, n: int = 1, *, path: Path | None = None,
+) -> int:
+    """Subtract ``n`` from the inventory, clamped to 0. Returns new count."""
+    if n <= 0:
+        return 0
+    if path is None:
+        path = DB_PATH
+    with _connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO inventory (item_key, count) VALUES (?, 0)
+            ON CONFLICT(item_key) DO NOTHING
+            """,
+            (item_key,),
+        )
+        conn.execute(
+            "UPDATE inventory SET count = MAX(0, count - ?) WHERE item_key = ?",
+            (int(n), item_key),
+        )
+        row = conn.execute(
+            "SELECT count FROM inventory WHERE item_key = ?", (item_key,),
+        ).fetchone()
+    return int(row[0]) if row else 0
 
 
 def increment_ball_used(
@@ -202,47 +276,30 @@ def update_encounter_hint(
 def query_item_counts(
     item_keys: list[str] | None = None, path: Path | None = None,
 ) -> dict[str, int]:
-    """Return ``{item_key: count}`` clamped to ``[0, item.cap]``.
+    """Return ``{item_key: count}`` from the live ``inventory`` table.
 
-    Earned = ``floor(SUM(output_tokens) / item.threshold)``.
-    Used   = ``SUM(count)`` from ``encounter_item_uses``.
-    Result = earned − used, clamped to the item's cap.
+    Item counts used to be derived from a `floor(tokens / threshold) − used`
+    formula. They're now persisted explicitly: ``add_to_inventory`` grows
+    the count (driven by the per-request lottery in ``items.roll_item_drops``),
+    ``increment_item_used`` shrinks it.
     """
     from tokenmon.items import ITEMS
 
     if path is None:
         path = DB_PATH
     keys = list(item_keys) if item_keys is not None else list(ITEMS.keys())
-    out: dict[str, int] = {}
+    out: dict[str, int] = {k: 0 for k in keys}
     if not keys:
         return out
 
+    placeholders = ",".join(["?"] * len(keys))
     with _connect(path) as conn:
-        total_out_row = conn.execute(
-            "SELECT COALESCE(SUM(output_tokens), 0) FROM requests"
-        ).fetchone()
-        total_out = int(total_out_row[0] or 0)
-        used_by_key: dict[str, int] = {}
-        for key in keys:
-            row = conn.execute(
-                "SELECT COALESCE(SUM(count), 0) FROM encounter_item_uses "
-                "WHERE item_key = ?",
-                (key,),
-            ).fetchone()
-            used_by_key[key] = int(row[0] or 0)
-
-    for key in keys:
-        item = ITEMS.get(key)
-        if item is None:
-            out[key] = 0
-            continue
-        earned = total_out // item.threshold if item.threshold > 0 else 0
-        remaining = earned - used_by_key.get(key, 0)
-        if remaining < 0:
-            remaining = 0
-        if remaining > item.cap:
-            remaining = item.cap
-        out[key] = remaining
+        rows = conn.execute(
+            f"SELECT item_key, count FROM inventory WHERE item_key IN ({placeholders})",
+            tuple(keys),
+        ).fetchall()
+    for key, count in rows:
+        out[key] = int(count or 0)
     return out
 
 

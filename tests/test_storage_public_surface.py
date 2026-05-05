@@ -50,6 +50,8 @@ PUBLIC_NAMES = [
     "mark_seen",
     "mark_caught",
     "query_pokedex_seen",
+    "add_to_inventory",
+    "decrement_inventory",
 ]
 
 

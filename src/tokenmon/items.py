@@ -5,14 +5,21 @@ Each Item has:
 - emoji: display glyph
 - display_name: human label
 - description: 1-line flavour
-- threshold: lifetime output_tokens needed per +1 of this item
+- threshold: legacy field — kept for the one-shot inventory backfill, no
+  longer drives runtime drops
+- tok_chance: probability per output_token of dropping this item on a
+  request. ``None`` means the item is not droppable via the token lottery
+  (e.g. quest rewards, evolution stones — to be added later).
 - cap: max stack size (default 99)
 - actions: tuple of action keys this item supports — currently only 'throw'
 """
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
+
+_RNG = random.SystemRandom()
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +32,7 @@ class Item:
     cap: int = 99
     actions: tuple[str, ...] = ()
     sprite_name: str | None = None
+    tok_chance: float | None = None
 
 
 ITEMS: dict[str, Item] = {
@@ -36,6 +44,7 @@ ITEMS: dict[str, Item] = {
         threshold=1_000,
         actions=("throw",),
         sprite_name="poke-ball",
+        tok_chance=1 / 1_000,
     ),
     "greatball": Item(
         key="greatball",
@@ -45,6 +54,7 @@ ITEMS: dict[str, Item] = {
         threshold=10_000,
         actions=("throw",),
         sprite_name="great-ball",
+        tok_chance=1 / 10_000,
     ),
     "ultraball": Item(
         key="ultraball",
@@ -54,6 +64,7 @@ ITEMS: dict[str, Item] = {
         threshold=50_000,
         actions=("throw",),
         sprite_name="ultra-ball",
+        tok_chance=1 / 50_000,
     ),
     "masterball": Item(
         key="masterball",
@@ -63,6 +74,7 @@ ITEMS: dict[str, Item] = {
         threshold=500_000,
         actions=("throw",),
         sprite_name="master-ball",
+        tok_chance=1 / 500_000,
     ),
 }
 
@@ -86,3 +98,31 @@ def get(key: str) -> Item | None:
 def is_throwable(key: str) -> bool:
     item = ITEMS.get(key)
     return item is not None and "throw" in item.actions
+
+
+def roll_item_drops(output_tokens: int) -> dict[str, int]:
+    """For each item with ``tok_chance`` set, roll how many drop on a
+    request that produced ``output_tokens`` output tokens.
+
+    Algorithm: ``ev = output_tokens × tok_chance``; deterministic floor
+    plus a Bernoulli on the fractional remainder. Same expected value as
+    a pure Bernoulli-per-token roll, but cheap (one ``random()`` call per
+    item per request) and the integer floor delivers the "you've crossed
+    a threshold" feel without ever forcing a 100% roll.
+
+    Returns ``{item_key: count}``; only positive entries are included.
+    """
+    drops: dict[str, int] = {}
+    if output_tokens <= 0:
+        return drops
+    for key, item in ITEMS.items():
+        if item.tok_chance is None or item.tok_chance <= 0:
+            continue
+        ev = output_tokens * item.tok_chance
+        base = int(ev)
+        rem = ev - base
+        if rem > 0 and _RNG.random() < rem:
+            base += 1
+        if base > 0:
+            drops[key] = base
+    return drops
