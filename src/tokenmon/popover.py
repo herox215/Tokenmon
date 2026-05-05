@@ -398,6 +398,12 @@ class _ItemRowHandler(NSObject):
         item = items.get(self._item_key)
         if item is None or not item.actions:
             return
+        # Single-action items (currently every throwable item): skip the
+        # context menu and execute the action directly. The menu was nice in
+        # theory but a one-item popup just adds an extra click for no gain.
+        if len(item.actions) == 1:
+            self._dispatch_action(item.actions[0])
+            return
         menu = NSMenu.alloc().initWithTitle_("")
         for action in item.actions:
             title = self._title_for_action(action)
@@ -407,28 +413,20 @@ class _ItemRowHandler(NSObject):
             mi.setTarget_(self)
             mi.setRepresentedObject_(action)
             menu.addItem_(mi)
+        # Use the button-anchored variant — popUpContextMenuWithEvent_ wants
+        # a right-mouse-down event we don't have during a left-click action.
         try:
-            from AppKit import NSApp
-            event = NSApp.currentEvent()
-        except Exception:
-            event = None
-        try:
-            if event is not None:
-                NSMenu.popUpContextMenuWithEvent_forView_(menu, event, sender)
-            else:
-                # Fallback when no current event is available — anchor at the
-                # button's origin via popUpMenuPositioningItem.
-                menu.popUpMenuPositioningItem_atLocation_inView_(
-                    None, NSMakeRect(0, 0, 0, 0).origin, sender,
-                )
+            bounds = sender.bounds()
+            location = (0.0, float(bounds.size.height))
+            menu.popUpMenuPositioningItem_atLocation_inView_(
+                None, location, sender,
+            )
         except Exception:
             log.exception("item-row context menu failed")
 
-    def actionSelected_(self, sender):  # noqa: N802
-        try:
-            action = str(sender.representedObject())
-        except Exception:
-            return
+    def _dispatch_action(self, action: str) -> None:
+        """Same dispatch path used by both the menu (multi-action items) and
+        the direct-execute shortcut for single-action items."""
         if action == "throw":
             try:
                 result = encounter.use_item(self._encounter_id, self._item_key)
@@ -436,14 +434,17 @@ class _ItemRowHandler(NSObject):
                 log.exception("use_item(throw) failed")
                 return
             if result.get("caught"):
-                # Close the bag and trigger the existing reveal flow.
                 self._popover._encounter_bag_open = False
                 self._popover._begin_catch_reveal()
             else:
-                # Stay in bag-open so the user can throw again. Refresh the
-                # pane to update counts and surface the new last_hint.
                 self._popover._show_pane(PANE_ENCOUNTER)
-        # Future actions ('use', 'evolve') get their branches here.
+
+    def actionSelected_(self, sender):  # noqa: N802
+        try:
+            action = str(sender.representedObject())
+        except Exception:
+            return
+        self._dispatch_action(action)
 
 
 class _RunAwayHandler(NSObject):
