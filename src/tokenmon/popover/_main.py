@@ -393,24 +393,73 @@ class _RevealTimerHandler(NSObject):
             log.exception("reveal teardown failed")
 
 
-class _StoneUseHandler(NSObject):
-    """Items pane "Use" button — applies an evolution stone to the active
-    Pokemon. On no-effect (wrong species), shows a notification rather than
-    silently consuming the stone."""
+class _ItemsPaneRowHandler(NSObject):
+    """Click on an Items-pane row → native NSMenu of the item's
+    applicable actions, anchored to the row. Selecting an action
+    executes it (currently only ``use`` is implemented).
+
+    Mirrors the encounter-bag _ItemRowHandler pattern so the two panes
+    feel consistent."""
 
     def initWithPopover_itemKey_(self, popover, item_key):  # noqa: N802
-        self = objc.super(_StoneUseHandler, self).init()
+        self = objc.super(_ItemsPaneRowHandler, self).init()
         if self is None:
             return None
         self._popover = popover
         self._item_key = str(item_key)
         return self
 
-    def useClicked_(self, _sender):  # noqa: N802
+    # --- Click target — popup the menu --------------------------------
+
+    def rowClicked_(self, sender):  # noqa: N802
+        item = items.get(self._item_key)
+        if item is None or not item.actions:
+            return
+        # In the Items pane only ``use`` actions make sense — ``throw``
+        # belongs to the encounter bag (where there's a target).
+        applicable = [a for a in item.actions if a == "use"]
+        if not applicable:
+            return
+        menu = NSMenu.alloc().initWithTitle_("")
+        for action in applicable:
+            title = self._title_for_action(action)
+            mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, b"actionSelected:", "",
+            )
+            mi.setTarget_(self)
+            mi.setRepresentedObject_(action)
+            menu.addItem_(mi)
+        try:
+            bounds = sender.bounds()
+            location = (0.0, float(bounds.size.height))
+            menu.popUpMenuPositioningItem_atLocation_inView_(
+                None, location, sender,
+            )
+        except Exception:
+            log.exception("items-pane context menu failed")
+
+    def _title_for_action(self, action: str) -> str:
+        item = items.get(self._item_key)
+        name = item.display_name if item is not None else self._item_key
+        if action == "use":
+            return f"Use {name}"
+        return action
+
+    # --- Menu callback -----------------------------------------------
+
+    def actionSelected_(self, sender):  # noqa: N802
+        try:
+            action = str(sender.representedObject())
+        except Exception:
+            return
+        if action == "use":
+            self._dispatch_use()
+
+    def _dispatch_use(self) -> None:
         try:
             active = box.get_active_pokemon()
         except Exception:
-            log.exception("get_active_pokemon failed in use-stone")
+            log.exception("get_active_pokemon failed in items-pane use")
             return
         if active is None:
             try:
@@ -427,22 +476,23 @@ class _StoneUseHandler(NSObject):
         except Exception:
             log.exception("use_stone failed")
             return
+        item = items.get(self._item_key)
+        item_name = item.display_name if item is not None else self._item_key
         if evolved is None:
-            item = items.get(self._item_key)
-            name = item.display_name if item else self._item_key
             try:
                 rumps.notification(
                     title="Tokenmon",
-                    subtitle=f"{name} hatte keinen Effekt",
-                    message=f"{pokemon.name_of(active.species_dex_id)} kann mit "
-                            f"{name} nicht entwickelt werden.",
+                    subtitle=f"{item_name} hatte keinen Effekt",
+                    message=(
+                        f"{pokemon.name_of(active.species_dex_id)} kann mit "
+                        f"{item_name} nicht entwickelt werden."
+                    ),
                 )
             except Exception:
                 pass
             self._popover._show_pane(PANE_ITEMS)
             return
-        # Success — refresh menubar state so the icon picks up the new form,
-        # then re-render the items pane (count -1) and announce.
+        # Success path — refresh state so the icon updates, announce.
         try:
             app = self._popover._app
             if hasattr(app, "_refresh_pokemon_state"):
@@ -2258,22 +2308,25 @@ class TokenmonPopover(NSObject):
                 pass
             view.addSubview_(desc_field)
 
-            # "Use" button for items with the "use" action and count > 0.
-            # Currently that's exclusively evolution stones; future "use"
-            # items (e.g. consumable berries) will render the same button.
-            if "use" in item.actions and count > 0:
-                use_btn = NSButton.alloc().initWithFrame_(
-                    NSMakeRect(CONTENT_WIDTH - 80, y_cursor - row_h + 8, 64, 24)
+            # Row-wide click target — pops a context menu of applicable
+            # actions on click. Currently only items with a "use" action
+            # (= evolution stones) get a menu; balls don't because their
+            # only action ("throw") needs a wild-encounter target.
+            if any(a == "use" for a in item.actions) and count > 0:
+                row_btn = NSButton.alloc().initWithFrame_(
+                    NSMakeRect(0, y_cursor - row_h, CONTENT_WIDTH, row_h)
                 )
-                use_btn.setTitle_("Use")
-                use_btn.setBezelStyle_(1)
-                handler = _StoneUseHandler.alloc().initWithPopover_itemKey_(
+                row_btn.setTitle_("")
+                row_btn.setBordered_(False)
+                row_btn.setBezelStyle_(NSBezelStyleRegularSquare)
+                row_btn.setTransparent_(True)
+                handler = _ItemsPaneRowHandler.alloc().initWithPopover_itemKey_(
                     self, key,
                 )
                 self._stone_use_handlers.append(handler)
-                use_btn.setTarget_(handler)
-                use_btn.setAction_(b"useClicked:")
-                view.addSubview_(use_btn)
+                row_btn.setTarget_(handler)
+                row_btn.setAction_(b"rowClicked:")
+                view.addSubview_(row_btn)
 
             y_cursor -= row_h + 4
 
