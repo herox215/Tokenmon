@@ -37,7 +37,7 @@ from AppKit import (
 from Foundation import NSMakeRect, NSMakeSize, NSObject
 
 from tokenmon import config, items
-from tokenmon.storage import get_pending_encounter
+from tokenmon.storage import get_pending_encounter, get_pending_trainer
 
 log = logging.getLogger("tokenmon.popover")
 
@@ -48,11 +48,14 @@ TZ = "Europe/Berlin"
 # their existing references working.
 from tokenmon.popover.widgets import (
     CONTENT_WIDTH,
+    PANE_BATTLE,
+    PANE_BATTLE_REWARD,
     PANE_BOX,
     PANE_ENCOUNTER,
     PANE_ITEMS,
     PANE_POKEMON,
     PANE_TOKENDEX,
+    PANE_TRAINER_PREVIEW,
     PANE_USAGE,
     POPOVER_HEIGHT,
     POPOVER_WIDTH,
@@ -187,15 +190,25 @@ class TokenmonPopover(NSObject):
             btn.removeFromSuperview()
         self._sidebar_buttons = []
 
-        # Determine slot list — encounter slot at top when one is pending.
+        # Determine slot list — pending entities take the top slots.
+        # Trainer takes priority over wild encounter when both happen
+        # to be pending (the spawn loop already prevents that, but be
+        # defensive).
         try:
-            pending = get_pending_encounter()
+            pending_enc = get_pending_encounter()
         except Exception:
             log.exception("get_pending_encounter failed")
-            pending = None
+            pending_enc = None
+        try:
+            pending_trainer = get_pending_trainer()
+        except Exception:
+            log.exception("get_pending_trainer failed")
+            pending_trainer = None
 
         items: list[tuple[int, str]] = []
-        if pending is not None:
+        if pending_trainer is not None:
+            items.append((PANE_TRAINER_PREVIEW, "⚔️"))
+        if pending_enc is not None:
             items.append((PANE_ENCOUNTER, "⚡"))
         items += [
             (PANE_POKEMON, "🥚"),
@@ -306,15 +319,23 @@ class TokenmonPopover(NSObject):
         somewhere clickable."""
         # Lazy imports so the controllers stay decoupled at module import
         # time (avoids cycles between _main and panes/*).
+        from tokenmon.popover.panes.battle import BattleController
+        from tokenmon.popover.panes.battle_reward import BattleRewardController
         from tokenmon.popover.panes.box import BoxController
         from tokenmon.popover.panes.encounter import EncounterController
         from tokenmon.popover.panes.items import ItemsController
         from tokenmon.popover.panes.pokemon import PokemonController
         from tokenmon.popover.panes.tokendex import TokendexController
+        from tokenmon.popover.panes.trainer_preview import (
+            TrainerPreviewController,
+        )
         from tokenmon.popover.panes.usage import UsageController
 
         registry = {
             PANE_ENCOUNTER: EncounterController,
+            PANE_TRAINER_PREVIEW: TrainerPreviewController,
+            PANE_BATTLE: BattleController,
+            PANE_BATTLE_REWARD: BattleRewardController,
             PANE_POKEMON: PokemonController,
             PANE_TOKENDEX: TokendexController,
             PANE_BOX: BoxController,
@@ -467,17 +488,24 @@ class TokenmonPopover(NSObject):
         if self._popover.isShown():
             self._popover.close()
             return
-        # Auto-select the encounter pane whenever one is pending and the user
-        # is currently on a base pane — covers both "first pop after spawn"
-        # and "user closed popover, encounter spawned, opens again".
+        # Auto-select a pending entity's pane whenever one is pending
+        # and the user is on a base pane. Trainer wins over wild
+        # encounter (the spawn loop prevents both being pending at once
+        # but be defensive).
+        base_panes = (PANE_POKEMON, PANE_TOKENDEX, PANE_BOX, PANE_USAGE)
         try:
-            pending = get_pending_encounter()
+            pending_trainer = get_pending_trainer()
+        except Exception:
+            log.exception("get_pending_trainer failed")
+            pending_trainer = None
+        try:
+            pending_enc = get_pending_encounter()
         except Exception:
             log.exception("get_pending_encounter failed")
-            pending = None
-        if pending is not None and self._current_pane in (
-            PANE_POKEMON, PANE_TOKENDEX, PANE_BOX, PANE_USAGE,
-        ):
+            pending_enc = None
+        if pending_trainer is not None and self._current_pane in base_panes:
+            self._current_pane = PANE_TRAINER_PREVIEW
+        elif pending_enc is not None and self._current_pane in base_panes:
             self._current_pane = PANE_ENCOUNTER
         self._refresh_sidebar_pokemon_icon()
         self._show_pane(self._current_pane)

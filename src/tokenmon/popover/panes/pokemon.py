@@ -218,7 +218,23 @@ class PokemonController(PaneController):
             align=NSTextAlignmentCenter,
         ))
 
+        # Move-learn inline dialog: when this Pokémon has queued moves
+        # to learn from a recent level-up, surface the prompt here so
+        # the user can act on it without leaving the pane.
         affection_y = xp_y - 22
+        try:
+            from tokenmon.popover.panes._move_learn_inline import (
+                build_move_learn_inline,
+            )
+            consumed_h = build_move_learn_inline(
+                view, self, pokemon_id=row.id,
+                top_y=xp_y - 30,
+            )
+        except Exception:
+            log.exception("move-learn inline build failed")
+            consumed_h = 0
+        affection_y -= consumed_h
+
         view.addSubview_(_label(
             NSMakeRect(0, affection_y, CONTENT_WIDTH, 16),
             f"Affection   {_fmt_affection(row.affection)}",
