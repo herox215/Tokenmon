@@ -11,3 +11,22 @@ build/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local Claude Code state (per-project agent settings, transcripts, etc.)
+.claude/
+
+# Defensive: never let a Pokémon sprite cache land in the repo. The real
+# cache is at ~/.tokenmon/ (outside this dir), but if anyone ever points
+# it inside the project tree we don't want sprites committed alongside
+# the code — they're third-party assets fetched at runtime from PokeAPI.
+sprites/
+sprites_shiny/
+item_sprites/
+pokedex_descriptions.json
+weather_cache.json

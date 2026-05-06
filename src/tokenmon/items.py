@@ -44,7 +44,7 @@ ITEMS: dict[str, Item] = {
         threshold=1_000,
         actions=("throw",),
         sprite_name="poke-ball",
-        tok_chance=1 / 1_000,
+        tok_chance=1 / 5_000,
     ),
     "greatball": Item(
         key="greatball",
@@ -77,7 +77,7 @@ ITEMS: dict[str, Item] = {
         tok_chance=1 / 500_000,
     ),
     # Evolution stones — used on the active Pokemon to trigger species-
-    # specific stone evolutions. Rarer than Ultra Balls (~1 per 100k tokens).
+    # specific stone evolutions. Rarer than Ultra Balls (~1 per 250k tokens).
     "fire-stone": Item(
         key="fire-stone",
         emoji="🔥",
@@ -86,7 +86,7 @@ ITEMS: dict[str, Item] = {
         threshold=100_000,
         actions=("use",),
         sprite_name="fire-stone",
-        tok_chance=1 / 100_000,
+        tok_chance=1 / 250_000,
     ),
     "water-stone": Item(
         key="water-stone",
@@ -96,7 +96,7 @@ ITEMS: dict[str, Item] = {
         threshold=100_000,
         actions=("use",),
         sprite_name="water-stone",
-        tok_chance=1 / 100_000,
+        tok_chance=1 / 250_000,
     ),
     "thunder-stone": Item(
         key="thunder-stone",
@@ -106,7 +106,7 @@ ITEMS: dict[str, Item] = {
         threshold=100_000,
         actions=("use",),
         sprite_name="thunder-stone",
-        tok_chance=1 / 100_000,
+        tok_chance=1 / 250_000,
     ),
     "leaf-stone": Item(
         key="leaf-stone",
@@ -116,7 +116,7 @@ ITEMS: dict[str, Item] = {
         threshold=100_000,
         actions=("use",),
         sprite_name="leaf-stone",
-        tok_chance=1 / 100_000,
+        tok_chance=1 / 250_000,
     ),
     "moon-stone": Item(
         key="moon-stone",
@@ -126,7 +126,7 @@ ITEMS: dict[str, Item] = {
         threshold=100_000,
         actions=("use",),
         sprite_name="moon-stone",
-        tok_chance=1 / 100_000,
+        tok_chance=1 / 250_000,
     ),
 }
 

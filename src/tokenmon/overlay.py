@@ -14,17 +14,27 @@ from pathlib import Path
 import objc
 from AppKit import (
     NSBackingStoreBuffered,
+    NSBezelStyleRounded,
     NSColor,
     NSCompositingOperationSourceAtop,
     NSCompositingOperationSourceOver,
+    NSCursor,
+    NSEvent,
+    NSEventMaskLeftMouseDown,
+    NSEventMaskOtherMouseDown,
+    NSEventMaskRightMouseDown,
     NSFloatingWindowLevel,
     NSFont,
+    NSGraphicsContext,
     NSImage,
+    NSImageInterpolationNone,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
     NSRectFillUsingOperation,
+    NSPanel,
     NSScreen,
     NSShadow,
+    NSStatusWindowLevel,
     NSTextAlignmentCenter,
     NSTextField,
     NSTimer,
@@ -35,6 +45,7 @@ from AppKit import (
     NSWindowCollectionBehaviorStationary,
     NSWindowCollectionBehaviorTransient,
     NSWindowStyleMaskBorderless,
+    NSWindowStyleMaskNonactivatingPanel,
 )
 from Foundation import NSMakeRect, NSMakeSize, NSObject
 
@@ -116,6 +127,169 @@ class _LevelUpHandler(NSObject):
             self._overlay._end_level_up()
         except Exception:
             log.exception("level-up teardown failed")
+
+
+class _BubbleWindow(NSPanel):
+    """NSPanel subclass for the companion text bubble.
+
+    Tokenmon is an LSUIElement (status-bar-only) app. macOS routes
+    keystrokes to whichever app is active app-wide, NOT to whichever
+    window claims to be key — so a plain NSWindow that becomes key here
+    would still see no keystrokes because Tokenmon isn't the foreground
+    app.
+
+    NSPanel + ``NSWindowStyleMaskNonactivatingPanel`` is the canonical
+    fix: a non-activating panel can become key WITHOUT activating its
+    host app, and macOS happily routes keystrokes to it. The user's
+    previously-frontmost app stays frontmost; only the typing focus
+    moves into the bubble.
+
+    Borderless panels default ``canBecomeKeyWindow`` to False, so we
+    still override. ``canBecomeMainWindow`` stays False — accessory
+    panels never want main-window status.
+    """
+
+    def canBecomeKeyWindow(self):  # noqa: N802
+        return True
+
+    def canBecomeMainWindow(self):  # noqa: N802
+        return False
+
+
+class _CompanionImageView(NSImageView):
+    """NSImageView that forwards mouse-downs to the overlay so clicking
+    the sprite opens (or closes) the companion text bubble, AND disables
+    image interpolation in its draw path so animated pixel-art GIFs stay
+    crisp when scaled (96×96 native → 128×128 view → ±1.05 layer-zoom
+    transform).
+
+    Click reachability is gated by the overlay's ``ignoresMouseEvents``
+    flag, which is toggled by the menubar's 20 Hz proximity tick: when
+    the cursor sits inside the sprite's frame the window accepts events,
+    otherwise clicks pass through to whatever's underneath.
+
+    The drawRect_ override mirrors the popover's ``_CrispImageView`` —
+    layer-level magnification filters alone aren't enough for animated
+    GIFs because each frame goes through NSImageView's draw pipeline,
+    which would otherwise apply default bilinear interpolation.
+    """
+
+    def initWithFrame_overlay_(self, frame, overlay):  # noqa: N802
+        self = objc.super(_CompanionImageView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._companion_overlay = overlay
+        return self
+
+    def acceptsFirstMouse_(self, _event):  # noqa: N802
+        return True
+
+    def resetCursorRects(self):  # noqa: N802
+        self.addCursorRect_cursor_(self.bounds(), NSCursor.pointingHandCursor())
+
+    def drawRect_(self, rect):  # noqa: N802
+        ctx = NSGraphicsContext.currentContext()
+        if ctx is not None:
+            ctx.setImageInterpolation_(NSImageInterpolationNone)
+        objc.super(_CompanionImageView, self).drawRect_(rect)
+
+    def mouseDown_(self, _event):  # noqa: N802
+        overlay = getattr(self, "_companion_overlay", None)
+        if overlay is None:
+            return
+        try:
+            overlay._on_sprite_clicked()
+        except Exception:
+            log.exception("sprite click handler failed")
+
+
+TURN_FRAMES = 12          # 12 frames @ 25 ms = 300 ms total turn duration
+TURN_INTERVAL = 0.025
+TURN_HALF = 6             # midpoint where the sprite is edge-on (scale_x=0)
+
+
+class _TurnHandler(NSObject):
+    """NSTimer-driven 2D turn animation for the companion sprite.
+
+    Frame plan:
+      0..HALF      : scale_x ramps x_start → 0 (sprite squishes horizontally
+                     while y stays at start_zoom)
+      HALF         : sprite image is swapped to the target path; scale snaps
+                     to (0, target_zoom) so the new sprite emerges at its
+                     intended size
+      HALF+1..N-1  : scale_x ramps 0 → ±target_zoom (sign = target_mirrored)
+
+    The image swap at the edge-on midpoint reads as a 2D vertical-axis
+    rotation; the y-zoom snap at the same instant lets the back sprite
+    appear at a larger scale than the front to compensate for PokeAPI
+    back sprites drawing their character smaller within the canvas.
+    """
+
+    def initWithOverlay_target_xEnd_yEnd_xStart_yStart_(  # noqa: N802
+        self, overlay, target_path, x_end, y_end, x_start, y_start,
+    ):
+        self = objc.super(_TurnHandler, self).init()
+        if self is None:
+            return None
+        self._overlay = overlay
+        self._target_path = target_path
+        self._x_end = float(x_end)
+        self._y_end = float(y_end)
+        self._x_start = float(x_start)
+        self._y_start = float(y_start)
+        self._frame = 0
+        return self
+
+    def start(self):
+        self._scheduleNext()
+
+    def _scheduleNext(self):
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            TURN_INTERVAL, self, b"fire:", None, False,
+        )
+
+    def fire_(self, _timer):  # noqa: N802
+        if getattr(self._overlay, "_turn_handler", None) is not self:
+            return  # newer turn cancelled us
+        self._frame += 1
+        try:
+            if self._frame < TURN_HALF:
+                t = self._frame / TURN_HALF
+                self._overlay._apply_scale(
+                    self._x_start * (1.0 - t), self._y_start,
+                )
+            elif self._frame == TURN_HALF:
+                # Edge-on swap: new sprite emerges at the target zoom.
+                self._overlay.update_sprite(self._target_path)
+                self._overlay._apply_scale(0.0, self._y_end)
+            elif self._frame < TURN_FRAMES:
+                t = (self._frame - TURN_HALF) / (TURN_FRAMES - TURN_HALF)
+                self._overlay._apply_scale(self._x_end * t, self._y_end)
+            else:
+                self._overlay._end_turn(self._x_end, self._y_end)
+                return
+        except Exception:
+            log.exception("turn animation step failed")
+            self._overlay._end_turn(self._x_end, self._y_end)
+            return
+        self._scheduleNext()
+
+
+class _AlertHandler(NSObject):
+    """NSTimer target that clears a transient flash_alert banner."""
+
+    def initWithOverlay_(self, overlay):  # noqa: N802
+        self = objc.super(_AlertHandler, self).init()
+        if self is None:
+            return None
+        self._overlay = overlay
+        return self
+
+    def fire_(self, _timer):  # noqa: N802
+        try:
+            self._overlay._end_alert()
+        except Exception:
+            log.exception("alert teardown failed")
 
 
 class _FloatingItemHandler(NSObject):
@@ -327,6 +501,43 @@ class PokemonOverlay:
         self._window: NSWindow | None = None
         self._image_view: NSImageView | None = None
         self._visible = False
+        # Companion mode: when True, the overlay stays visible after
+        # level-up / evolution events finish instead of hiding. Set via
+        # set_persistent() from the menubar app, which also calls show()
+        # immediately when companion_mode flips on.
+        self._persistent: bool = False
+        # Alpha factors composited multiplicatively. ``_mood_alpha`` carries
+        # the time-of-day modifier (1.0 daytime, 0.85 night), and
+        # ``_proximity_alpha`` gets out of the way when the cursor
+        # approaches the sprite. Final window alpha is the product of the
+        # two. ``_last_applied_alpha`` short-circuits repeated
+        # setAlphaValue_ calls when nothing changed — relevant for the
+        # 20 Hz proximity tick.
+        self._mood_alpha: float = 1.0
+        self._proximity_alpha: float = 1.0
+        self._last_applied_alpha: float = 1.0
+        # In-flight turn animation handler (None when no turn running).
+        # Strong-ref kept so PyObjC doesn't GC the NSTimer target before
+        # all 12 frames fire.
+        self._turn_handler = None
+        # Currently-applied (x, y) layer scale — tracked so the next
+        # ``animate_sprite_turn`` knows where to start interpolating from.
+        # Sign carries mirror state, magnitude carries zoom.
+        self._current_scale: tuple[float, float] = (1.0, 1.0)
+        # Companion text bubble — opened on sprite click. NSPanel +
+        # NSTextField; toggles on subsequent clicks. None when not
+        # currently shown. ``_bubble_dismisser`` is the global NSEvent
+        # monitor that auto-closes the bubble when the user clicks
+        # outside our windows. ``_bubble_submit_handler`` is the strong
+        # ref to the NSObject target the text field invokes on Enter.
+        self._bubble_window: NSPanel | None = None
+        self._bubble_field: NSTextField | None = None
+        self._bubble_dismisser = None
+        self._bubble_submit_handler = None
+        # Generic alert banner (encounter pending, token burst, …).
+        self._alert_label: NSTextField | None = None
+        self._alert_handler: _LevelUpHandler | None = None
+        self._alert_timer: NSTimer | None = None
         self._level_up_label: NSTextField | None = None
         self._level_up_handler: _LevelUpHandler | None = None
         self._level_up_timer: NSTimer | None = None
@@ -360,7 +571,7 @@ class PokemonOverlay:
         )
         win.setReleasedWhenClosed_(False)
 
-        img_view = NSImageView.alloc().initWithFrame_(rect)
+        img_view = _CompanionImageView.alloc().initWithFrame_overlay_(rect, self)
         img_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
         img_view.setAnimates_(True)
         # Crisp pixel-art scaling — sprites stay sharp when scaled to 128×128.
@@ -383,6 +594,35 @@ class PokemonOverlay:
         x, y = _position_for(self._corner, screen.visibleFrame(), self._size, self._margin)
         self._window.setFrameOrigin_((x, y))
 
+    def move_to(self, x: float, y: float, *, animate: bool = True) -> None:
+        """Slide the overlay to absolute AppKit coordinates ``(x, y)``.
+
+        Used by companion mode to dock the sprite to the bottom-left of
+        the active app's window. ``animate=True`` uses Cocoa's built-in
+        ~250 ms slide so the move feels like the Pokémon walked there
+        rather than teleported.
+        """
+        if self._window is None:
+            return
+        rect = NSMakeRect(float(x), float(y), self._size, self._size)
+        try:
+            self._window.setFrame_display_animate_(rect, True, bool(animate))
+        except Exception:
+            log.exception("move_to failed")
+
+    def move_to_corner(self, *, animate: bool = True) -> None:
+        """Slide back to the configured screen corner. Used when the user
+        switches to a non-engagement app."""
+        if self._window is None:
+            return
+        screen = self._window.screen() or NSScreen.mainScreen()
+        if screen is None:
+            return
+        x, y = _position_for(
+            self._corner, screen.visibleFrame(), self._size, self._margin,
+        )
+        self.move_to(x, y, animate=animate)
+
     def update_sprite(self, sprite_path: Path | None) -> None:
         if sprite_path is None or not sprite_path.exists():
             return
@@ -396,6 +636,116 @@ class PokemonOverlay:
         self._image_view.setImage_(img)
         self._image_view.setAnimates_(True)
 
+    def set_sprite_orientation(self, *, front_path: Path,
+                               back_path: Path | None,
+                               mirrored: bool = False) -> None:
+        """Swap between front and back sprite for the same species and
+        optionally horizontally mirror the rendered sprite.
+
+        Caller resolves both paths via ``pokemon.ensure_sprite(...,
+        back=True/False)``; back_path may be None when no back sprite
+        exists for that Pokémon (post-gen-V species without animated
+        back, or download failure). In that case we stay on the front
+        sprite — the overlay never errors out.
+
+        ``mirrored=True`` flips the sprite around its vertical centre
+        via the image view's CALayer transform. Useful when the Pokémon
+        is anchored to one side of the focused window but should still
+        appear to face the window content (e.g. anchor on the right →
+        mirror back sprite so it faces left toward the content).
+        """
+        if back_path is not None and back_path.exists():
+            target = back_path
+        else:
+            target = front_path
+        if not target.exists():
+            log.warning("set_sprite_orientation: missing sprite %s", target)
+            return
+        self.update_sprite(target)
+        self.set_sprite_mirror(mirrored)
+
+    def set_sprite_mirror(self, mirrored: bool) -> None:
+        """Final-state mirror flip with zoom = 1.0. Convenience wrapper
+        around ``_apply_scale``."""
+        self._apply_scale(-1.0 if mirrored else 1.0, 1.0)
+
+    def _apply_scale(self, x: float, y: float) -> None:
+        """Set the sprite layer's transform to scale(x, y, 1) around the
+        layer's centre.
+
+        NSView's backing layer can default to an off-centre anchor (e.g.
+        (0, 0) on older macOS), which would make a sign-flipped scale
+        send the visible sprite off the view bounds. We center anchor +
+        position before applying the transform.
+        """
+        self._current_scale = (float(x), float(y))
+        if self._image_view is None:
+            return
+        layer = self._image_view.layer()
+        if layer is None:
+            return
+        try:
+            from Quartz import CATransform3DMakeScale
+            bounds = layer.bounds()
+            cx = float(bounds.size.width) / 2.0
+            cy = float(bounds.size.height) / 2.0
+            layer.setAnchorPoint_((0.5, 0.5))
+            layer.setPosition_((cx, cy))
+            layer.setTransform_(
+                CATransform3DMakeScale(float(x), float(y), 1.0),
+            )
+        except Exception:
+            log.exception("_apply_scale failed")
+
+    def animate_sprite_turn(self, *, front_path: Path,
+                            back_path: Path | None,
+                            mirrored: bool = False,
+                            zoom: float = 1.0) -> None:
+        """Animated front↔back swap that reads as a 2D turn: the sprite
+        squishes horizontally to zero width, the image swaps at the
+        edge-on point, and the new sprite expands back out (mirrored
+        sign on x decides facing; zoom decides target render size).
+
+        ``zoom > 1.0`` is useful for back sprites — PokeAPI gen-V back
+        sprites draw the character smaller within the 96×96 canvas
+        because the in-game camera shows them behind the trainer.
+        Scaling the layer above 1.0 enlarges the visible character; the
+        window's frame clips the overflow so neighbouring app pixels
+        aren't affected.
+
+        Cancels any in-flight turn so rapid orientation flips don't
+        stack — only the latest target wins.
+        """
+        if back_path is not None and back_path.exists():
+            target = back_path
+        else:
+            target = front_path
+        if not target.exists():
+            log.warning("animate_sprite_turn: missing sprite %s", target)
+            return
+        x_end = (-1.0 if mirrored else 1.0) * float(zoom)
+        y_end = float(zoom)
+        x_start, y_start = self._current_scale
+        handler = _TurnHandler.alloc().initWithOverlay_target_xEnd_yEnd_xStart_yStart_(
+            self, target, x_end, y_end, x_start, y_start,
+        )
+        self._turn_handler = handler
+        handler.start()
+
+    def _end_turn(self, x_end: float, y_end: float) -> None:
+        # Snap to canonical end state to clear any per-frame rounding drift.
+        self._apply_scale(x_end, y_end)
+        self._turn_handler = None
+
+    def reset_sprite_state(self) -> None:
+        """Cancel any in-flight turn animation and reset the layer
+        transform to identity (no mirror, no zoom). Called by the
+        menubar when the active Pokémon changes so the new species
+        doesn't inherit the previous one's engaged-state transform.
+        """
+        self._turn_handler = None
+        self._apply_scale(1.0, 1.0)
+
     def show(self) -> None:
         self._ensure_window()
         if self._window is None:
@@ -408,6 +758,324 @@ class PokemonOverlay:
         if self._window is not None:
             self._window.orderOut_(None)
         self._visible = False
+        # Don't leave a dangling text bubble when the sprite vanishes.
+        if self._bubble_window is not None:
+            self._close_bubble()
+
+    def set_persistent(self, persistent: bool) -> None:
+        """Toggle companion-mode persistence. When True, level-up / evolution
+        animations strip their banners but leave the sprite window on screen.
+        Caller is responsible for showing/hiding the overlay when the flag
+        flips — this method only stores the preference."""
+        self._persistent = bool(persistent)
+
+    def set_mood_alpha(self, multiplier: float) -> None:
+        """Apply a Phase-5 mood multiplier (e.g. night dimming) on top of
+        whatever idle-state damping is currently active. Clamped to a
+        sane range so a typo can't make the overlay invisible."""
+        m = float(multiplier)
+        if m < 0.5:
+            m = 0.5
+        if m > 1.0:
+            m = 1.0
+        if abs(m - self._mood_alpha) < 1e-3:
+            return
+        self._mood_alpha = m
+        self._apply_alpha()
+
+    def set_proximity_alpha(self, multiplier: float) -> None:
+        """Cursor-proximity fade factor. 1.0 = cursor far away (full alpha
+        per the other factors), 0.1ish = cursor on the sprite (mostly
+        transparent so the sprite gets out of the way)."""
+        m = float(multiplier)
+        if m < 0.0:
+            m = 0.0
+        if m > 1.0:
+            m = 1.0
+        if abs(m - self._proximity_alpha) < 5e-3:
+            return  # too small to matter — skip the redraw
+        self._proximity_alpha = m
+        self._apply_alpha()
+
+    def _apply_alpha(self) -> None:
+        if self._window is None:
+            return
+        alpha = self._mood_alpha * self._proximity_alpha
+        # Idempotency — setAlphaValue_ triggers a window redisplay even
+        # when the value is unchanged, so the 20 Hz proximity tick would
+        # otherwise spam the compositor while the cursor sits still.
+        if abs(alpha - self._last_applied_alpha) < 5e-3:
+            return
+        self._last_applied_alpha = alpha
+        try:
+            self._window.setAlphaValue_(alpha)
+        except Exception:
+            log.exception("setAlphaValue_ failed")
+
+    # --- Generic alert flash ---------------------------------------------
+
+    def flash_alert(self, text: str, duration_s: float = 4.0) -> None:
+        """Show a small text/emoji banner above the sprite for ``duration_s``
+        seconds, then auto-clear. Reuses the level-up banner geometry but
+        leaves the underlying sprite untouched. If an alert is already in
+        flight it gets replaced."""
+        # Tear down any in-flight alert first.
+        if self._alert_timer is not None:
+            try:
+                self._alert_timer.invalidate()
+            except Exception:
+                pass
+            self._alert_timer = None
+        if self._alert_label is not None:
+            try:
+                self._alert_label.removeFromSuperview()
+            except Exception:
+                pass
+            self._alert_label = None
+        if self._window is None:
+            return
+        size = self._size
+        banner_h = 24  # smaller than LEVEL_UP_BANNER_HEIGHT — non-disruptive
+        # Position the banner just above the sprite without resizing the
+        # window — overlap with the sprite a few px is fine for a one-line
+        # flash and keeps the layout simple.
+        label = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(0, size - banner_h, size, banner_h)
+        )
+        label.setStringValue_(text)
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        label.setAlignment_(NSTextAlignmentCenter)
+        label.setFont_(NSFont.boldSystemFontOfSize_(13))
+        label.setTextColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.92, 0.4, 1.0)
+        )
+        shadow = NSShadow.alloc().init()
+        shadow.setShadowColor_(NSColor.blackColor())
+        shadow.setShadowOffset_(NSMakeSize(0, -1))
+        shadow.setShadowBlurRadius_(3)
+        label.setShadow_(shadow)
+        self._window.contentView().addSubview_(label)
+        self._alert_label = label
+
+        handler = _AlertHandler.alloc().initWithOverlay_(self)
+        self._alert_handler = handler
+        self._alert_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                max(0.5, duration_s), handler, b"fire:", None, False
+            )
+        )
+
+    def _end_alert(self) -> None:
+        if self._alert_timer is not None:
+            try:
+                self._alert_timer.invalidate()
+            except Exception:
+                pass
+            self._alert_timer = None
+        if self._alert_label is not None:
+            try:
+                self._alert_label.removeFromSuperview()
+            except Exception:
+                pass
+            self._alert_label = None
+        self._alert_handler = None
+
+    # --- Click-through gating + text bubble ------------------------------
+
+    def set_clickable(self, clickable: bool) -> None:
+        """Toggle the overlay window between click-through (events pass to
+        whatever's underneath) and clickable (mouseDown_ on the sprite
+        fires our handler). Called from the menubar's proximity tick to
+        only intercept clicks when the cursor is over the sprite."""
+        if self._window is None:
+            return
+        try:
+            self._window.setIgnoresMouseEvents_(not bool(clickable))
+        except Exception:
+            log.exception("setIgnoresMouseEvents_ failed")
+
+    @property
+    def bubble_open(self) -> bool:
+        return self._bubble_window is not None
+
+    def _on_sprite_clicked(self) -> None:
+        """Toggle the companion text bubble: show if hidden, hide if
+        already up."""
+        if self._bubble_window is not None:
+            self._close_bubble()
+        else:
+            self._open_bubble()
+
+    def _open_bubble(self) -> None:
+        if self._window is None:
+            return
+        # Position the bubble to the right of the sprite, vertically
+        # centred. The bubble window is a borderless 220×40 NSWindow with
+        # a single NSTextField inside.
+        sprite_frame = self._window.frame()
+        bubble_w = 220
+        bubble_h = 40
+        bx = float(sprite_frame.origin.x) + float(sprite_frame.size.width) + 6
+        by = float(sprite_frame.origin.y) + (
+            float(sprite_frame.size.height) - bubble_h
+        ) / 2
+        rect = NSMakeRect(bx, by, bubble_w, bubble_h)
+        # NonactivatingPanel is the bit that lets keystrokes reach the
+        # field while Tokenmon stays a background app. Without it the
+        # text caret blinks but typing goes to whatever app actually has
+        # the active state.
+        win = _BubbleWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect,
+            NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
+            NSBackingStoreBuffered, False,
+        )
+        win.setOpaque_(False)
+        win.setBackgroundColor_(NSColor.clearColor())
+        win.setHasShadow_(True)
+        # NSStatusWindowLevel sits above NSFloatingWindowLevel (the sprite)
+        # and above floats from other apps, so the bubble stays in front
+        # even when another window steals focus.
+        win.setLevel_(NSStatusWindowLevel)
+        # Stationary + CanJoinAllSpaces so it shows on every Space without
+        # following Space switches. Transient is intentionally OMITTED —
+        # transient panels get auto-dismissed by some system actions and
+        # would slip behind / disappear unexpectedly.
+        win.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorIgnoresCycle
+        )
+        win.setReleasedWhenClosed_(False)
+        win.setMovable_(False)
+        win.setHidesOnDeactivate_(False)
+
+        # Field fills the entire window edge-to-edge so there's no
+        # transparent gap around it. We deliberately drop the system
+        # rounded-bezel: it renders with macOS vibrancy / translucency
+        # which the user reads as "transparent". Instead we set an
+        # explicit dark background color and a CALayer cornerRadius for
+        # rounded corners — yielding a solid, clearly-visible block.
+        field = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(0, 0, bubble_w, bubble_h)
+        )
+        field.setBezeled_(False)
+        field.setBordered_(False)
+        field.setDrawsBackground_(True)
+        bg = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            0.16, 0.16, 0.18, 1.0,
+        )
+        field.setBackgroundColor_(bg)
+        field.setTextColor_(NSColor.whiteColor())
+        field.setEditable_(True)
+        field.setSelectable_(True)
+        field.setStringValue_("")
+        # Placeholder rendered light-gray so it's readable on the dark
+        # background — default placeholder color is too dark to see here.
+        from Foundation import NSAttributedString
+        from AppKit import NSFontAttributeName, NSForegroundColorAttributeName
+        ph_attrs = {
+            NSFontAttributeName: NSFont.systemFontOfSize_(13),
+            NSForegroundColorAttributeName: NSColor.colorWithCalibratedWhite_alpha_(
+                1.0, 0.45,
+            ),
+        }
+        field.setPlaceholderAttributedString_(
+            NSAttributedString.alloc().initWithString_attributes_(
+                "Sag was zum Pokémon…", ph_attrs,
+            )
+        )
+        field.setFont_(NSFont.systemFontOfSize_(13))
+        # Round the corners via CALayer so the dark background renders as
+        # a pill-shape rather than a hard rectangle.
+        field.setWantsLayer_(True)
+        layer = field.layer()
+        if layer is not None:
+            layer.setCornerRadius_(8.0)
+            layer.setMasksToBounds_(True)
+            layer.setBackgroundColor_(bg.CGColor())
+
+        # Press Return → action fires → close bubble. NSTextField default
+        # only sends action on Enter (sendsActionOnEndEditing=False), so
+        # focus loss won't trigger this — the global outside-click
+        # dismisser handles that case.
+        from tokenmon.popover._handlers import make_handler
+        submit_handler = make_handler(lambda _s: self._close_bubble())
+        self._bubble_submit_handler = submit_handler
+        field.setTarget_(submit_handler)
+        field.setAction_(b"fire:")
+
+        win.setContentView_(field)
+        # makeKeyAndOrderFront brings the bubble to front AND makes it
+        # key — required so the text field receives keystrokes. With the
+        # _BubbleWindow override of canBecomeKeyWindow, this works for a
+        # borderless window too.
+        win.makeKeyAndOrderFront_(None)
+        try:
+            win.makeFirstResponder_(field)
+        except Exception:
+            log.exception("makeFirstResponder_ failed")
+
+        self._bubble_window = win
+        self._bubble_field = field
+        self._install_bubble_dismisser()
+
+    def _close_bubble(self) -> None:
+        self._uninstall_bubble_dismisser()
+        if self._bubble_window is not None:
+            try:
+                self._bubble_window.orderOut_(None)
+                self._bubble_window.close()
+            except Exception:
+                log.exception("bubble close failed")
+        self._bubble_window = None
+        self._bubble_field = None
+        self._bubble_submit_handler = None
+
+    def _install_bubble_dismisser(self) -> None:
+        """Install a global NSEvent monitor that closes the bubble on any
+        mouse-down event delivered to another app. The global monitor
+        does NOT see clicks inside Tokenmon's own windows, so:
+          - clicks on the sprite go to ``_CompanionImageView.mouseDown_``
+            (which toggles the bubble closed via _on_sprite_clicked)
+          - clicks inside the bubble (e.g. positioning the text caret)
+            are handled by the NSPanel itself
+          - clicks anywhere else fire this handler → close.
+        """
+        if self._bubble_dismisser is not None:
+            return
+        mask = (
+            NSEventMaskLeftMouseDown
+            | NSEventMaskRightMouseDown
+            | NSEventMaskOtherMouseDown
+        )
+
+        def _handler(_event):
+            try:
+                self._close_bubble()
+            except Exception:
+                log.exception("bubble outside-click dismisser failed")
+
+        try:
+            self._bubble_dismisser = (
+                NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                    mask, _handler,
+                )
+            )
+        except Exception:
+            log.exception("bubble dismisser install failed")
+            self._bubble_dismisser = None
+
+    def _uninstall_bubble_dismisser(self) -> None:
+        if self._bubble_dismisser is None:
+            return
+        try:
+            NSEvent.removeMonitor_(self._bubble_dismisser)
+        except Exception:
+            log.exception("bubble dismisser remove failed")
+        self._bubble_dismisser = None
 
     # --- Floating-item drift animation -----------------------------------
 
@@ -585,12 +1253,23 @@ class PokemonOverlay:
             return
         size = self._size
         banner_h = LEVEL_UP_BANNER_HEIGHT
-        screen = self._window.screen() or NSScreen.mainScreen()
-        if screen is not None:
-            x, y = _position_for(self._corner, screen.visibleFrame(), size, self._margin)
+        # In companion mode the sprite is docked to the focused window —
+        # don't teleport it to the screen corner; grow upward in place.
+        # Default (event-only) mode keeps the corner anchor.
+        if self._persistent:
+            current = self._window.frame()
+            x = float(current.origin.x)
+            y = float(current.origin.y)
             self._window.setFrame_display_animate_(
-                NSMakeRect(x, y, size, size + banner_h), True, True
+                NSMakeRect(x, y, size, size + banner_h), True, True,
             )
+        else:
+            screen = self._window.screen() or NSScreen.mainScreen()
+            if screen is not None:
+                x, y = _position_for(self._corner, screen.visibleFrame(), size, self._margin)
+                self._window.setFrame_display_animate_(
+                    NSMakeRect(x, y, size, size + banner_h), True, True
+                )
         content = self._window.contentView()
         content.setFrame_(NSMakeRect(0, 0, size, size + banner_h))
         if self._image_view is not None:
@@ -628,17 +1307,37 @@ class PokemonOverlay:
             self._image_view.setAnimates_(True)
         if self._window is None:
             return
-        screen = self._window.screen() or NSScreen.mainScreen()
-        if screen is not None:
-            x, y = _position_for(self._corner, screen.visibleFrame(), self._size, self._margin)
+        # Shrink window back to sprite-only. In companion mode keep the
+        # current origin (companion docking owns the position); in default
+        # mode return to the configured screen corner.
+        if self._persistent:
+            current = self._window.frame()
+            x = float(current.origin.x)
+            y = float(current.origin.y)
             self._window.setFrame_display_animate_(
-                NSMakeRect(x, y, self._size, self._size), True, False
+                NSMakeRect(x, y, self._size, self._size), True, False,
             )
+        else:
+            screen = self._window.screen() or NSScreen.mainScreen()
+            if screen is not None:
+                x, y = _position_for(
+                    self._corner, screen.visibleFrame(), self._size, self._margin,
+                )
+                self._window.setFrame_display_animate_(
+                    NSMakeRect(x, y, self._size, self._size), True, False,
+                )
         content = self._window.contentView()
         content.setFrame_(NSMakeRect(0, 0, self._size, self._size))
         if self._image_view is not None:
             self._image_view.setFrame_(NSMakeRect(0, 0, self._size, self._size))
-        self.hide()
+        if not self._persistent:
+            self.hide()
+        else:
+            # Companion mode: clear any inherited mirror/zoom transform
+            # so the evolved sprite renders un-flipped. The next
+            # _tick_orientation in the menubar will re-apply the correct
+            # back/front + mirror based on input recency.
+            self.reset_sprite_state()
 
     # --- Level-up animation -----------------------------------------------
 
@@ -719,8 +1418,8 @@ class PokemonOverlay:
         self._level_up_handler = None
         if self._window is None:
             return
-        # Shrink window back to sprite-only, then hide it. Overlay only ever
-        # appears for level-up events, so we want it gone afterwards.
+        # Shrink window back to sprite-only. In default (event-only) mode we
+        # then hide it; in companion mode the sprite stays put.
         screen = self._window.screen() or NSScreen.mainScreen()
         if screen is not None:
             x, y = _position_for(self._corner, screen.visibleFrame(), self._size, self._margin)
@@ -731,4 +1430,5 @@ class PokemonOverlay:
         content.setFrame_(NSMakeRect(0, 0, self._size, self._size))
         if self._image_view is not None:
             self._image_view.setFrame_(NSMakeRect(0, 0, self._size, self._size))
-        self.hide()
+        if not self._persistent:
+            self.hide()

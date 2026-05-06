@@ -27,10 +27,13 @@ from .data import (
 
 # Sprite cache + fetcher.
 from .sprites import (
+    BACK_SPRITE_DIR,
+    SHINY_BACK_SPRITE_DIR,
     SHINY_SPRITE_DIR,
     SHINY_SPRITE_URL_TMPL,
     SPRITE_DIR,
     SPRITE_URL_TMPL,
+    back_sprite_dir,
     ensure_sprite,
     sprite_path,
 )
@@ -98,9 +101,10 @@ __all__ = [
     "GEN1_TYPES", "GROWTH_RATES", "NATURES", "CHARACTERISTICS",
     "STONE_EVOLUTIONS", "TYPE_COLORS",
     # sprites
+    "BACK_SPRITE_DIR", "SHINY_BACK_SPRITE_DIR",
     "SHINY_SPRITE_DIR", "SHINY_SPRITE_URL_TMPL",
     "SPRITE_DIR", "SPRITE_URL_TMPL",
-    "ensure_sprite", "sprite_path",
+    "back_sprite_dir", "ensure_sprite", "sprite_path",
     # level
     "MAX_LEVEL", "catch_rate_of", "current_stage_of", "display_name",
     "evolution_chain", "growth_rate_of", "level_from_xp",

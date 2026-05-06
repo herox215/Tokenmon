@@ -119,3 +119,25 @@ def test_pat_steps_with_hearts_has_five():
     steps = popover._build_pat_steps(True)
     hearts = [a for _, a in steps if a.startswith("heart_")]
     assert len(hearts) == 5
+
+
+# ---- _nice_max -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("value, expected", [
+    (0, 1),
+    (1, 1),
+    (2, 2),
+    (3, 5),
+    (5, 5),
+    (6, 10),
+    (17, 20),
+    (42, 50),
+    (123, 200),
+    (4_500, 5_000),
+    (17_342, 20_000),
+    (60_000, 100_000),
+])
+def test_nice_max_rounds_to_one_two_five(value, expected):
+    from tokenmon.popover.widgets import _nice_max
+    assert _nice_max(value) == expected

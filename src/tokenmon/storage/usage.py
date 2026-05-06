@@ -19,6 +19,7 @@ __all__ = [
     "insert_usage",
     "query_today",
     "query_today_by_model",
+    "query_today_token_buckets",
     "query_xp_for_date",
     "query_xp_for_pokemon",
     "latest_request_ts",
@@ -174,6 +175,53 @@ def query_today_by_model(
             (start, end),
         ).fetchall()
     return {row[0]: Totals(*row[1:]) for row in rows}
+
+
+def query_today_token_buckets(
+    tz_name: str = "Europe/Berlin",
+    bucket_minutes: int = 15,
+    path: Path | None = None,
+) -> list[int]:
+    """Output-token sums per fixed-size time bucket across the local day.
+
+    Returns a list of length ``1440 // bucket_minutes`` (default 96 for
+    15 min). Index 0 is 00:00–00:15 local, index -1 is 23:45–24:00 local.
+    Empty buckets sit at 0.
+
+    DST note: on fall-back days the local clock visits 02:00–03:00 twice,
+    so those buckets accumulate both passes. On spring-forward days that
+    hour simply stays empty. We don't try to disentangle the wall-clock
+    duplicate — `_today_utc_bounds` already clamps the day window, and
+    visually showing the second pass merged into the same slot is the
+    least surprising option for a usage chart.
+    """
+    if path is None:
+        path = DB_PATH
+    if 1440 % bucket_minutes != 0:
+        raise ValueError(
+            f"bucket_minutes must divide 1440 evenly, got {bucket_minutes}"
+        )
+    n_buckets = 1440 // bucket_minutes
+    buckets = [0] * n_buckets
+    start, end = _today_utc_bounds(tz_name)
+    tz = ZoneInfo(tz_name)
+    with _connect(path) as conn:
+        rows = conn.execute(
+            """
+            SELECT ts_utc, output_tokens FROM requests
+            WHERE ts_utc >= ? AND ts_utc < ?
+            """,
+            (start, end),
+        ).fetchall()
+    for ts_str, out_tokens in rows:
+        ts = datetime.fromisoformat(ts_str)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        local = ts.astimezone(tz)
+        idx = (local.hour * 60 + local.minute) // bucket_minutes
+        if 0 <= idx < n_buckets:
+            buckets[idx] += int(out_tokens or 0)
+    return buckets
 
 
 def query_xp_for_date(

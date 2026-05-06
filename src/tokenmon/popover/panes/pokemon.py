@@ -72,7 +72,7 @@ class PokemonController(PaneController):
         if row is None:
             view.addSubview_(_label(
                 NSMakeRect(16, POPOVER_HEIGHT // 2 - 10, CONTENT_WIDTH - 32, 20),
-                "Konnte aktives Pokemon nicht laden.",
+                "Could not load active Pokémon.",
                 color=NSColor.secondaryLabelColor(),
                 align=NSTextAlignmentCenter,
             ))
@@ -221,7 +221,7 @@ class PokemonController(PaneController):
         affection_y = xp_y - 22
         view.addSubview_(_label(
             NSMakeRect(0, affection_y, CONTENT_WIDTH, 16),
-            f"Zuneigung   {_fmt_affection(row.affection)}",
+            f"Affection   {_fmt_affection(row.affection)}",
             font=NSFont.systemFontOfSize_(12),
             color=NSColor.labelColor(),
             align=NSTextAlignmentCenter,

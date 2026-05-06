@@ -438,6 +438,9 @@ class TokenmonPopover(NSObject):
     def toggleOverlay_(self, _sender):  # noqa: N802
         self._app.toggle_overlay(None)
 
+    def toggleCompanion_(self, _sender):  # noqa: N802
+        self._app.toggle_companion(None)
+
     def toggleWeather_(self, _sender):  # noqa: N802
         self._app.toggle_weather(None)
 
@@ -531,7 +534,7 @@ class TokenmonPopover(NSObject):
         """Fallback: small NSMenu with Quit, shown on right-click."""
         menu = NSMenu.alloc().init()
         item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Beenden", b"quit:", "",
+            "Quit", b"quit:", "",
         )
         item.setTarget_(self._right_click_handler)
         menu.addItem_(item)
@@ -551,6 +554,15 @@ class TokenmonPopover(NSObject):
         for iv in self._animated_image_views:
             iv.setAnimates_(False)
         self._stop_weather_layer()
+        # Tear down the active controller so any timers it owns (e.g. the
+        # Usage pane's 30-s chart refresh) stop firing while the popover
+        # is hidden. The controller is rebuilt next time _show_pane runs.
+        if self._current_controller is not None:
+            try:
+                self._current_controller.teardown()
+            except Exception:
+                log.exception("controller teardown on popover close failed")
+            self._current_controller = None
 
     # ---- weather background ----
 

@@ -61,34 +61,34 @@ _WMO_TYPE_BOOSTS: dict[int, frozenset[str]] = {
 # label used in the encounter pane sub-header. Mapping is grouped — every
 # WMO code listed in _WMO_TYPE_BOOSTS has a matching label here.
 _WMO_LABELS: dict[int, tuple[str, str]] = {
-    0: ("☀️", "Sonnig"),
-    1: ("🌤️", "Heiter"),
-    2: ("⛅", "Wolkig"),
-    3: ("☁️", "Bewölkt"),
-    45: ("🌫️", "Nebel"),
-    48: ("🌫️", "Nebel"),
-    51: ("🌦️", "Nieselregen"),
-    53: ("🌦️", "Nieselregen"),
-    55: ("🌦️", "Nieselregen"),
-    56: ("🌧️", "Eisregen"),
-    57: ("🌧️", "Eisregen"),
-    61: ("🌧️", "Regen"),
-    63: ("🌧️", "Regen"),
-    65: ("🌧️", "Starkregen"),
-    66: ("🌧️", "Eisregen"),
-    67: ("🌧️", "Eisregen"),
-    71: ("🌨️", "Schnee"),
-    73: ("🌨️", "Schnee"),
-    75: ("❄️", "Starker Schnee"),
-    77: ("🌨️", "Schneegriesel"),
-    80: ("🌧️", "Regenschauer"),
-    81: ("🌧️", "Regenschauer"),
-    82: ("⛈️", "Heftiger Schauer"),
-    85: ("🌨️", "Schneeschauer"),
-    86: ("❄️", "Schneeschauer"),
-    95: ("⛈️", "Gewitter"),
-    96: ("⛈️", "Gewitter"),
-    99: ("⛈️", "Schweres Gewitter"),
+    0: ("☀️", "Clear"),
+    1: ("🌤️", "Mainly clear"),
+    2: ("⛅", "Partly cloudy"),
+    3: ("☁️", "Overcast"),
+    45: ("🌫️", "Fog"),
+    48: ("🌫️", "Fog"),
+    51: ("🌦️", "Drizzle"),
+    53: ("🌦️", "Drizzle"),
+    55: ("🌦️", "Drizzle"),
+    56: ("🌧️", "Freezing drizzle"),
+    57: ("🌧️", "Freezing drizzle"),
+    61: ("🌧️", "Rain"),
+    63: ("🌧️", "Rain"),
+    65: ("🌧️", "Heavy rain"),
+    66: ("🌧️", "Freezing rain"),
+    67: ("🌧️", "Freezing rain"),
+    71: ("🌨️", "Snow"),
+    73: ("🌨️", "Snow"),
+    75: ("❄️", "Heavy snow"),
+    77: ("🌨️", "Snow grains"),
+    80: ("🌧️", "Rain showers"),
+    81: ("🌧️", "Rain showers"),
+    82: ("⛈️", "Heavy showers"),
+    85: ("🌨️", "Snow showers"),
+    86: ("❄️", "Snow showers"),
+    95: ("⛈️", "Thunderstorm"),
+    96: ("⛈️", "Thunderstorm"),
+    99: ("⛈️", "Severe thunderstorm"),
 }
 
 
@@ -113,10 +113,10 @@ def type_weights(snap: WeatherSnapshot) -> dict[str, float]:
 
 def emoji_label(snap: WeatherSnapshot) -> str:
     """Single-line summary for the encounter pane: emoji, condition, and
-    the favored types (if any). e.g. '🌧️ Regen · Wasser/Bug bevorzugt'."""
-    emoji, condition = _WMO_LABELS.get(int(snap.wmo), ("🌡️", "Unbekannt"))
+    the favored types (if any). e.g. '🌧️ Rain · Water/Bug favored'."""
+    emoji, condition = _WMO_LABELS.get(int(snap.wmo), ("🌡️", "Unknown"))
     weights = type_weights(snap)
     if not weights:
         return f"{emoji} {condition} · {snap.temp_c:.0f}°C"
     favored = "/".join(sorted(t.capitalize() for t in weights))
-    return f"{emoji} {condition} · {favored} bevorzugt"
+    return f"{emoji} {condition} · {favored} favored"

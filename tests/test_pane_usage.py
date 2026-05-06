@@ -15,6 +15,7 @@ class _FakeApp:
     _show_pokemon = True
     _show_overlay = False
     _use_weather = False
+    _companion_mode = False
 
 
 class _FakePopover:
@@ -33,9 +34,9 @@ def test_usage_controller_build_does_not_raise(db_path):
     ctrl = UsageController(pop)
     view = ctrl.build_view()
     assert view is not None
-    # No animations on the usage pane → controller's handler list stays
-    # tight: just the debug-spawn click handler.
-    assert len(ctrl._handlers) == 1
+    # Usage pane anchors at least the chart-refresh NSTimer target. Don't
+    # assert exact equality so future tweaks don't churn this test.
+    assert len(ctrl._handlers) >= 1
 
 
 def test_usage_controller_teardown_clears_handlers(db_path):
@@ -45,8 +46,8 @@ def test_usage_controller_teardown_clears_handlers(db_path):
     ctrl.build_view()
     ctrl.teardown()
     assert ctrl._handlers == []
-    assert ctrl._already_pending_label is None
-    assert ctrl._already_pending_timer is None
+    assert ctrl._chart_view is None
+    assert ctrl._chart_timer is None
 
 
 def test_usage_controller_teardown_idempotent_without_build(db_path):
@@ -55,3 +56,23 @@ def test_usage_controller_teardown_idempotent_without_build(db_path):
     ctrl = UsageController(_FakePopover())
     ctrl.teardown()  # no crash
     assert ctrl._handlers == []
+
+
+def test_usage_controller_chart_view_present_after_build(db_path):
+    from tokenmon.popover.panes.usage import UsageController
+    from tokenmon.popover.widgets import _TokenChartView
+
+    ctrl = UsageController(_FakePopover())
+    ctrl.build_view()
+    assert isinstance(ctrl._chart_view, _TokenChartView)
+    assert ctrl._chart_timer is not None
+    ctrl.teardown()
+
+
+def test_usage_controller_refresh_chart_handles_missing_view(db_path):
+    """_refresh_chart must be safe to call after teardown drops the view."""
+    from tokenmon.popover.panes.usage import UsageController
+    ctrl = UsageController(_FakePopover())
+    ctrl.build_view()
+    ctrl.teardown()
+    ctrl._refresh_chart()  # no crash, no-op

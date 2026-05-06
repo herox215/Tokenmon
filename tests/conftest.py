@@ -42,8 +42,10 @@ def _isolate_sprites(tmp_path, monkeypatch):
     """Redirect sprite cache + stub the network fetcher."""
     sprite_dir = tmp_path / "sprites"
     shiny_dir = tmp_path / "sprites_shiny"
-    sprite_dir.mkdir(parents=True, exist_ok=True)
-    shiny_dir.mkdir(parents=True, exist_ok=True)
+    back_dir = tmp_path / "sprites_back"
+    shiny_back_dir = tmp_path / "sprites_back_shiny"
+    for d in (sprite_dir, shiny_dir, back_dir, shiny_back_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
     import tokenmon.pokemon as pkmn
 
@@ -52,15 +54,27 @@ def _isolate_sprites(tmp_path, monkeypatch):
     # redirected dirs when it does direct module-attribute lookups.
     monkeypatch.setattr(pkmn, "SPRITE_DIR", sprite_dir, raising=False)
     monkeypatch.setattr(pkmn, "SHINY_SPRITE_DIR", shiny_dir, raising=False)
+    monkeypatch.setattr(pkmn, "BACK_SPRITE_DIR", back_dir, raising=False)
+    monkeypatch.setattr(
+        pkmn, "SHINY_BACK_SPRITE_DIR", shiny_back_dir, raising=False
+    )
     try:
         from tokenmon.pokemon import sprites as _sprites_mod
         monkeypatch.setattr(_sprites_mod, "SPRITE_DIR", sprite_dir, raising=False)
         monkeypatch.setattr(_sprites_mod, "SHINY_SPRITE_DIR", shiny_dir, raising=False)
+        monkeypatch.setattr(_sprites_mod, "BACK_SPRITE_DIR", back_dir, raising=False)
+        monkeypatch.setattr(
+            _sprites_mod, "SHINY_BACK_SPRITE_DIR", shiny_back_dir, raising=False
+        )
     except ImportError:
         pass  # Pre-Wave-D layout — no sprites submodule yet.
 
-    def _fake_ensure_sprite(dex_id, timeout=5.0, *, shiny=False):
-        target = (shiny_dir if shiny else sprite_dir) / f"{int(dex_id)}.gif"
+    def _fake_ensure_sprite(dex_id, timeout=5.0, *, shiny=False, back=False):
+        if back:
+            base = shiny_back_dir if shiny else back_dir
+        else:
+            base = shiny_dir if shiny else sprite_dir
+        target = base / f"{int(dex_id)}.gif"
         if not target.exists():
             target.write_bytes(b"GIF89a fake")
         return target

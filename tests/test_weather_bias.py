@@ -62,15 +62,15 @@ def test_hot_temperature_adds_fire():
 
 def test_emoji_label_contains_condition_and_favored_types():
     label = emoji_label(_snap(61, temp_c=10.0))
-    assert "Regen" in label
-    assert "Wasser" in label or "Bug" in label
+    assert "Rain" in label
+    assert "Water" in label or "Bug" in label
 
 
 def test_emoji_label_neutral_weather_shows_temperature():
     """When there's no boost, the label falls back to weather + temp."""
     label = emoji_label(_snap(2, temp_c=15.0))
     assert "15" in label  # temperature shown
-    assert "bevorzugt" not in label  # no type-favored phrasing
+    assert "favored" not in label  # no type-favored phrasing
 
 
 def test_unknown_wmo_label_does_not_crash():

@@ -27,6 +27,7 @@ from .usage import (
     insert_usage,
     query_today,
     query_today_by_model,
+    query_today_token_buckets,
     query_xp_for_date,
     query_xp_for_pokemon,
     latest_request_ts,
@@ -83,6 +84,7 @@ __all__ = [
     "SCHEMA", "init_db",
     # usage
     "Usage", "Totals", "insert_usage", "query_today", "query_today_by_model",
+    "query_today_token_buckets",
     "query_xp_for_date", "query_xp_for_pokemon", "latest_request_ts",
     "backfill_trained_pokemon_ids",
     # pokemon

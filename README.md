@@ -67,7 +67,7 @@ and records usage. For streaming requests Tokenmon also injects
 without that flag, OpenAI-style streams hide them.
 
 For models we don't have hardcoded pricing for (most of OpenRouter's catalog),
-the "Geschätzte Kosten" line shows the partial cost plus a coverage
+the estimated-cost line in the popover shows the partial cost plus a coverage
 percentage so you know how much of your usage isn't priced.
 
 After this:
@@ -112,7 +112,7 @@ uv run tokenmon status
 ## Troubleshooting
 
 **Menubar shows ⚠️ instead of 🥚** — the proxy isn't reachable on
-`127.0.0.1:8788`. Click the menubar item → "Proxy neustarten", or:
+`127.0.0.1:8788`. Use the menubar's restart-proxy action, or run:
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.tokenmon.proxy
@@ -131,3 +131,20 @@ path. Re-run `uv run tokenmon install` from the new location.
 - Anthropic only. Other providers (OpenAI, Google, …) are out of scope.
 - macOS only. The menubar uses `rumps`/AppKit; the proxy itself is portable.
 - No retention policy — the SQLite DB grows forever until you `DELETE` from it.
+
+## License & disclaimer
+
+Tokenmon's source code is released under the [MIT License](LICENSE).
+
+**This is an unofficial, non-commercial fan project.** Pokémon, Poké Ball,
+Pokédex, and every Pokémon name, sprite, and species are trademarks and/or
+copyrighted works of Nintendo, Game Freak, and The Pokémon Company. This
+project is not affiliated with, endorsed by, or sponsored by any of them.
+
+All Pokémon sprites and species descriptions are fetched at runtime from
+the community-maintained [PokeAPI](https://pokeapi.co/) and cached locally
+under `~/.tokenmon/`; nothing Pokémon-owned is bundled in this repository.
+
+The MIT License covers only the original code in this repository. It does
+**not** grant any rights to the third-party trademarks or copyrighted
+content referenced above.

@@ -463,3 +463,165 @@ def _type_badge_row(
         )
         badges.append(b)
     return badges
+
+
+# --- Token-usage chart ----------------------------------------------------
+
+
+def _nice_max(value: int) -> int:
+    """Round ``value`` up to the nearest 1/2/5 × 10ⁿ — used as the y-axis
+    ceiling for the token chart so the gridline labels stay legible
+    (10K, 20K, 50K …) instead of arbitrary numbers like 17,342.
+
+    ``_nice_max(0) == 1`` so an empty-day chart still has a valid scale.
+    """
+    if value <= 0:
+        return 1
+    import math
+    exp = math.floor(math.log10(value))
+    base = 10 ** exp
+    for mul in (1, 2, 5, 10):
+        cap = mul * base
+        if cap >= value:
+            return int(cap)
+    return int(10 * base)
+
+
+class _TokenChartView(NSView):
+    """Bar chart of output tokens per fixed-size time bucket across today.
+
+    Y axis = tokens (0..nice_max), X axis = local time of day (0..24h).
+    A vertical accent-coloured "now" line marks the current time so the
+    user can read past activity left of it and see the empty future on
+    the right.
+
+    State is set via ``setBuckets_nowMinute_`` so ``drawRect_`` stays
+    pure — the controller refreshes both data and the now position
+    every 30 s while the pane is visible.
+    """
+
+    PLOT_LEFT_PAD = 36   # room for y-axis labels
+    PLOT_RIGHT_PAD = 8
+    PLOT_TOP_PAD = 8
+    PLOT_BOTTOM_PAD = 14  # room for x-axis labels
+
+    def initWithFrame_buckets_bucketMinutes_nowMinute_(  # noqa: N802
+        self, frame, buckets, bucket_minutes, now_minute,
+    ):
+        self = objc.super(_TokenChartView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._buckets: list[int] = list(buckets)
+        self._bucket_minutes: int = int(bucket_minutes)
+        self._now_minute: int = int(now_minute)
+        return self
+
+    def setBuckets_nowMinute_(self, buckets, now_minute):  # noqa: N802
+        self._buckets = list(buckets)
+        self._now_minute = int(now_minute)
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, _rect):  # noqa: N802
+        bounds = self.bounds()
+        # Card background.
+        NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.06).set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            bounds, 8, 8,
+        ).fill()
+        NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.18).set()
+        border = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            bounds, 8, 8,
+        )
+        border.setLineWidth_(0.5)
+        border.stroke()
+
+        plot_x = self.PLOT_LEFT_PAD
+        plot_y = self.PLOT_BOTTOM_PAD
+        plot_w = bounds.size.width - self.PLOT_LEFT_PAD - self.PLOT_RIGHT_PAD
+        plot_h = bounds.size.height - self.PLOT_TOP_PAD - self.PLOT_BOTTOM_PAD
+
+        from tokenmon.ui_helpers import fmt_tokens
+
+        total = sum(self._buckets)
+        if total == 0:
+            # Empty-state — show a single centred line where the bars would be.
+            attrs = {
+                NSFontAttributeName: NSFont.systemFontOfSize_(11),
+                NSForegroundColorAttributeName: NSColor.secondaryLabelColor(),
+            }
+            astr = NSAttributedString.alloc().initWithString_attributes_(
+                "Noch keine Tokens heute", attrs,
+            )
+            size = astr.size()
+            astr.drawAtPoint_((
+                (bounds.size.width - size.width) / 2,
+                (bounds.size.height - size.height) / 2,
+            ))
+            self._draw_x_axis_labels(plot_x, plot_y, plot_w)
+            return
+
+        peak = max(self._buckets)
+        y_max = _nice_max(peak)
+
+        # Gridlines + y-axis labels at 0, mid, max.
+        grid_color = NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.18)
+        label_attrs = {
+            NSFontAttributeName: NSFont.systemFontOfSize_(9),
+            NSForegroundColorAttributeName: NSColor.secondaryLabelColor(),
+        }
+        for frac, value in ((0.0, 0), (0.5, y_max // 2), (1.0, y_max)):
+            gy = plot_y + plot_h * frac
+            line = NSBezierPath.bezierPath()
+            line.moveToPoint_((plot_x, gy))
+            line.lineToPoint_((plot_x + plot_w, gy))
+            grid_color.set()
+            line.setLineWidth_(0.5)
+            line.stroke()
+            label = fmt_tokens(int(value))
+            astr = NSAttributedString.alloc().initWithString_attributes_(
+                label, label_attrs,
+            )
+            sz = astr.size()
+            astr.drawAtPoint_((plot_x - sz.width - 4, gy - sz.height / 2))
+
+        # Bars.
+        n = len(self._buckets)
+        bar_w = plot_w / n
+        accent = NSColor.controlAccentColor().colorWithAlphaComponent_(0.85)
+        accent.set()
+        for i, value in enumerate(self._buckets):
+            if value <= 0:
+                continue
+            h = plot_h * (value / y_max)
+            x = plot_x + i * bar_w
+            # Inset by 0.5 px so adjacent non-zero bars don't smear.
+            rect = NSMakeRect(x + 0.5, plot_y, max(0.5, bar_w - 1.0), h)
+            NSBezierPath.fillRect_(rect)
+
+        # "Now" line — only if it falls inside today's window (0..1440).
+        if 0 <= self._now_minute <= 1440:
+            nx = plot_x + plot_w * (self._now_minute / 1440.0)
+            now_path = NSBezierPath.bezierPath()
+            now_path.moveToPoint_((nx, plot_y))
+            now_path.lineToPoint_((nx, plot_y + plot_h))
+            NSColor.systemOrangeColor().colorWithAlphaComponent_(0.9).set()
+            now_path.setLineWidth_(1.0)
+            now_path.stroke()
+
+        self._draw_x_axis_labels(plot_x, plot_y, plot_w)
+
+    def _draw_x_axis_labels(self, plot_x, plot_y, plot_w):
+        attrs = {
+            NSFontAttributeName: NSFont.systemFontOfSize_(9),
+            NSForegroundColorAttributeName: NSColor.secondaryLabelColor(),
+        }
+        for hour in (0, 6, 12, 18, 24):
+            frac = hour / 24.0
+            x = plot_x + plot_w * frac
+            text = f"{hour:02d}"
+            astr = NSAttributedString.alloc().initWithString_attributes_(
+                text, attrs,
+            )
+            sz = astr.size()
+            # Label hangs below the plot area inside PLOT_BOTTOM_PAD.
+            astr.drawAtPoint_((x - sz.width / 2, plot_y - sz.height - 1))

@@ -53,6 +53,22 @@ from tokenmon.storage import (
 REFRESH_INTERVAL_SEC = 30
 HEALTH_INTERVAL_SEC = 10
 ACTIVITY_POLL_INTERVAL_SEC = 5
+# Companion: how long an input event keeps the Pokémon facing the screen
+# before it turns around to look at the user. Polled at the
+# ACTIVITY_POLL_INTERVAL_SEC tick, so transitions can lag up to that
+# interval — fine, since 30 s already implies "no recent activity".
+INTERACTION_TIMEOUT_S = 30.0
+# Zoom factor for the back sprite. PokeAPI gen-V back sprites draw the
+# character noticeably smaller than the front sprite within the same
+# 96×96 canvas — boosting the layer scale brings them visually back to
+# par. The companion window clips the overflow so the larger render
+# stays within the sprite frame.
+COMPANION_BACK_ZOOM = 1.05
+# Cursor-proximity fade tick frequency. 20 Hz feels smooth without
+# noticeable CPU cost (each fire is one NSEvent.mouseLocation, one frame
+# read, one cheap distance calc). The set_proximity_alpha path is
+# idempotent, so identical alphas don't redisplay the window.
+PROXIMITY_TICK_S = 0.05
 # Affection grows while the active Pokemon stays the same. With a 5s poll,
 # 120 ticks = 10 minutes of "owning" time per +1 affection — at the 0..255
 # cap that's ~42h of cumulative active time to fully bond. Counter resets to
@@ -232,7 +248,37 @@ class TokenmonApp(rumps.App):
             corner=str(config.get("overlay_corner") or "bottom-right"),
         )
         self._show_overlay = bool(config.get("show_overlay"))
+        self._companion_mode = bool(config.get("companion_mode"))
         self._use_weather = bool(config.get("use_weather"))
+        # Wire companion-mode persistence into the overlay so level-up /
+        # evolution endings don't hide the sprite while the companion is on.
+        self._overlay.set_persistent(self._companion_mode)
+        # Active-app observer + global-input monitor — installed lazily when
+        # companion mode is on so we don't subscribe to system events for
+        # users who never enable the feature. Strong refs kept on `self` so
+        # PyObjC doesn't GC them.
+        self._active_app_observer = None
+        self._input_monitor = None
+        # Tracks which orientation the overlay last rendered ("front"/"back")
+        # so the 5-s tick doesn't redundantly reload sprite paths every poll
+        # when nothing changed.
+        self._last_orientation: str | None = None
+        # Last-docked window rect, used by _tick_dock to detect when the
+        # focused window changed (different window of same app, moved,
+        # resized, migrated to another screen) and we should re-dock.
+        self._last_dock_rect = None
+        # Throttle for input-event-driven dock checks — we re-poll the
+        # window list at most this often so per-keystroke callbacks don't
+        # spam CGWindowListCopyWindowInfo.
+        self._last_dock_check_mono: float = 0.0
+        if self._companion_mode:
+            try:
+                self._overlay.update_sprite(self._pokemon_sprite)
+                self._overlay.show()
+                self._install_active_app_observer()
+                self._install_input_monitor()
+            except Exception:
+                log.exception("companion overlay show on init failed")
         # Level-up detection state. The overlay never appears outside of
         # level-up events, so we only need a "last seen level" to detect changes.
         self._last_known_level: int = self._compute_current_level()
@@ -287,6 +333,22 @@ class TokenmonApp(rumps.App):
             self._last_known_level = self._compute_current_level()
             self._sync_menubar_icon()
             self._sync_overlay()
+            # Reset the companion's mirror/zoom transform — without this
+            # the new species would render with the previous one's
+            # engaged-state transform (e.g. inherits a -1.15 x scale and
+            # appears mirrored). Then re-evaluate orientation from
+            # scratch so the new sprite picks the correct front/back +
+            # mirror based on current input recency.
+            if self._companion_mode:
+                try:
+                    self._overlay.reset_sprite_state()
+                except Exception:
+                    log.exception("reset_sprite_state on active change failed")
+                self._last_orientation = None
+                try:
+                    self._tick_orientation(force=True)
+                except Exception:
+                    log.exception("tick_orientation on active change failed")
             return
 
         # Try to evolve the active Pokemon if its XP says it's due.
@@ -306,6 +368,15 @@ class TokenmonApp(rumps.App):
         )
         self._sync_menubar_icon()
         self._sync_overlay()
+        # Same reset as in the active-switch branch — without this, the
+        # evolved species inherits the previous form's mirror/zoom layer
+        # transform and renders flipped after the evolution animation.
+        if self._companion_mode:
+            try:
+                self._overlay.reset_sprite_state()
+            except Exception:
+                log.exception("reset_sprite_state on evolution failed")
+            self._last_orientation = None
 
         # Evolution always implies a forward step — fire notification + animation.
         base = pokemon.line_of(new_id)
@@ -317,10 +388,10 @@ class TokenmonApp(rumps.App):
             try:
                 rumps.notification(
                     title="Tokenmon",
-                    subtitle="Entwicklung!",
+                    subtitle="Evolution!",
                     message=(
                         f"{pokemon.display_name(active.nickname, old_id)} "
-                        f"entwickelt sich zu {pokemon.name_of(new_id)}!"
+                        f"is evolving into {pokemon.name_of(new_id)}!"
                     ),
                 )
             except Exception:
@@ -400,6 +471,13 @@ class TokenmonApp(rumps.App):
                     )
                 except Exception:
                     log.exception("encounter notification failed")
+                # Companion-mode flash so the user sees the spawn even when
+                # the menubar isn't where their eyes are.
+                if self._companion_mode and self._overlay.visible:
+                    try:
+                        self._overlay.flash_alert("⚡ wild!", duration_s=4.0)
+                    except Exception:
+                        log.exception("encounter flash_alert failed")
                 break  # only one pending encounter at a time
 
     def _compute_current_level(self) -> int:
@@ -432,7 +510,7 @@ class TokenmonApp(rumps.App):
                 rumps.notification(
                     title="Tokenmon",
                     subtitle="Level up!",
-                    message=f"{display} ist aufgestiegen!",
+                    message=f"{display} leveled up!",
                 )
             except Exception:
                 log.exception("level-up notification failed")
@@ -560,26 +638,26 @@ class TokenmonApp(rumps.App):
     def _build_menu(self, totals: Totals, by_model: dict[str, Totals], proxy_up: bool) -> list:
         items: list = []
         items.append(self._pokemon_menu_item())
-        items.append(rumps.MenuItem("📖 Tokendex öffnen", callback=self.open_tokendex))
-        toggle = rumps.MenuItem("Pokemon im Menubar anzeigen", callback=self.toggle_menubar_pokemon)
+        items.append(rumps.MenuItem("📖 Open Tokendex", callback=self.open_tokendex))
+        toggle = rumps.MenuItem("Show Pokémon in menubar", callback=self.toggle_menubar_pokemon)
         toggle.state = 1 if self._show_pokemon else 0
         items.append(toggle)
         overlay_toggle = rumps.MenuItem(
-            "Pokemon als Desktop-Overlay anzeigen", callback=self.toggle_overlay
+            "Show Pokémon as desktop overlay", callback=self.toggle_overlay
         )
         overlay_toggle.state = 1 if self._show_overlay else 0
         items.append(overlay_toggle)
         items.append(None)
         if not proxy_up:
-            items.append(rumps.MenuItem("⚠️  Proxy offline — Calls werden NICHT getrackt!"))
-            items.append(rumps.MenuItem("Proxy neustarten", callback=self.restart_proxy))
+            items.append(rumps.MenuItem("⚠️  Proxy offline — calls are NOT being tracked!"))
+            items.append(rumps.MenuItem("Restart proxy", callback=self.restart_proxy))
             items.append(None)
         # XP / "active" tokens count only the model's output: it's the only
         # token category comparable across providers (cached input doesn't
         # exist in OpenRouter, while it dominates Anthropic-via-Claude-Code).
         active = totals.output_tokens
         items.extend([
-            rumps.MenuItem(f"Heute: {_fmt_tokens(active)} tokens (output)"),
+            rumps.MenuItem(f"Today: {_fmt_tokens(active)} tokens (output)"),
             rumps.MenuItem(f"  Output:   {_fmt_tokens(totals.output_tokens)}"),
             rumps.MenuItem(f"  Input:    {_fmt_tokens(totals.input_tokens)}"),
             rumps.MenuItem(f"  Requests: {totals.request_count}"),
@@ -589,7 +667,7 @@ class TokenmonApp(rumps.App):
         priced_tokens = 0
         all_tokens = 0
         if by_model:
-            items.append(rumps.MenuItem("Pro Modell:"))
+            items.append(rumps.MenuItem("Per model:"))
             for model, t in by_model.items():
                 cost, has_price = cost_for(
                     model,
@@ -614,14 +692,14 @@ class TokenmonApp(rumps.App):
                     )
                 )
             items.append(None)
-            cost_line = f"Geschätzte Kosten: {_fmt_usd(total_cost)}"
+            cost_line = f"Estimated cost: {_fmt_usd(total_cost)}"
             if all_tokens > 0 and priced_tokens < all_tokens:
                 coverage = priced_tokens / all_tokens
-                cost_line += f"  ({coverage:.0%} Preisabdeckung)"
+                cost_line += f"  ({coverage:.0%} price coverage)"
             items.append(rumps.MenuItem(cost_line))
             items.append(None)
-        items.append(rumps.MenuItem("Aktualisieren", callback=self.refresh))
-        items.append(rumps.MenuItem("Beenden", callback=rumps.quit_application))
+        items.append(rumps.MenuItem("Refresh", callback=self.refresh))
+        items.append(rumps.MenuItem("Quit", callback=rumps.quit_application))
         return items
 
     @rumps.timer(REFRESH_INTERVAL_SEC)
@@ -635,6 +713,46 @@ class TokenmonApp(rumps.App):
             self._proxy_up = up
             self.refresh(None)
 
+    @rumps.timer(PROXIMITY_TICK_S)
+    def proximity_tick(self, _sender) -> None:
+        """Fade the companion overlay when the cursor approaches AND make
+        the sprite clickable when the cursor sits inside its frame, so
+        clicks on the Pokémon open the text bubble while clicks elsewhere
+        still pass through to whatever's underneath. No-op when companion
+        mode is off."""
+        if not self._companion_mode or not self._overlay.visible:
+            if self._overlay._proximity_alpha < 1.0:
+                self._overlay.set_proximity_alpha(1.0)
+            self._overlay.set_clickable(False)
+            return
+        if self._overlay._window is None:
+            return
+        try:
+            from AppKit import NSEvent
+            from tokenmon.companion.proximity import proximity_alpha
+            loc = NSEvent.mouseLocation()
+            frame = self._overlay._window.frame()
+            inside = (
+                frame.origin.x <= loc.x < frame.origin.x + frame.size.width
+                and frame.origin.y <= loc.y < frame.origin.y + frame.size.height
+            )
+            # While the text bubble is open, keep the sprite fully opaque
+            # — the user is mid-interaction; fading it would be jarring.
+            # We still gate clickability so the user can click the sprite
+            # again to close the bubble.
+            if self._overlay.bubble_open:
+                self._overlay.set_proximity_alpha(1.0)
+            else:
+                cx = float(frame.origin.x) + float(frame.size.width) / 2.0
+                cy = float(frame.origin.y) + float(frame.size.height) / 2.0
+                dx = float(loc.x) - cx
+                dy = float(loc.y) - cy
+                distance = (dx * dx + dy * dy) ** 0.5
+                self._overlay.set_proximity_alpha(proximity_alpha(distance))
+            self._overlay.set_clickable(inside)
+        except Exception:
+            log.exception("proximity tick failed")
+
     @rumps.timer(ACTIVITY_POLL_INTERVAL_SEC)
     def activity_poll(self, _sender) -> None:
         now = time.monotonic()
@@ -643,10 +761,59 @@ class TokenmonApp(rumps.App):
         self._maybe_roll_encounters()
         self._tick_affection()
         self._tick_pending_drops()
+        self._tick_mood()
+        self._tick_dock()
+        self._tick_orientation()
         if self._last_known_level != prev_level:
             # Refresh now so the menubar title picks up the new level immediately
             # (otherwise we'd wait up to 30s for the next refresh).
             self.refresh(None)
+
+    def _tick_dock(self, *, throttle_s: float = 0.0) -> None:
+        """Re-check the focused window. NSWorkspace's activate notification
+        only fires on app changes, but the user can also:
+          - switch between windows of the same app (cmd-`, click)
+          - drag a window to a new position
+          - move a window to another screen
+
+        Called from two places:
+          1. The 5-s activity_poll — long-running drift detection.
+          2. The input monitor on every key/click (very frequent) —
+             gives snappy response to cmd-` and clicks on other windows.
+
+        ``throttle_s`` enforces a minimum gap between successive checks
+        so per-keystroke calls don't spam CGWindowListCopyWindowInfo.
+        Pass 0 for the periodic tick (always run); pass e.g. 0.2 for
+        input-driven calls.
+        """
+        if not self._companion_mode or not self._overlay.visible:
+            return
+        if self._overlay.evolution_running:
+            return
+        if throttle_s > 0.0:
+            now_mono = time.monotonic()
+            if (now_mono - self._last_dock_check_mono) < throttle_s:
+                return
+            self._last_dock_check_mono = now_mono
+        else:
+            self._last_dock_check_mono = time.monotonic()
+        try:
+            self._dock_to_focused_window()
+        except Exception:
+            log.exception("dock tick failed")
+
+    def _tick_mood(self) -> None:
+        """Apply the time-of-day mood modifier (night dims the sprite) on
+        the 5-s tick. No-op when companion mode is off."""
+        if not self._companion_mode or not self._overlay.visible:
+            return
+        try:
+            from tokenmon.companion.mood import mood_modifiers
+            from zoneinfo import ZoneInfo
+            mods = mood_modifiers(datetime.now(ZoneInfo(TZ)))
+            self._overlay.set_mood_alpha(mods.alpha_multiplier)
+        except Exception:
+            log.exception("mood modifier apply failed")
 
     def _tick_pending_drops(self) -> None:
         """Diff pending_drops against the last snapshot. Newly-arrived items
@@ -719,7 +886,7 @@ class TokenmonApp(rumps.App):
         ok, msg = _restart_proxies_via_launchctl()
         rumps.notification(
             title="Tokenmon",
-            subtitle="Proxy-Restart" if ok else "Proxy-Restart fehlgeschlagen",
+            subtitle="Proxy restart" if ok else "Proxy restart failed",
             message=msg,
         )
 
@@ -732,9 +899,240 @@ class TokenmonApp(rumps.App):
     def toggle_overlay(self, _sender) -> None:
         self._show_overlay = not self._show_overlay
         config.set_("show_overlay", self._show_overlay)
-        if not self._show_overlay and self._overlay.visible:
+        # Companion mode keeps the sprite up regardless of show_overlay —
+        # the latter only gates event-driven appearances now.
+        if not self._show_overlay and self._overlay.visible and not self._companion_mode:
             self._overlay.hide()
         self.refresh(None)
+
+    def toggle_companion(self, _sender) -> None:
+        self._companion_mode = not self._companion_mode
+        config.set_("companion_mode", self._companion_mode)
+        self._overlay.set_persistent(self._companion_mode)
+        if self._companion_mode:
+            try:
+                self._overlay.update_sprite(self._pokemon_sprite)
+                self._overlay.show()
+                self._install_active_app_observer()
+                self._install_input_monitor()
+                # Seed orientation + position from whatever app is currently
+                # in front so we don't wait for the next activation event.
+                self._on_active_app_changed(self._current_bundle_id_safe())
+            except Exception:
+                log.exception("companion overlay show failed")
+        else:
+            self._uninstall_active_app_observer()
+            self._uninstall_input_monitor()
+            self._last_orientation = None
+            # Don't yank a level-up animation mid-flight; the next
+            # _end_level_up / _end_evolution will hide it now that
+            # _persistent is False.
+            if self._overlay.visible and not self._overlay.evolution_running:
+                self._overlay.hide()
+        self.refresh(None)
+
+    def _install_input_monitor(self) -> None:
+        if self._input_monitor is not None:
+            return
+        try:
+            from tokenmon.companion.input_monitor import InputActivityMonitor
+            # Each input event triggers two cheap checks:
+            #  * _tick_orientation early-exits when sprite + side are
+            #    already correct, so per-keystroke cost is a comparison.
+            #  * _tick_dock with a 200 ms throttle so cmd-` and clicks on
+            #    other windows reposition us almost immediately, but
+            #    sustained typing doesn't keep hammering the window list.
+            mon = InputActivityMonitor(on_input=self._on_input_event)
+            mon.start()
+            mon.mark_input_now()
+            self._input_monitor = mon
+        except Exception:
+            log.exception("install input monitor failed")
+
+    def _on_input_event(self) -> None:
+        """Called from the global input monitor on every key/click/scroll.
+        Bumps orientation immediately and (throttled) re-checks the dock
+        target so we follow same-app window switches with ~200 ms latency
+        instead of waiting up to 5 s for the periodic tick."""
+        try:
+            self._tick_orientation()
+        except Exception:
+            log.exception("orientation tick failed")
+        try:
+            self._tick_dock(throttle_s=0.2)
+        except Exception:
+            log.exception("dock tick failed")
+
+    def _uninstall_input_monitor(self) -> None:
+        mon = self._input_monitor
+        if mon is None:
+            return
+        try:
+            mon.stop()
+        except Exception:
+            log.exception("stop input monitor failed")
+        self._input_monitor = None
+
+    def _install_active_app_observer(self) -> None:
+        if self._active_app_observer is not None:
+            return
+        try:
+            from tokenmon.companion.active_app import ActiveAppObserver
+            obs = ActiveAppObserver.alloc().initWithCallback_(
+                self._on_active_app_changed,
+            )
+            obs.start()
+            self._active_app_observer = obs
+        except Exception:
+            log.exception("install active-app observer failed")
+
+    def _uninstall_active_app_observer(self) -> None:
+        obs = self._active_app_observer
+        if obs is None:
+            return
+        try:
+            obs.stop()
+        except Exception:
+            log.exception("stop active-app observer failed")
+        self._active_app_observer = None
+
+    def _current_bundle_id_safe(self) -> str | None:
+        try:
+            from tokenmon.companion.active_app import current_bundle_id
+            return current_bundle_id()
+        except Exception:
+            log.exception("current_bundle_id failed")
+            return None
+
+    def _on_active_app_changed(self, _bundle_id: str | None) -> None:
+        """When the foreground app changes, immediately dock to the new
+        app's bottom-left window edge (animated) and re-evaluate
+        orientation. The 5-s ``_tick_dock`` then keeps the position in
+        sync as the user drags the window around or switches between
+        windows of the same app (which doesn't fire this notification)."""
+        if not self._companion_mode:
+            return
+        try:
+            self._dock_to_focused_window(force=True)
+        except Exception:
+            log.exception("dock to focused window failed")
+        try:
+            self._tick_orientation(force=True)
+        except Exception:
+            log.exception("orientation tick after app change failed")
+
+    def _dock_to_focused_window(self, *, force: bool = False) -> None:
+        """Slide the overlay to the bottom-RIGHT of the focused window —
+        a fixed anchor that doesn't move between engaged and idle
+        states. Engagement is communicated by sprite orientation
+        (front/back) AND by horizontal mirror: from the right anchor
+        the un-mirrored back sprite would face right (away from
+        content), so we mirror it to face left toward the window.
+
+        Multi-monitor: we explicitly do NOT clamp negative x — a screen
+        left of the primary has negative x in both CG and AppKit. We DO
+        verify the target sits on a connected screen, otherwise corner-
+        fallback.
+
+        Cross-screen moves use ``animate=False`` because NSWindow's
+        animated setFrame can glitch when the target frame is on a
+        different display than the current one.
+
+        ``force=True`` re-issues the move even if the rect is unchanged.
+        """
+        try:
+            from tokenmon.companion.window_geom import (
+                focused_window_bounds, frontmost_pid, screen_containing_point,
+            )
+        except Exception:
+            log.exception("window_geom import failed")
+            return
+        pid = frontmost_pid()
+        if pid is None:
+            if self._last_dock_rect is not None or force:
+                self._overlay.move_to_corner(animate=True)
+                self._last_dock_rect = None
+            return
+        rect = focused_window_bounds(pid)
+        if rect is None:
+            if self._last_dock_rect is not None or force:
+                self._overlay.move_to_corner(animate=True)
+                self._last_dock_rect = None
+            return
+        if not force and rect == self._last_dock_rect:
+            return
+        sprite_size = self._overlay._size
+        # Bottom-right of the focused window with 4 px inset so the
+        # sprite doesn't ride the macOS window-shadow gradient.
+        target_x = rect.x + rect.width - sprite_size - 4
+        target_y = rect.y
+        # Verify the target sits on a real connected screen.
+        anchor_x = target_x + sprite_size / 2
+        anchor_y = target_y + 1
+        target_screen = screen_containing_point(anchor_x, anchor_y)
+        if target_screen is None:
+            log.warning(
+                "dock target (%s, %s) is off all screens; falling back to corner",
+                target_x, target_y,
+            )
+            self._overlay.move_to_corner(animate=True)
+            self._last_dock_rect = None
+            return
+        try:
+            current_screen = self._overlay._window.screen() if self._overlay._window else None
+        except Exception:
+            current_screen = None
+        animate = (current_screen is not None and current_screen == target_screen)
+        self._overlay.move_to(target_x, target_y, animate=animate)
+        self._last_dock_rect = rect
+
+    def _tick_orientation(self, *, force: bool = False) -> None:
+        """Choose front vs. back sprite based on how recently the user
+        provided input. Within INTERACTION_TIMEOUT_S of an input event →
+        back (Pokémon looks at the window content). Otherwise → front
+        (looks at the user). Position stays fixed at the focused window's
+        bottom-RIGHT in both states; the back sprite is horizontally
+        mirrored so it still appears to face the content area (which is
+        to the LEFT of the sprite at the right anchor).
+
+        ``force=True`` re-applies even if state hasn't changed.
+        """
+        if not self._companion_mode or not self._overlay.visible:
+            return
+        mon = self._input_monitor
+        idle_s = mon.seconds_since_last_input() if mon is not None else None
+        want = "front"
+        if idle_s is not None and idle_s <= INTERACTION_TIMEOUT_S:
+            want = "back"
+        if not force and want == self._last_orientation:
+            return
+        try:
+            front = pokemon.ensure_sprite(
+                self._pokemon_dex_id, shiny=self._pokemon_is_shiny,
+            )
+            if front is None:
+                return
+            back = None
+            if want == "back":
+                back = pokemon.ensure_sprite(
+                    self._pokemon_dex_id,
+                    shiny=self._pokemon_is_shiny, back=True,
+                )
+            # Mirror the back sprite — the unmirrored gen-V back sprite
+            # has the Pokémon's head turned to the right (3/4 view), but
+            # at the right anchor we want it facing left toward content.
+            mirrored = (want == "back")
+            # Back sprites get an extra zoom to compensate for PokeAPI
+            # rendering them smaller within the canvas. Front sprites
+            # stay at zoom=1.0.
+            zoom = COMPANION_BACK_ZOOM if want == "back" else 1.0
+            self._overlay.animate_sprite_turn(
+                front_path=front, back_path=back,
+                mirrored=mirrored, zoom=zoom,
+            )
+            self._last_orientation = want
+        except Exception:
+            log.exception("orientation swap failed")
 
     def toggle_weather(self, _sender) -> None:
         self._use_weather = not self._use_weather

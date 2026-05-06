@@ -138,7 +138,7 @@ class _RowView(NSView):
         lvl_text = "Lv MAX" if level >= pokemon.MAX_LEVEL else f"Lv {level}"
         stats = _label(
             NSMakeRect(text_x, height - 42, text_w, 16),
-            f"{lvl_text}    Total: {self._entry.xp:,} XP    Tage: {self._entry.days}",
+            f"{lvl_text}    Total: {self._entry.xp:,} XP    Days: {self._entry.days}",
             font=NSFont.systemFontOfSize_(11),
             color=NSColor.secondaryLabelColor(),
         )
@@ -221,7 +221,7 @@ def show() -> None:
     if not rows:
         content.addSubview_(_label(
             NSMakeRect(16, content_height / 2 - 10, WINDOW_WIDTH - 32, 20),
-            "Noch kein Pokemon erlebt — sammle Tokens!",
+            "No Pokémon yet — collect tokens!",
             color=NSColor.secondaryLabelColor(),
         ))
     else:

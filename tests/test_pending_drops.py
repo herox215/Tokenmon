@@ -66,9 +66,9 @@ def test_claim_noop_when_empty(db_path):
 
 
 def test_insert_usage_routes_drops_through_pending(db_path):
-    """A 5000-token request now lands in pending_drops, not inventory."""
+    """A 25_000-token request (pokéball EV=5) lands in pending_drops, not inventory."""
     storage.insert_usage(
-        storage.Usage(model="x", output_tokens=5000), path=db_path,
+        storage.Usage(model="x", output_tokens=25_000), path=db_path,
     )
     assert storage.query_item_counts(["pokeball"], path=db_path)["pokeball"] == 0
     pending = storage.query_pending_drops(path=db_path)

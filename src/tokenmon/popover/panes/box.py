@@ -243,7 +243,7 @@ class BoxController(PaneController):
         if p is None:
             view.addSubview_(_label(
                 NSMakeRect(16, POPOVER_HEIGHT // 2 - 10, CONTENT_WIDTH - 32, 20),
-                "Pokemon nicht gefunden.",
+                "Pokémon not found.",
                 color=NSColor.secondaryLabelColor(),
                 align=NSTextAlignmentCenter,
             ))
@@ -321,7 +321,7 @@ class BoxController(PaneController):
             )
             save_btn.setTitle_("✓")
             save_btn.setBordered_(False)
-            save_btn.setToolTip_("Speichern (Enter)")
+            save_btn.setToolTip_("Save (Enter)")
             save_btn.setTarget_(self._nick_handler)
             save_btn.setAction_(b"saveButton:")
             view.addSubview_(save_btn)
@@ -331,7 +331,7 @@ class BoxController(PaneController):
             )
             cancel_btn.setTitle_("✗")
             cancel_btn.setBordered_(False)
-            cancel_btn.setToolTip_("Abbrechen (Esc)")
+            cancel_btn.setToolTip_("Cancel (Esc)")
             cancel_btn.setTarget_(self._nick_handler)
             cancel_btn.setAction_(b"cancelButton:")
             view.addSubview_(cancel_btn)
@@ -346,7 +346,7 @@ class BoxController(PaneController):
             )
             edit_btn.setTitle_("✏️")
             edit_btn.setBordered_(False)
-            edit_btn.setToolTip_("Spitznamen bearbeiten")
+            edit_btn.setToolTip_("Edit nickname")
             edit_btn.setTarget_(self._nick_handler)
             edit_btn.setAction_(b"beginEdit:")
             view.addSubview_(edit_btn)

@@ -20,6 +20,7 @@ from AppKit import (
     NSImageView,
     NSMenu,
     NSMenuItem,
+    NSScrollView,
     NSTextAlignmentCenter,
     NSTextField,
     NSView,
@@ -104,8 +105,8 @@ class _ItemsPaneRowHandler(NSObject):
             try:
                 rumps.notification(
                     title="Tokenmon",
-                    subtitle="Kein aktives Pokémon",
-                    message="Setze zuerst ein Pokémon als aktiv.",
+                    subtitle="No active Pokémon",
+                    message="Set a Pokémon as active first.",
                 )
             except Exception:
                 pass
@@ -122,10 +123,10 @@ class _ItemsPaneRowHandler(NSObject):
             try:
                 rumps.notification(
                     title="Tokenmon",
-                    subtitle=f"{item_name} hatte keinen Effekt",
+                    subtitle=f"{item_name} had no effect",
                     message=(
                         f"{pokemon.display_name(active.nickname, active.species_dex_id)} "
-                        f"kann mit {item_name} nicht entwickelt werden."
+                        f"can't be evolved with {item_name}."
                     ),
                 )
             except Exception:
@@ -145,10 +146,10 @@ class _ItemsPaneRowHandler(NSObject):
         try:
             rumps.notification(
                 title="Tokenmon",
-                subtitle="Entwicklung!",
+                subtitle="Evolution!",
                 message=(
                     f"{pokemon.display_name(active.nickname, active.species_dex_id)} "
-                    f"entwickelte sich zu {pokemon.name_of(evolved)}!"
+                    f"evolved into {pokemon.name_of(evolved)}!"
                 ),
             )
         except Exception:
@@ -220,15 +221,35 @@ class ItemsController(PaneController):
         if not owned_items:
             view.addSubview_(_label(
                 NSMakeRect(16, POPOVER_HEIGHT // 2 - 10, CONTENT_WIDTH - 32, 20),
-                "Inventar leer — generiere Tokens, um Items zu erhalten.",
+                "Inventory empty — generate tokens to receive items.",
                 font=NSFont.systemFontOfSize_(12),
                 color=NSColor.secondaryLabelColor(),
                 align=NSTextAlignmentCenter,
             ))
-        y_cursor = POPOVER_HEIGHT - 50
+            return view
+
+        # Scrollable rows — Header occupies the top 44 px of the pane,
+        # everything below scrolls. Mirrors the Tokendex/Box pattern so
+        # the weather background stays visible behind the rows.
+        row_h = 56
+        row_gap = 4
+        scroll_h = POPOVER_HEIGHT - 44
+        content_h = max(len(owned_items) * (row_h + row_gap), scroll_h)
+        scroll = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, CONTENT_WIDTH, scroll_h)
+        )
+        scroll.setHasVerticalScroller_(True)
+        scroll.setAutohidesScrollers_(True)
+        scroll.setBorderType_(0)
+        scroll.setDrawsBackground_(False)
+        scroll.contentView().setDrawsBackground_(False)
+        content = NSView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, CONTENT_WIDTH, content_h)
+        )
+
+        y_cursor = content_h - 4
         for key, item in owned_items:
             count = int(counts.get(key, 0) or 0)
-            row_h = 56
 
             sprite = items_remote.get_item_image(item)
             if sprite is not None:
@@ -237,9 +258,9 @@ class ItemsController(PaneController):
                 )
                 iv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
                 iv.setImage_(sprite)
-                view.addSubview_(iv)
+                content.addSubview_(iv)
             else:
-                view.addSubview_(_label(
+                content.addSubview_(_label(
                     NSMakeRect(16, y_cursor - row_h + 14, 36, 30),
                     item.emoji,
                     font=NSFont.systemFontOfSize_(24),
@@ -253,12 +274,12 @@ class ItemsController(PaneController):
                 NSColor.tertiaryLabelColor() if count == 0
                 else NSColor.labelColor()
             )
-            view.addSubview_(_label(
+            content.addSubview_(_label(
                 NSMakeRect(text_x, y_cursor - 22, text_w - 50, 18),
                 item.display_name,
                 font=NSFont.boldSystemFontOfSize_(13),
             ))
-            view.addSubview_(_label(
+            content.addSubview_(_label(
                 NSMakeRect(CONTENT_WIDTH - 80, y_cursor - 22, 64, 18),
                 count_text,
                 font=NSFont.boldSystemFontOfSize_(13),
@@ -281,7 +302,7 @@ class ItemsController(PaneController):
                 desc_field.cell().setWraps_(True)
             except Exception:
                 pass
-            view.addSubview_(desc_field)
+            content.addSubview_(desc_field)
 
             if any(a == "use" for a in item.actions) and count > 0:
                 row_btn = NSButton.alloc().initWithFrame_(
@@ -298,10 +319,12 @@ class ItemsController(PaneController):
                 self._handlers.append(row_handler)
                 row_btn.setTarget_(row_handler)
                 row_btn.setAction_(b"rowClicked:")
-                view.addSubview_(row_btn)
+                content.addSubview_(row_btn)
 
-            y_cursor -= row_h + 4
+            y_cursor -= row_h + row_gap
 
+        scroll.setDocumentView_(content)
+        view.addSubview_(scroll)
         return view
 
     # ---- claim animation ----------------------------------------------
