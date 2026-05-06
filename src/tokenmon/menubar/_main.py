@@ -247,7 +247,6 @@ class TokenmonApp(rumps.App):
             size=int(config.get("overlay_size") or 128),
             corner=str(config.get("overlay_corner") or "bottom-right"),
         )
-        self._show_overlay = bool(config.get("show_overlay"))
         self._companion_mode = bool(config.get("companion_mode"))
         self._use_weather = bool(config.get("use_weather"))
         # Wire companion-mode persistence into the overlay so level-up /
@@ -396,7 +395,7 @@ class TokenmonApp(rumps.App):
                 )
             except Exception:
                 log.exception("evolution notification failed")
-            if self._show_overlay:
+            if self._companion_mode:
                 try:
                     self._overlay.show_evolution(old_id, new_id)
                 except Exception:
@@ -518,7 +517,7 @@ class TokenmonApp(rumps.App):
             # overlay hides itself again when the banner timer expires.
             # Suppress the level-up animation while an evolution animation is
             # already running (level-up and evolution often coincide).
-            if self._show_overlay and not self._overlay.evolution_running:
+            if self._companion_mode and not self._overlay.evolution_running:
                 try:
                     self._overlay.update_sprite(self._pokemon_sprite)
                     self._overlay.show_level_up()
@@ -642,11 +641,6 @@ class TokenmonApp(rumps.App):
         toggle = rumps.MenuItem("Show Pokémon in menubar", callback=self.toggle_menubar_pokemon)
         toggle.state = 1 if self._show_pokemon else 0
         items.append(toggle)
-        overlay_toggle = rumps.MenuItem(
-            "Show Pokémon as desktop overlay", callback=self.toggle_overlay
-        )
-        overlay_toggle.state = 1 if self._show_overlay else 0
-        items.append(overlay_toggle)
         items.append(None)
         if not proxy_up:
             items.append(rumps.MenuItem("⚠️  Proxy offline — calls are NOT being tracked!"))
@@ -788,7 +782,7 @@ class TokenmonApp(rumps.App):
         """
         if not self._companion_mode or not self._overlay.visible:
             return
-        if self._overlay.evolution_running:
+        if self._overlay.evolution_running or self._overlay.wiggling:
             return
         if throttle_s > 0.0:
             now_mono = time.monotonic()
@@ -833,12 +827,14 @@ class TokenmonApp(rumps.App):
             if delta > 0:
                 new_drops[key] = delta
         self._last_pending_snapshot = current
-        # Note: not gating on self._overlay.visible — the Pokémon overlay
-        # only pops up briefly for level-ups, but the user's mental model
-        # of "overlay aktiv" is the config flag. Floaters appear at the
-        # overlay's nominal position regardless of whether the window is
-        # currently shown.
-        if new_drops and self._show_overlay:
+        # Drops only animate while the companion is on. Wiggle the sprite
+        # first to announce the drop, then float the items up so they
+        # appear to come "out of" the wiggling Pokémon.
+        if new_drops and self._companion_mode:
+            try:
+                self._overlay.wiggle()
+            except Exception:
+                log.exception("wiggle failed")
             try:
                 self._overlay.show_floating_items(new_drops)
             except Exception:
@@ -894,15 +890,6 @@ class TokenmonApp(rumps.App):
         self._show_pokemon = not self._show_pokemon
         config.set_("show_pokemon_in_menubar", self._show_pokemon)
         self._sync_menubar_icon()
-        self.refresh(None)
-
-    def toggle_overlay(self, _sender) -> None:
-        self._show_overlay = not self._show_overlay
-        config.set_("show_overlay", self._show_overlay)
-        # Companion mode keeps the sprite up regardless of show_overlay —
-        # the latter only gates event-driven appearances now.
-        if not self._show_overlay and self._overlay.visible and not self._companion_mode:
-            self._overlay.hide()
         self.refresh(None)
 
     def toggle_companion(self, _sender) -> None:

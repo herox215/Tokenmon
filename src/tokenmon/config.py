@@ -15,14 +15,14 @@ CONFIG_PATH = DB_DIR / "config.json"
 
 _DEFAULTS: dict[str, Any] = {
     "show_pokemon_in_menubar": True,
-    "show_overlay": False,
     "overlay_corner": "bottom-right",
     "overlay_size": 128,
-    # Companion mode: when on, the desktop Pokémon is permanently visible
-    # rather than only appearing for level-up / evolution events. Lays the
-    # foundation for app-aware orientation (front vs. back sprite) in later
-    # phases. Independent of show_overlay — the latter still gates whether
-    # level-up/evo overlays surface at all.
+    # Companion mode: gates the entire desktop overlay. When on, the
+    # Pokémon is permanently visible, docked to the focused app window,
+    # and level-up / evolution / item-drop events surface attached to it.
+    # When off, none of the desktop overlay shows. Replaces the older
+    # ``show_overlay`` flag (silently ignored if present in legacy
+    # config).
     "companion_mode": False,
     # Weather-aware spawning: when on, encounter rolls bias species
     # selection toward types matching the local weather (rain → water,

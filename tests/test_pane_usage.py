@@ -13,7 +13,6 @@ class _FakeApp:
     """Minimal stand-in for the rumps menubar app — just the attributes
     the UsageController reads."""
     _show_pokemon = True
-    _show_overlay = False
     _use_weather = False
     _companion_mode = False
 

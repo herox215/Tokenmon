@@ -203,6 +203,77 @@ class _CompanionImageView(NSImageView):
             log.exception("sprite click handler failed")
 
 
+WIGGLE_FRAMES = 6         # 6 frames @ 50 ms = 300 ms total wiggle duration
+WIGGLE_INTERVAL = 0.05
+WIGGLE_AMPLITUDE_PX = 8
+
+
+class _WiggleHandler(NSObject):
+    """NSTimer-driven horizontal-shake animation for the companion sprite.
+
+    Used to announce an event (e.g. items about to drop) without actually
+    moving the sprite away from its docked position. Each frame nudges
+    the window's origin by ±amp px around the start origin with linear
+    damping so the last swing is smaller than the first.
+
+    During the wiggle the menubar's ``_tick_dock`` early-exits on the
+    overlay's ``wiggling`` property — without that, the periodic re-dock
+    would fight the per-frame setFrameOrigin calls and flatten the
+    visible motion.
+    """
+
+    def initWithOverlay_originX_originY_amplitude_frames_(  # noqa: N802
+        self, overlay, ox, oy, amplitude, frames,
+    ):
+        self = objc.super(_WiggleHandler, self).init()
+        if self is None:
+            return None
+        self._overlay = overlay
+        self._ox = float(ox)
+        self._oy = float(oy)
+        self._amp = int(amplitude)
+        self._frames = int(frames)
+        self._frame = 0
+        return self
+
+    def start(self):
+        self._scheduleNext()
+
+    def _scheduleNext(self):
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            WIGGLE_INTERVAL, self, b"fire:", None, False,
+        )
+
+    def fire_(self, _timer):  # noqa: N802
+        # If the overlay was reset / replaced, abort.
+        if getattr(self._overlay, "_wiggle_handler", None) is not self:
+            return
+        self._frame += 1
+        try:
+            if self._frame >= self._frames:
+                # Snap to the original origin and clear the wiggling flag.
+                if self._overlay._window is not None:
+                    self._overlay._window.setFrameOrigin_((self._ox, self._oy))
+                self._overlay._wiggling = False
+                self._overlay._wiggle_handler = None
+                return
+            # Alternating direction with linear damping so the last swing
+            # is smaller than the first.
+            direction = 1 if self._frame % 2 == 1 else -1
+            decay = (self._frames - self._frame) / self._frames
+            offset = direction * self._amp * decay
+            if self._overlay._window is not None:
+                self._overlay._window.setFrameOrigin_(
+                    (self._ox + offset, self._oy),
+                )
+        except Exception:
+            log.exception("wiggle frame failed")
+            self._overlay._wiggling = False
+            self._overlay._wiggle_handler = None
+            return
+        self._scheduleNext()
+
+
 TURN_FRAMES = 12          # 12 frames @ 25 ms = 300 ms total turn duration
 TURN_INTERVAL = 0.025
 TURN_HALF = 6             # midpoint where the sprite is edge-on (scale_x=0)
@@ -524,6 +595,12 @@ class PokemonOverlay:
         # ``animate_sprite_turn`` knows where to start interpolating from.
         # Sign carries mirror state, magnitude carries zoom.
         self._current_scale: tuple[float, float] = (1.0, 1.0)
+        # Wiggle (item-drop announce) state. ``_wiggling`` gates the
+        # menubar's _tick_dock so the periodic re-dock doesn't fight the
+        # per-frame setFrameOrigin nudges. Strong-ref to the handler
+        # keeps PyObjC from GC'ing the NSTimer target.
+        self._wiggling: bool = False
+        self._wiggle_handler = None
         # Companion text bubble — opened on sprite click. NSPanel +
         # NSTextField; toggles on subsequent clicks. None when not
         # currently shown. ``_bubble_dismisser`` is the global NSEvent
@@ -1100,19 +1177,31 @@ class PokemonOverlay:
         MAX_FLOATERS_PER_ITEM = 5
         MAX_FLOATERS_TOTAL = 8
         STAGGER_SEC = 0.18
+        # Lead time so the items start floating AFTER the wiggle finishes.
+        # Caller (menubar._tick_pending_drops) wiggles first, then calls
+        # this — staggering the floater starts by WIGGLE_LEAD_S means
+        # they appear to fly out of the wiggling sprite.
+        WIGGLE_LEAD_S = 0.30
 
-        # Compute the anchor from the configured corner regardless of
-        # whether the overlay window is currently shown.
-        screen = None
-        if self._window is not None:
-            screen = self._window.screen()
-        if screen is None:
-            screen = NSScreen.mainScreen()
-        if screen is None:
-            return
-        anchor_x, anchor_y = _position_for(
-            self._corner, screen.visibleFrame(), self._size, self._margin,
-        )
+        # Anchor: in companion mode use the current docked window frame
+        # so floaters spawn directly from the sprite. In default mode
+        # fall back to the configured corner so floaters appear at the
+        # overlay's nominal position even when the window isn't shown.
+        if self._persistent and self._window is not None:
+            frame = self._window.frame()
+            anchor_x = float(frame.origin.x)
+            anchor_y = float(frame.origin.y)
+        else:
+            screen = None
+            if self._window is not None:
+                screen = self._window.screen()
+            if screen is None:
+                screen = NSScreen.mainScreen()
+            if screen is None:
+                return
+            anchor_x, anchor_y = _position_for(
+                self._corner, screen.visibleFrame(), self._size, self._margin,
+            )
         base_x = anchor_x + self._size / 2 - _FloatingItemHandler.SIZE / 2
         base_y = anchor_y + self._size + 4
 
@@ -1142,8 +1231,11 @@ class PokemonOverlay:
             jitter = (i % 3 - 1) * 10
             x = base_x + jitter
             y = base_y
+            # Lead delay (so items emerge after the wiggle) only when
+            # docked — corner-mode keeps the original instant stagger.
+            lead = WIGGLE_LEAD_S if self._persistent else 0.0
             handler = _FloatingItemHandler.alloc().initWithSprite_x_y_delay_(
-                sprite, x, y, i * STAGGER_SEC,
+                sprite, x, y, lead + i * STAGGER_SEC,
             )
             self._floating_item_handlers.append(handler)
             handler.start()
@@ -1165,6 +1257,33 @@ class PokemonOverlay:
     @property
     def evolution_running(self) -> bool:
         return self._evolution_running
+
+    @property
+    def wiggling(self) -> bool:
+        return self._wiggling
+
+    def wiggle(self, *, amplitude_px: int = WIGGLE_AMPLITUDE_PX,
+               frames: int = WIGGLE_FRAMES) -> None:
+        """Brief horizontal oscillation of the sprite window.
+
+        Used to announce an event (e.g. items about to drop) without
+        moving the sprite away from its docked position. Cancels any
+        in-flight wiggle so back-to-back calls don't stack. No-op when
+        the window isn't built yet.
+        """
+        if self._window is None:
+            return
+        # Cancel a previous wiggle by overwriting the handler ref — the
+        # old handler's fire_ early-exits when it sees a stranger.
+        current = self._window.frame()
+        ox = float(current.origin.x)
+        oy = float(current.origin.y)
+        handler = _WiggleHandler.alloc().initWithOverlay_originX_originY_amplitude_frames_(
+            self, ox, oy, amplitude_px, frames,
+        )
+        self._wiggle_handler = handler
+        self._wiggling = True
+        handler.start()
 
     # --- Evolution animation ----------------------------------------------
 
@@ -1366,11 +1485,19 @@ class PokemonOverlay:
         size = self._size
         banner_h = LEVEL_UP_BANNER_HEIGHT
         win = self._window
-        screen = win.screen() or NSScreen.mainScreen()
-        if screen is None:
-            return
-        x, y = _position_for(self._corner, screen.visibleFrame(), size, self._margin)
-        # Grow upward so the sprite stays in place.
+        # In companion mode the sprite is docked to the focused window —
+        # don't teleport to the configured screen corner; grow upward at
+        # the current origin so the banner appears above the docked
+        # sprite. Default mode keeps the corner anchor.
+        if self._persistent:
+            current = win.frame()
+            x = float(current.origin.x)
+            y = float(current.origin.y)
+        else:
+            screen = win.screen() or NSScreen.mainScreen()
+            if screen is None:
+                return
+            x, y = _position_for(self._corner, screen.visibleFrame(), size, self._margin)
         win.setFrame_display_animate_(
             NSMakeRect(x, y, size, size + banner_h), True, True
         )
@@ -1418,14 +1545,26 @@ class PokemonOverlay:
         self._level_up_handler = None
         if self._window is None:
             return
-        # Shrink window back to sprite-only. In default (event-only) mode we
-        # then hide it; in companion mode the sprite stays put.
-        screen = self._window.screen() or NSScreen.mainScreen()
-        if screen is not None:
-            x, y = _position_for(self._corner, screen.visibleFrame(), self._size, self._margin)
+        # Shrink window back to sprite-only. In companion mode keep the
+        # current origin (companion docking owns the position); in
+        # default (event-only) mode return to the configured corner and
+        # hide afterwards.
+        if self._persistent:
+            current = self._window.frame()
+            x = float(current.origin.x)
+            y = float(current.origin.y)
             self._window.setFrame_display_animate_(
-                NSMakeRect(x, y, self._size, self._size), True, False
+                NSMakeRect(x, y, self._size, self._size), True, False,
             )
+        else:
+            screen = self._window.screen() or NSScreen.mainScreen()
+            if screen is not None:
+                x, y = _position_for(
+                    self._corner, screen.visibleFrame(), self._size, self._margin,
+                )
+                self._window.setFrame_display_animate_(
+                    NSMakeRect(x, y, self._size, self._size), True, False,
+                )
         content = self._window.contentView()
         content.setFrame_(NSMakeRect(0, 0, self._size, self._size))
         if self._image_view is not None:

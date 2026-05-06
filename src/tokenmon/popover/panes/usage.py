@@ -177,13 +177,13 @@ class UsageController(PaneController):
         )
 
         # Footer toolbar — toggles + buttons. All anchored bottom-up so
-        # the chart above never overlaps. Restart/Quit at y=12, four
-        # switches stacked above at y=50/72/94/116 (h=18, 22 px stride).
+        # the chart above never overlaps. Restart/Quit at y=12, three
+        # switches stacked above at y=50/72/94 (h=18, 22 px stride).
         sw_companion = NSButton.alloc().initWithFrame_(
             NSMakeRect(margin_x, 50, CONTENT_WIDTH - 32, 18)
         )
         sw_companion.setButtonType_(NSButtonTypeSwitch)
-        sw_companion.setTitle_("Pokémon as desktop companion (always visible)")
+        sw_companion.setTitle_("Show Pokémon as desktop companion")
         sw_companion.setState_(
             1 if getattr(self.popover._app, "_companion_mode", False) else 0
         )
@@ -201,18 +201,8 @@ class UsageController(PaneController):
         sw_weather.setAction_(b"toggleWeather:")
         view.addSubview_(sw_weather)
 
-        sw_overlay = NSButton.alloc().initWithFrame_(
-            NSMakeRect(margin_x, 94, CONTENT_WIDTH - 32, 18)
-        )
-        sw_overlay.setButtonType_(NSButtonTypeSwitch)
-        sw_overlay.setTitle_("Show Pokémon as desktop overlay")
-        sw_overlay.setState_(1 if self.popover._app._show_overlay else 0)
-        sw_overlay.setTarget_(self.popover)
-        sw_overlay.setAction_(b"toggleOverlay:")
-        view.addSubview_(sw_overlay)
-
         sw_pokemon = NSButton.alloc().initWithFrame_(
-            NSMakeRect(margin_x, 116, CONTENT_WIDTH - 32, 18)
+            NSMakeRect(margin_x, 94, CONTENT_WIDTH - 32, 18)
         )
         sw_pokemon.setButtonType_(NSButtonTypeSwitch)
         sw_pokemon.setTitle_("Show Pokémon in menubar")

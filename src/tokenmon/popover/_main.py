@@ -435,9 +435,6 @@ class TokenmonPopover(NSObject):
     def toggleMenubarPokemon_(self, _sender):  # noqa: N802
         self._app.toggle_menubar_pokemon(None)
 
-    def toggleOverlay_(self, _sender):  # noqa: N802
-        self._app.toggle_overlay(None)
-
     def toggleCompanion_(self, _sender):  # noqa: N802
         self._app.toggle_companion(None)
 
