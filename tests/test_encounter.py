@@ -184,3 +184,62 @@ def test_run_away(db_path):
     enc = encounter.maybe_spawn(force=True, path=db_path)
     encounter.run_away(enc.id, path=db_path)
     assert storage.get_pending_encounter(path=db_path) is None
+
+
+# ---- spawn_probability ---------------------------------------------------
+
+
+def test_spawn_probability_below_min_is_zero():
+    """Tiny replies don't even roll — the curve floor is hard."""
+    assert encounter.spawn_probability(0) == 0.0
+    assert encounter.spawn_probability(encounter.SPAWN_MIN_OUTPUT - 1) == 0.0
+
+
+def test_spawn_probability_at_min_is_positive():
+    p = encounter.spawn_probability(encounter.SPAWN_MIN_OUTPUT)
+    assert 0.0 < p < 0.05  # ~2.5% at 50 tokens with scale=2000
+
+
+def test_spawn_probability_caps_at_token_cap():
+    """Beyond SPAWN_TOKEN_CAP the curve plateaus — even huge replies
+    can't reach 100%."""
+    cap = encounter.SPAWN_TOKEN_CAP
+    p_at_cap = encounter.spawn_probability(cap)
+    p_huge = encounter.spawn_probability(cap * 100)
+    assert p_at_cap == p_huge
+    assert p_at_cap < 1.0  # never certain
+
+
+def test_spawn_probability_monotonic():
+    """More output tokens → strictly greater chance, up to the cap."""
+    samples = [50, 200, 500, 1000, 1500, 2000]
+    probs = [encounter.spawn_probability(t) for t in samples]
+    assert probs == sorted(probs)
+
+
+def test_maybe_spawn_skips_below_min_output(db_path, monkeypatch):
+    """Even with random() = 0 (forces the gate open) a tiny reply
+    still doesn't spawn because spawn_probability returns 0.0."""
+    monkeypatch.setattr(encounter._RNG, "random", lambda: 0.0)
+    monkeypatch.setattr(encounter, "_last_spawn_seconds_ago",
+                        lambda *_a, **_k: float("inf"))
+    enc = encounter.maybe_spawn(output_tokens=10, path=db_path)
+    assert enc is None
+
+
+def test_maybe_spawn_uses_token_weighted_probability(db_path, monkeypatch):
+    """Above SPAWN_MIN_OUTPUT, random() < p triggers a spawn."""
+    monkeypatch.setattr(encounter._RNG, "random", lambda: 0.0)
+    monkeypatch.setattr(encounter, "_last_spawn_seconds_ago",
+                        lambda *_a, **_k: float("inf"))
+    enc = encounter.maybe_spawn(output_tokens=2000, path=db_path)
+    assert enc is not None
+
+
+def test_maybe_spawn_respects_cooldown(db_path, monkeypatch):
+    """Within the cooldown window we never spawn, even on a 'lucky' roll."""
+    monkeypatch.setattr(encounter._RNG, "random", lambda: 0.0)
+    monkeypatch.setattr(encounter, "_last_spawn_seconds_ago",
+                        lambda *_a, **_k: 60.0)  # 1 min ago, < 5 min cooldown
+    enc = encounter.maybe_spawn(output_tokens=2000, path=db_path)
+    assert enc is None

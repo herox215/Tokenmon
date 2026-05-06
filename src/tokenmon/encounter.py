@@ -9,6 +9,7 @@ import encounter).
 from __future__ import annotations
 
 import logging
+import math
 import random
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,9 +38,15 @@ log = logging.getLogger("tokenmon.encounter")
 
 # --- Tunables --------------------------------------------------------------
 
-SPAWN_PROBABILITY = 0.03                # 3% per output-bearing call
-SPAWN_COOLDOWN_SECONDS = 30 * 60        # 30 min between spawn attempts
-SPAWN_MIN_OUTPUT = 50                   # don't spawn from tiny calls
+# Spawn probability per request scales with output_tokens via
+# ``1 - exp(-min(output_tokens, SPAWN_TOKEN_CAP) / SPAWN_TOKEN_SCALE)``.
+# The cap keeps very large responses from saturating at 100% — e.g. with
+# the values below, even a 50k-token response stays at ~63%, so big
+# requests are *more* likely to spawn but never guaranteed.
+SPAWN_TOKEN_SCALE = 2000                # curve scale: 2000 tokens → ~63%
+SPAWN_TOKEN_CAP = 2000                  # output_tokens are clamped to this
+SPAWN_COOLDOWN_SECONDS = 5 * 60         # 5 min between spawn attempts
+SPAWN_MIN_OUTPUT = 50                   # don't even roll for tiny calls
 
 CATCH_PROBABILITY_BASELINE = 0.7        # softener — 70% per ball at max catch_rate
 LEVEL_MIN, LEVEL_MAX = 1, 1  # wild Pokemon are always Lv 1; XP comes from training
@@ -77,21 +84,36 @@ def _last_spawn_seconds_ago(path: Path = DB_PATH) -> float:
     return delta.total_seconds()
 
 
-def maybe_spawn(*, force: bool = False, path: Path = DB_PATH) -> Encounter | None:
+def spawn_probability(output_tokens: int) -> float:
+    """Per-request spawn probability as a function of output_tokens.
+
+    Shaped so a small reply has a small chance and a long, substantive
+    response has a meaningful one — without ever quite reaching 100% so
+    encounters never feel mandatory. Below ``SPAWN_MIN_OUTPUT`` we don't
+    roll at all (returns 0.0)."""
+    if output_tokens < SPAWN_MIN_OUTPUT:
+        return 0.0
+    clamped = min(int(output_tokens), SPAWN_TOKEN_CAP)
+    return 1.0 - math.exp(-clamped / SPAWN_TOKEN_SCALE)
+
+
+def maybe_spawn(
+    *, force: bool = False, output_tokens: int = 0, path: Path = DB_PATH,
+) -> Encounter | None:
     """Maybe spawn a new wild Pokemon. Returns the new ``Encounter`` or None.
 
     Rules:
       - never spawn while a pending encounter exists,
       - cooldown: at least SPAWN_COOLDOWN_SECONDS since the last spawn,
-      - probability gate: ``random() < SPAWN_PROBABILITY`` (skipped when
-        ``force=True``).
+      - probability gate: ``random() < spawn_probability(output_tokens)``
+        (skipped when ``force=True``).
     """
     if get_pending_encounter(path=path) is not None:
         return None
     if not force:
         if _last_spawn_seconds_ago(path) < SPAWN_COOLDOWN_SECONDS:
             return None
-        if _RNG.random() >= SPAWN_PROBABILITY:
+        if _RNG.random() >= spawn_probability(output_tokens):
             return None
 
     species_dex_id = pokemon.random_species()

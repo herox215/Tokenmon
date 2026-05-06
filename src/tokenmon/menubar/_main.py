@@ -347,26 +347,36 @@ class TokenmonApp(rumps.App):
             log.exception("max request id query failed")
             return 0
 
-    def _query_new_request_count(self, since: int) -> int:
+    def _query_new_requests(self, since: int) -> tuple[list[int], int]:
+        """Return (output_token counts of new requests, max_id seen).
+
+        The token list drives encounter.spawn_probability — one entry per
+        new request, in id order. ``max_id`` is the high-water mark we'll
+        hand back to the next poll."""
         try:
             import sqlite3
             from tokenmon.storage import DB_PATH
             with sqlite3.connect(DB_PATH, timeout=2.0) as conn:
-                row = conn.execute(
-                    "SELECT COUNT(*), COALESCE(MAX(id), ?) FROM requests WHERE id > ?",
-                    (since, since),
-                ).fetchone()
-                return int(row[0] or 0), int(row[1] or since)
+                rows = conn.execute(
+                    "SELECT id, output_tokens FROM requests "
+                    "WHERE id > ? ORDER BY id ASC",
+                    (since,),
+                ).fetchall()
         except Exception:
-            return 0, since
+            return [], since
+        if not rows:
+            return [], since
+        tokens = [int(ot or 0) for _, ot in rows]
+        max_id = int(rows[-1][0])
+        return tokens, max_id
 
     def _maybe_roll_encounters(self) -> None:
         """For every new request that landed since the last poll, give
         encounter.maybe_spawn() a chance to spawn. The spawn logic itself
-        guards on cooldown + pending status + 3% probability, so calling it
-        once per new request honours the per-call probability semantics."""
-        n_new, max_id = self._query_new_request_count(self._last_seen_request_id)
-        if n_new <= 0:
+        guards on cooldown + pending status + a token-weighted probability,
+        so calling it once per new request honours the per-call semantics."""
+        tokens_per_req, max_id = self._query_new_requests(self._last_seen_request_id)
+        if not tokens_per_req:
             return
         self._last_seen_request_id = max_id
         try:
@@ -374,9 +384,9 @@ class TokenmonApp(rumps.App):
         except Exception:
             log.exception("encounter import failed")
             return
-        for _ in range(n_new):
+        for output_tokens in tokens_per_req:
             try:
-                spawned = encounter.maybe_spawn()
+                spawned = encounter.maybe_spawn(output_tokens=output_tokens)
             except Exception:
                 log.exception("maybe_spawn failed")
                 spawned = None
