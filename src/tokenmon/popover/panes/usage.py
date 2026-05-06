@@ -168,6 +168,17 @@ class UsageController(PaneController):
         sw_overlay.setTarget_(self.popover)
         sw_overlay.setAction_(b"toggleOverlay:")
         view.addSubview_(sw_overlay)
+        y_cursor -= 22
+
+        sw_weather = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin_x, y_cursor - 16, CONTENT_WIDTH - 32, 18)
+        )
+        sw_weather.setButtonType_(NSButtonTypeSwitch)
+        sw_weather.setTitle_("Wetterdaten für Spawns nutzen")
+        sw_weather.setState_(1 if self.popover._app._use_weather else 0)
+        sw_weather.setTarget_(self.popover)
+        sw_weather.setAction_(b"toggleWeather:")
+        view.addSubview_(sw_weather)
         y_cursor -= 26
 
         # Debug spawn-encounter button (sits just above the Restart/Quit row).

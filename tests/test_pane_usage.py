@@ -14,6 +14,7 @@ class _FakeApp:
     the UsageController reads."""
     _show_pokemon = True
     _show_overlay = False
+    _use_weather = False
 
 
 class _FakePopover:

@@ -14,7 +14,7 @@ import random
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tokenmon import box, pokemon
+from tokenmon import box, config, pokemon, weather
 from tokenmon.items import (
     BALL_CATCH_MODIFIERS,
     is_throwable,
@@ -116,7 +116,16 @@ def maybe_spawn(
         if _RNG.random() >= spawn_probability(output_tokens):
             return None
 
-    species_dex_id = pokemon.random_species()
+    type_weights: dict[str, float] | None = None
+    if config.get("use_weather"):
+        try:
+            snap = weather.get_weather()
+        except Exception:
+            log.exception("weather.get_weather failed")
+            snap = None
+        if snap is not None:
+            type_weights = weather.type_weights(snap)
+    species_dex_id = pokemon.random_species(type_weights=type_weights)
     nature = pokemon.random_nature()
     ivs = pokemon.roll_ivs()
     characteristic = pokemon.characteristic_for_ivs(ivs)

@@ -150,6 +150,9 @@ class BoxController(PaneController):
         scroll.setHasVerticalScroller_(True)
         scroll.setAutohidesScrollers_(True)
         scroll.setBorderType_(0)
+        # Transparent so the popover's weather layer shows through.
+        scroll.setDrawsBackground_(False)
+        scroll.contentView().setDrawsBackground_(False)
 
         cols = 8
         cell = 40

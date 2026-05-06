@@ -81,6 +81,9 @@ class TokendexController(PaneController):
         scroll.setHasVerticalScroller_(True)
         scroll.setAutohidesScrollers_(True)
         scroll.setBorderType_(0)
+        # Transparent so the popover's weather layer shows through.
+        scroll.setDrawsBackground_(False)
+        scroll.contentView().setDrawsBackground_(False)
 
         row_h = 44
         row_width = CONTENT_WIDTH - 16

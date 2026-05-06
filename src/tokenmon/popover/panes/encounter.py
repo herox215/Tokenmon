@@ -26,7 +26,7 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSMakeSize, NSObject
 
-from tokenmon import encounter, items, items_remote, pokemon
+from tokenmon import config, encounter, items, items_remote, pokemon, weather
 from tokenmon.overlay import _silhouette_image
 from tokenmon.popover._actions import title_for_action
 from tokenmon.popover._handlers import make_handler
@@ -198,6 +198,26 @@ class EncounterController(PaneController):
             color=NSColor.secondaryLabelColor(),
             align=NSTextAlignmentCenter,
         ))
+
+        # --- Weather flavor (only when use_weather is on and a fetch
+        # succeeded) — small subtitle below the Lv/Type stub. Failures
+        # silently drop the line; spawning still works without bias.
+        weather_y = info_y - 16
+        if config.get("use_weather"):
+            try:
+                snap = weather.get_weather()
+            except Exception:
+                log.exception("weather.get_weather failed in encounter pane")
+                snap = None
+            if snap is not None:
+                view.addSubview_(_label(
+                    NSMakeRect(0, weather_y, CONTENT_WIDTH, 14),
+                    weather.emoji_label(snap),
+                    font=NSFont.systemFontOfSize_(11),
+                    color=NSColor.secondaryLabelColor(),
+                    align=NSTextAlignmentCenter,
+                ))
+                info_y = weather_y  # downstream layout starts below the line
 
         # --- Hint (only in bag-open mode) ---
         hint_y = info_y - 22

@@ -13,6 +13,7 @@ from .data import (
     GEN1_NIGHT_ONLY,
     NATURES,
 )
+from .level import types_of
 
 _RNG = random.SystemRandom()
 
@@ -48,15 +49,28 @@ def can_spawn_now(dex_id: int, *, window: str | None = None) -> bool:
 # --- Random picks ---------------------------------------------------------
 
 
-def random_species() -> int:
-    """Uniform random pick from base forms that can spawn at the current
-    local time of day. Falls back to the unfiltered pool if curated lists
-    ever drain it (defensive)."""
+def random_species(type_weights: dict[str, float] | None = None) -> int:
+    """Random pick from base forms that can spawn at the current local
+    time of day.
+
+    With ``type_weights=None`` (the default), every species in the pool
+    is equally likely — byte-identical to the legacy uniform behavior.
+    With a mapping, each species' weight is the *max* multiplier across
+    its types (so a dual-type Pokémon benefits from whichever of its
+    types is more favored), and species with no boosted type keep the
+    default weight of 1.0.
+    """
     window = current_time_window()
     pool = [d for d in _BASE_IDS if can_spawn_now(d, window=window)]
     if not pool:
         pool = _BASE_IDS
-    return _RNG.choice(pool)
+    if not type_weights:
+        return _RNG.choice(pool)
+    weights = [
+        max((type_weights.get(t, 1.0) for t in types_of(d)), default=1.0)
+        for d in pool
+    ]
+    return _RNG.choices(pool, weights=weights, k=1)[0]
 
 
 def random_nature() -> dict:

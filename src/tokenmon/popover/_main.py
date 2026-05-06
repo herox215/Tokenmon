@@ -118,6 +118,15 @@ class TokenmonPopover(NSObject):
         )
         self._root.addSubview_(self._content_container)
 
+        # Weather background layer — sits inside the content container
+        # *before* any pane view, so panes naturally render above it in
+        # the z-stack. Started/stopped by popoverWillShow_/DidClose_.
+        self._weather_bg_view = NSView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT)
+        )
+        self._content_container.addSubview_(self._weather_bg_view)
+        self._weather_animator = None
+
         self._current_pane: int = PANE_POKEMON
         self._current_pane_view: NSView | None = None
         # Animated NSImageViews collected during build_view; popoverWillShow_/
@@ -429,6 +438,9 @@ class TokenmonPopover(NSObject):
     def toggleOverlay_(self, _sender):  # noqa: N802
         self._app.toggle_overlay(None)
 
+    def toggleWeather_(self, _sender):  # noqa: N802
+        self._app.toggle_weather(None)
+
     def restartProxy_(self, _sender):  # noqa: N802
         self._app.restart_proxy(None)
 
@@ -532,8 +544,44 @@ class TokenmonPopover(NSObject):
     def popoverWillShow_(self, _notification):  # noqa: N802
         for iv in self._animated_image_views:
             iv.setAnimates_(True)
+        self._start_weather_layer()
 
     def popoverDidClose_(self, _notification):  # noqa: N802
         self._uninstall_global_monitor()
         for iv in self._animated_image_views:
             iv.setAnimates_(False)
+        self._stop_weather_layer()
+
+    # ---- weather background ----
+
+    def _start_weather_layer(self) -> None:
+        """If use_weather is on and the current weather has a particle
+        spec, build & start the animator inside the background view.
+        Failures fall through silently — the popover still works."""
+        try:
+            from tokenmon import config, weather
+            if not config.get("use_weather"):
+                return
+            snap = weather.get_weather()
+            if snap is None:
+                return
+            spec = weather.particles_for(snap)
+            if spec is None:
+                return
+            from tokenmon.popover.weather_layer import WeatherParticleAnimator
+            anim = WeatherParticleAnimator.alloc().initWithHost_spec_snapshot_(
+                self._weather_bg_view, spec, snap,
+            )
+            anim.start()
+            self._weather_animator = anim
+        except Exception:
+            log.exception("weather layer start failed")
+
+    def _stop_weather_layer(self) -> None:
+        if self._weather_animator is None:
+            return
+        try:
+            self._weather_animator.stop()
+        except Exception:
+            log.exception("weather layer stop failed")
+        self._weather_animator = None

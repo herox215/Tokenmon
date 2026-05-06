@@ -232,6 +232,7 @@ class TokenmonApp(rumps.App):
             corner=str(config.get("overlay_corner") or "bottom-right"),
         )
         self._show_overlay = bool(config.get("show_overlay"))
+        self._use_weather = bool(config.get("use_weather"))
         # Level-up detection state. The overlay never appears outside of
         # level-up events, so we only need a "last seen level" to detect changes.
         self._last_known_level: int = self._compute_current_level()
@@ -733,6 +734,11 @@ class TokenmonApp(rumps.App):
         config.set_("show_overlay", self._show_overlay)
         if not self._show_overlay and self._overlay.visible:
             self._overlay.hide()
+        self.refresh(None)
+
+    def toggle_weather(self, _sender) -> None:
+        self._use_weather = not self._use_weather
+        config.set_("use_weather", self._use_weather)
         self.refresh(None)
 
     def open_tokendex(self, _sender) -> None:

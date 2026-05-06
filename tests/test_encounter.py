@@ -243,3 +243,75 @@ def test_maybe_spawn_respects_cooldown(db_path, monkeypatch):
                         lambda *_a, **_k: 60.0)  # 1 min ago, < 5 min cooldown
     enc = encounter.maybe_spawn(output_tokens=2000, path=db_path)
     assert enc is None
+
+
+# ---- weather-aware spawning ---------------------------------------------
+
+
+def test_maybe_spawn_uses_weather_when_enabled(db_path, monkeypatch):
+    """With use_weather on and a stub snapshot, maybe_spawn must pass the
+    derived type weights through to random_species."""
+    from datetime import datetime, timezone
+
+    from tokenmon import config, weather
+    from tokenmon.weather import WeatherSnapshot
+
+    monkeypatch.setattr(config, "get",
+                        lambda k: True if k == "use_weather" else None)
+    fake_snap = WeatherSnapshot(
+        wmo=61, temp_c=10.0, city="Test",
+        fetched_at=datetime.now(timezone.utc),
+    )
+    monkeypatch.setattr(weather, "get_weather", lambda: fake_snap)
+
+    captured: dict = {}
+
+    def fake_random_species(type_weights=None):
+        captured["weights"] = type_weights
+        return 7  # Squirtle, water — arbitrary valid pick
+
+    monkeypatch.setattr(encounter.pokemon, "random_species", fake_random_species)
+    encounter.maybe_spawn(force=True, path=db_path)
+    assert captured["weights"] is not None
+    assert "water" in captured["weights"]
+
+
+def test_maybe_spawn_skips_weather_when_disabled(db_path, monkeypatch):
+    """use_weather off → random_species is called with type_weights=None
+    and weather.get_weather isn't even invoked."""
+    from tokenmon import config, weather
+
+    monkeypatch.setattr(config, "get", lambda _k: None)  # all flags falsy
+
+    def boom():
+        raise AssertionError("weather.get_weather should not be called")
+    monkeypatch.setattr(weather, "get_weather", boom)
+
+    captured: dict = {}
+
+    def fake_random_species(type_weights=None):
+        captured["weights"] = type_weights
+        return 7
+
+    monkeypatch.setattr(encounter.pokemon, "random_species", fake_random_species)
+    encounter.maybe_spawn(force=True, path=db_path)
+    assert captured["weights"] is None
+
+
+def test_maybe_spawn_falls_back_when_weather_unavailable(db_path, monkeypatch):
+    """use_weather on but get_weather returns None → no bias, no crash."""
+    from tokenmon import config, weather
+
+    monkeypatch.setattr(config, "get",
+                        lambda k: True if k == "use_weather" else None)
+    monkeypatch.setattr(weather, "get_weather", lambda: None)
+
+    captured: dict = {}
+
+    def fake_random_species(type_weights=None):
+        captured["weights"] = type_weights
+        return 7
+
+    monkeypatch.setattr(encounter.pokemon, "random_species", fake_random_species)
+    encounter.maybe_spawn(force=True, path=db_path)
+    assert captured["weights"] is None
