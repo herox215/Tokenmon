@@ -479,6 +479,38 @@ class TokenmonApp(rumps.App):
                         log.exception("encounter flash_alert failed")
                 break  # only one pending encounter at a time
 
+        # Trainer-spawn rolls run in parallel to wild encounters but
+        # with their own gating (own cooldown, lower probability,
+        # additional guard against spawning while a wild is pending).
+        try:
+            from tokenmon import trainer
+        except Exception:
+            log.exception("trainer import failed")
+            return
+        for output_tokens in tokens_per_req:
+            try:
+                t = trainer.maybe_spawn(output_tokens=output_tokens)
+            except Exception:
+                log.exception("trainer.maybe_spawn failed")
+                t = None
+            if t is not None:
+                try:
+                    rumps.notification(
+                        title="Tokenmon",
+                        subtitle=f"{t.title} {t.name} wants to battle!",
+                        message=f"Difficulty: {t.difficulty.title()}",
+                    )
+                except Exception:
+                    log.exception("trainer notification failed")
+                if self._companion_mode and self._overlay.visible:
+                    try:
+                        self._overlay.flash_alert(
+                            "⚔️ trainer!", duration_s=4.0,
+                        )
+                    except Exception:
+                        log.exception("trainer flash_alert failed")
+                break
+
     def _compute_current_level(self) -> int:
         try:
             active = box.get_active_pokemon()
@@ -496,6 +528,7 @@ class TokenmonApp(rumps.App):
         """Detect a level increase since the last poll and fire visuals/notification."""
         new_level = self._compute_current_level()
         if new_level > self._last_known_level:
+            old_level = self._last_known_level
             self._last_known_level = new_level
             try:
                 active = box.get_active_pokemon()
@@ -523,6 +556,22 @@ class TokenmonApp(rumps.App):
                     self._overlay.show_level_up()
                 except Exception:
                     log.exception("overlay level-up animation failed")
+            # Move-learn queue: for every level the Pokémon just gained,
+            # check the species learnset and queue moves they'd learn.
+            # The active Pokémon's pane shows an inline "Learn / Skip"
+            # banner the next time the user opens it.
+            if active is not None:
+                try:
+                    from tokenmon import learnsets_remote
+                    from tokenmon.storage import queue_move_learn
+                    for lv in range(old_level + 1, new_level + 1):
+                        moves = learnsets_remote.moves_at_level(
+                            active.species_dex_id, lv,
+                        )
+                        for move_key in moves:
+                            queue_move_learn(active.id, move_key, lv)
+                except Exception:
+                    log.exception("move-learn queueing failed")
         elif new_level < self._last_known_level:
             # Defensive: data shrunk (manual DB edit?). Track silently.
             self._last_known_level = new_level
