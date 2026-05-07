@@ -53,6 +53,10 @@ from tokenmon.storage import (
 REFRESH_INTERVAL_SEC = 30
 HEALTH_INTERVAL_SEC = 10
 ACTIVITY_POLL_INTERVAL_SEC = 5
+# HP regen rate: one HP point per this many output-tokens trained on
+# the active Pokémon. Out-of-battle only — battle damage drives HP
+# during a fight, regen freezes for the duration.
+HP_REGEN_TOKENS_PER_HP = 1000
 # Companion: how long an input event keeps the Pokémon facing the screen
 # before it turns around to look at the user. Polled at the
 # ACTIVITY_POLL_INTERVAL_SEC tick, so transitions can lag up to that
@@ -285,6 +289,14 @@ class TokenmonApp(rumps.App):
         # stays active. Resets when the active changes or becomes None.
         self._affection_ticks: int = 0
         self._affection_active_id: int | None = None
+        # HP-regen bookkeeping — every HP_REGEN_TOKENS_PER_HP output-
+        # tokens trained on the active Pokémon restore one HP point
+        # (clamped to max). Tracks the active Pokémon's last-seen total
+        # XP plus a fractional remainder so partial chunks accumulate
+        # across ticks instead of being floored away each time.
+        self._hp_regen_active_id: int | None = None
+        self._hp_regen_last_xp: int = 0
+        self._hp_regen_remainder: int = 0
         # Floating-item-drop detection: snapshot pending_drops at startup so
         # any items already pending aren't re-played as "new drops" the
         # first time the poll fires. Subsequent polls diff against this.
@@ -880,6 +892,7 @@ class TokenmonApp(rumps.App):
         self._maybe_roll_encounters()
         self._tick_affection()
         self._tick_pending_drops()
+        self._tick_hp_regen()
         self._tick_mood()
         self._tick_dock()
         self._tick_orientation()
@@ -887,6 +900,83 @@ class TokenmonApp(rumps.App):
             # Refresh now so the menubar title picks up the new level immediately
             # (otherwise we'd wait up to 30s for the next refresh).
             self.refresh(None)
+
+    def _tick_hp_regen(self) -> None:
+        """Restore the active Pokémon's HP at one point per
+        ``HP_REGEN_TOKENS_PER_HP`` output-tokens trained on it,
+        clamped to its current max HP. Skips while a battle is in
+        progress so combat damage drives HP during a fight rather
+        than fighting the regen counter.
+
+        ``_hp_regen_remainder`` accumulates partial chunks across
+        ticks so a slow stream of small requests still adds up over
+        time — e.g. 600 + 600 = 1200 yields 1 HP plus a 200 carry.
+        """
+        # Battle in progress → freeze regen.
+        if getattr(self._popover, "_battle_session", None) is not None:
+            return
+        try:
+            active = box.get_active_pokemon()
+        except Exception:
+            log.exception("active lookup in hp_regen tick failed")
+            return
+        if active is None:
+            self._hp_regen_active_id = None
+            return
+        # Active Pokémon changed → reset baseline; no retroactive heal.
+        if self._hp_regen_active_id != active.id:
+            self._hp_regen_active_id = active.id
+            try:
+                self._hp_regen_last_xp = query_xp_for_pokemon(active.id)
+            except Exception:
+                log.exception("xp baseline read failed")
+                self._hp_regen_last_xp = 0
+            self._hp_regen_remainder = 0
+            return
+        # Already at full → nothing to do (and don't spam carry-over).
+        if active.hp_current is None:
+            return
+        # Pull current XP and compute the delta since the last tick.
+        try:
+            current_xp = query_xp_for_pokemon(active.id)
+        except Exception:
+            log.exception("xp lookup in hp_regen tick failed")
+            return
+        delta = current_xp - self._hp_regen_last_xp
+        self._hp_regen_last_xp = current_xp
+        if delta <= 0:
+            return
+        pool = self._hp_regen_remainder + int(delta)
+        hp_to_add = pool // HP_REGEN_TOKENS_PER_HP
+        self._hp_regen_remainder = pool % HP_REGEN_TOKENS_PER_HP
+        if hp_to_add <= 0:
+            return
+        # Compute current max HP from the active's IVs + level so the
+        # regen respects post-level-up cap increases.
+        try:
+            from tokenmon.pokemon.stats import final_stats
+            from tokenmon.storage import set_pokemon_hp
+            growth = pokemon.growth_rate_of(active.species_dex_id)
+            level, _, _ = pokemon.level_from_xp(current_xp, growth)
+            hp_max = final_stats(
+                active.species_dex_id, active.ivs, max(1, level), active.nature,
+            )[0]
+        except Exception:
+            log.exception("hp_max compute in regen tick failed")
+            return
+        new_hp = min(hp_max, int(active.hp_current) + hp_to_add)
+        try:
+            if new_hp >= hp_max:
+                # Fully healed → store NULL for the implicit-full
+                # semantics so the regen tick stops firing for this
+                # Pokémon until it takes damage again.
+                set_pokemon_hp(active.id, None)
+                # Reset remainder so the next damage cycle starts fresh.
+                self._hp_regen_remainder = 0
+            else:
+                set_pokemon_hp(active.id, new_hp)
+        except Exception:
+            log.exception("hp_regen persist failed")
 
     def _tick_dock(self, *, throttle_s: float = 0.0) -> None:
         """Re-check the focused window. NSWorkspace's activate notification
