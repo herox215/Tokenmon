@@ -42,7 +42,6 @@ from tokenmon.popover.widgets import (
 )
 from tokenmon.storage import query_xp_for_pokemon
 from tokenmon.tokendex import _XPBarView
-from tokenmon.ui_helpers import fmt_affection as _fmt_affection
 
 log = logging.getLogger("tokenmon.popover.panes.pokemon")
 
@@ -368,7 +367,7 @@ class PokemonController(PaneController):
         # Move-learn inline dialog: when this Pokémon has queued moves
         # to learn from a recent level-up, surface the prompt here so
         # the user can act on it without leaving the pane.
-        affection_y = xp_y - 22
+        cursor_y = xp_y - 22
         try:
             from tokenmon.popover.panes._move_learn_inline import (
                 build_move_learn_inline,
@@ -380,7 +379,7 @@ class PokemonController(PaneController):
         except Exception:
             log.exception("move-learn inline build failed")
             consumed_h = 0
-        affection_y -= consumed_h
+        cursor_y -= consumed_h
 
         # Move grid: shows the four learned moves with hover tooltips
         # for power/accuracy/PP. Backfills missing moves from the
@@ -390,22 +389,14 @@ class PokemonController(PaneController):
             self._backfill_initial_moves(row.id, row.species_dex_id, level)
             from tokenmon.popover.panes._move_grid import build_move_grid
             grid_h = build_move_grid(
-                view, pokemon_id=row.id, top_y=affection_y - 4,
+                view, pokemon_id=row.id, top_y=cursor_y - 4,
             )
         except Exception:
             log.exception("move grid build failed")
             grid_h = 0
-        affection_y -= grid_h
+        cursor_y -= grid_h
 
-        view.addSubview_(_label(
-            NSMakeRect(0, affection_y, CONTENT_WIDTH, 16),
-            f"Affection   {_fmt_affection(row.affection)}",
-            font=NSFont.systemFontOfSize_(12),
-            color=NSColor.labelColor(),
-            align=NSTextAlignmentCenter,
-        ))
-
-        nature_y = affection_y - 22
+        nature_y = cursor_y - 22
         view.addSubview_(_label(
             NSMakeRect(0, nature_y, CONTENT_WIDTH, 16),
             f"{row.nature} nature",
