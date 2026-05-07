@@ -99,6 +99,12 @@ ALL_NAMES: dict[int, str] = {
 
 _TRADE_LEVEL = 30  # placeholder for the four Gen-1 trade evolutions
 
+# Targets of the four Gen-1 trade evolutions. Used together with
+# _TRADE_LEVEL to disambiguate "evolves at level 30" vs. "evolves via trade"
+# in user-facing strings (the data tables themselves still encode these
+# as level-30 entries because there's no trade mechanic in the app yet).
+TRADE_EVOLUTION_TARGETS: frozenset[int] = frozenset({65, 68, 76, 94})
+
 EVOLUTIONS: dict[int, list[tuple[int, int]]] = {
     1:   [(16, 2), (32, 3)],
     4:   [(16, 5), (36, 6)],
