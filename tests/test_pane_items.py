@@ -90,3 +90,51 @@ def test_claim_step_unknown_action_is_no_op(db_path):
     # Should not raise, even with no views.
     ctrl.claim_step("totally_unknown")
     assert pop._claim_active is True  # unchanged
+
+
+def _find_label_with_substring(view, needle: str) -> bool:
+    """Recursively search ``view``'s subview tree for an NSTextField whose
+    stringValue() contains ``needle``."""
+    from AppKit import NSTextField
+    for sv in view.subviews():
+        if isinstance(sv, NSTextField):
+            try:
+                if needle in str(sv.stringValue()):
+                    return True
+            except Exception:
+                pass
+        if _find_label_with_substring(sv, needle):
+            return True
+    return False
+
+
+def test_items_pane_shows_money_with_thousands_separator(db_path, monkeypatch):
+    from tokenmon.popover.panes import items as items_pane
+    monkeypatch.setattr(items_pane, "get_money", lambda: 1234)
+    pop = _FakePopover(claim_active=False)
+    ctrl = items_pane.ItemsController(pop)
+    view = ctrl.build_view()
+    assert _find_label_with_substring(view, "$ 1,234")
+
+
+def test_items_pane_shows_money_zero(db_path, monkeypatch):
+    from tokenmon.popover.panes import items as items_pane
+    monkeypatch.setattr(items_pane, "get_money", lambda: 0)
+    pop = _FakePopover(claim_active=False)
+    ctrl = items_pane.ItemsController(pop)
+    view = ctrl.build_view()
+    assert _find_label_with_substring(view, "$ 0")
+
+
+def test_items_pane_money_falls_back_to_zero_on_error(db_path, monkeypatch):
+    from tokenmon.popover.panes import items as items_pane
+
+    def _boom():
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(items_pane, "get_money", _boom)
+    pop = _FakePopover(claim_active=False)
+    ctrl = items_pane.ItemsController(pop)
+    # Must not propagate; fallback renders "$ 0".
+    view = ctrl.build_view()
+    assert _find_label_with_substring(view, "$ 0")

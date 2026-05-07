@@ -40,6 +40,7 @@ from tokenmon.popover.widgets import (
 )
 from tokenmon.storage import (
     claim_pending_drops,
+    get_money,
     query_item_counts,
     query_pending_drops,
 )
@@ -218,9 +219,26 @@ class ItemsController(PaneController):
         )
 
         view.addSubview_(_label(
-            NSMakeRect(16, POPOVER_HEIGHT - 32, CONTENT_WIDTH - 32, 22),
+            NSMakeRect(16, POPOVER_HEIGHT - 32, 180, 22),
             "Items",
             font=NSFont.boldSystemFontOfSize_(15),
+        ))
+
+        # Player money — small, right-aligned, sits in the header gap
+        # between the "Items" title and the 🎁 button (x=310..406).
+        # Placed at x=196, w=110 so its right edge stops at 306, leaving
+        # a 4 px gap before the gift button.
+        try:
+            money_amount = int(get_money())
+        except Exception:
+            log.exception("get_money failed")
+            money_amount = 0
+        view.addSubview_(_label(
+            NSMakeRect(196, POPOVER_HEIGHT - 32, 110, 18),
+            f"$ {money_amount:,}",
+            font=NSFont.systemFontOfSize_(13),
+            color=NSColor.secondaryLabelColor(),
+            align=2,  # NSTextAlignmentRight
         ))
 
         # "Found N items" gift button — top-right.
