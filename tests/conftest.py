@@ -32,8 +32,28 @@ def _isolate_db(tmp_path, monkeypatch):
     # it (post-Wave-B). The try/except keeps this robust against the
     # in-flight package split.
     import tokenmon.storage as storage
+    from tokenmon.storage import _db as storage_db
     monkeypatch.setattr(storage, "DB_DIR", db_dir, raising=False)
     monkeypatch.setattr(storage, "DB_PATH", db_path, raising=False)
+    monkeypatch.setattr(storage_db, "DB_DIR", db_dir, raising=False)
+    monkeypatch.setattr(storage_db, "DB_PATH", db_path, raising=False)
+    # Submodules import DB_PATH via ``from ._db import DB_PATH`` and
+    # bind it at module-load time. Patching ``_db.DB_PATH`` alone
+    # doesn't propagate to those bindings, so we patch each submodule
+    # explicitly. ``raising=False`` makes this resilient to future
+    # renames / additions.
+    for sub in (
+        "encounter", "pokedex", "pokemon", "usage",
+        "player", "moves", "pending_moves", "trainers",
+    ):
+        try:
+            mod = __import__(
+                f"tokenmon.storage.{sub}", fromlist=["*"],
+            )
+            monkeypatch.setattr(mod, "DB_PATH", db_path, raising=False)
+            monkeypatch.setattr(mod, "DB_DIR", db_dir, raising=False)
+        except ImportError:
+            continue
     yield db_path
 
 

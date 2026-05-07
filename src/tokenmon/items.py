@@ -128,6 +128,22 @@ ITEMS: dict[str, Item] = {
         sprite_name="moon-stone",
         tok_chance=1 / 250_000,
     ),
+    # Healing items — used on the active Pokémon to restore HP.
+    "potion": Item(
+        key="potion",
+        emoji="🧪",
+        display_name="Potion",
+        description="Restores 20 HP to the active Pokémon.",
+        threshold=2_000,
+        actions=("use",),
+        sprite_name="potion",
+        tok_chance=1 / 5_000,
+    ),
+}
+
+# HP restored per use, keyed by item slug.
+POTION_HEAL_AMOUNTS: dict[str, int] = {
+    "potion": 20,
 }
 
 # Catch-rate modifier per ball when used in 'throw' action. Items not in this

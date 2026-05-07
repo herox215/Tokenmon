@@ -53,6 +53,10 @@ from tokenmon.storage import (
 REFRESH_INTERVAL_SEC = 30
 HEALTH_INTERVAL_SEC = 10
 ACTIVITY_POLL_INTERVAL_SEC = 5
+# HP regen rate: one HP point per this many output-tokens trained on
+# the active Pokémon. Out-of-battle only — battle damage drives HP
+# during a fight, regen freezes for the duration.
+HP_REGEN_TOKENS_PER_HP = 1000
 # Companion: how long an input event keeps the Pokémon facing the screen
 # before it turns around to look at the user. Polled at the
 # ACTIVITY_POLL_INTERVAL_SEC tick, so transitions can lag up to that
@@ -272,7 +276,10 @@ class TokenmonApp(rumps.App):
         self._last_dock_check_mono: float = 0.0
         if self._companion_mode:
             try:
-                self._overlay.update_sprite(self._pokemon_sprite)
+                self._overlay.update_sprite(
+                    self._pokemon_sprite,
+                    speed=self._companion_sprite_speed(),
+                )
                 self._overlay.show()
                 self._install_active_app_observer()
                 self._install_input_monitor()
@@ -285,6 +292,14 @@ class TokenmonApp(rumps.App):
         # stays active. Resets when the active changes or becomes None.
         self._affection_ticks: int = 0
         self._affection_active_id: int | None = None
+        # HP-regen bookkeeping — every HP_REGEN_TOKENS_PER_HP output-
+        # tokens trained on the active Pokémon restore one HP point
+        # (clamped to max). Tracks the active Pokémon's last-seen total
+        # XP plus a fractional remainder so partial chunks accumulate
+        # across ticks instead of being floored away each time.
+        self._hp_regen_active_id: int | None = None
+        self._hp_regen_last_xp: int = 0
+        self._hp_regen_remainder: int = 0
         # Floating-item-drop detection: snapshot pending_drops at startup so
         # any items already pending aren't re-played as "new drops" the
         # first time the poll fires. Subsequent polls diff against this.
@@ -405,7 +420,10 @@ class TokenmonApp(rumps.App):
         """Refresh the overlay's sprite (when the displayed Pokemon changes).
         Does NOT decide visibility — the overlay only appears on level-up events."""
         if self._overlay.visible:
-            self._overlay.update_sprite(self._pokemon_sprite)
+            self._overlay.update_sprite(
+                self._pokemon_sprite,
+                speed=self._companion_sprite_speed(),
+            )
 
     def _query_max_request_id(self) -> int:
         try:
@@ -479,6 +497,38 @@ class TokenmonApp(rumps.App):
                         log.exception("encounter flash_alert failed")
                 break  # only one pending encounter at a time
 
+        # Trainer-spawn rolls run in parallel to wild encounters but
+        # with their own gating (own cooldown, lower probability,
+        # additional guard against spawning while a wild is pending).
+        try:
+            from tokenmon import trainer
+        except Exception:
+            log.exception("trainer import failed")
+            return
+        for output_tokens in tokens_per_req:
+            try:
+                t = trainer.maybe_spawn(output_tokens=output_tokens)
+            except Exception:
+                log.exception("trainer.maybe_spawn failed")
+                t = None
+            if t is not None:
+                try:
+                    rumps.notification(
+                        title="Tokenmon",
+                        subtitle=f"{t.title} {t.name} wants to battle!",
+                        message=f"Difficulty: {t.difficulty.title()}",
+                    )
+                except Exception:
+                    log.exception("trainer notification failed")
+                if self._companion_mode and self._overlay.visible:
+                    try:
+                        self._overlay.flash_alert(
+                            "⚔️ trainer!", duration_s=4.0,
+                        )
+                    except Exception:
+                        log.exception("trainer flash_alert failed")
+                break
+
     def _compute_current_level(self) -> int:
         try:
             active = box.get_active_pokemon()
@@ -496,6 +546,7 @@ class TokenmonApp(rumps.App):
         """Detect a level increase since the last poll and fire visuals/notification."""
         new_level = self._compute_current_level()
         if new_level > self._last_known_level:
+            old_level = self._last_known_level
             self._last_known_level = new_level
             try:
                 active = box.get_active_pokemon()
@@ -519,13 +570,122 @@ class TokenmonApp(rumps.App):
             # already running (level-up and evolution often coincide).
             if self._companion_mode and not self._overlay.evolution_running:
                 try:
-                    self._overlay.update_sprite(self._pokemon_sprite)
+                    self._overlay.update_sprite(
+                        self._pokemon_sprite,
+                        speed=self._companion_sprite_speed(),
+                    )
                     self._overlay.show_level_up()
                 except Exception:
                     log.exception("overlay level-up animation failed")
+            # Move-learn handling: for every level the Pokémon just
+            # gained, walk the species learnset and either auto-learn
+            # the move (free slot available, no duplicate) or queue
+            # it for the modal forget-which-move pane (4 slots full).
+            if active is not None:
+                try:
+                    self._apply_level_up_moves(active, old_level, new_level)
+                except Exception:
+                    log.exception("level-up move application failed")
         elif new_level < self._last_known_level:
             # Defensive: data shrunk (manual DB edit?). Track silently.
             self._last_known_level = new_level
+
+    def _apply_level_up_moves(self, active, old_level: int, new_level: int) -> None:
+        """For each level gained, learn the species' level-up moves.
+
+        Auto-learn rules:
+          1. If the move is already known → skip (no duplicate).
+          2. If <4 slots filled → write to the lowest free slot at full
+             PP and fire a "X learned Foo!" notification.
+          3. Otherwise → queue via ``queue_move_learn`` so the modal
+             pane can present the forget-which-move flow next time the
+             popover opens.
+
+        First-time level-ups for a Pokémon with no ``pokemon_moves``
+        rows trigger a backfill from ``initial_moves`` so the lower-
+        level moves don't get lost.
+        """
+        from tokenmon import learnsets_remote, moves_remote
+        from tokenmon.storage import (
+            get_pokemon_moves,
+            queue_move_learn,
+            set_pokemon_move,
+        )
+
+        # Backfill: a Pokémon caught before this feature has an empty
+        # pokemon_moves table; the level-up walk below would only ever
+        # add the new-level moves and miss earlier ones.
+        existing = get_pokemon_moves(active.id)
+        if not existing:
+            try:
+                seed_keys = learnsets_remote.initial_moves(
+                    active.species_dex_id, max(1, old_level),
+                )
+                for slot, key in enumerate(seed_keys[:4]):
+                    md = moves_remote.get_move_data(key)
+                    max_pp = md.pp if md is not None else 35
+                    set_pokemon_move(active.id, slot, key, max_pp=max_pp)
+            except Exception:
+                log.exception("level-up backfill failed")
+
+        existing_keys = {
+            m.move_key for m in get_pokemon_moves(active.id)
+        }
+        display = pokemon.display_name(
+            active.nickname, active.species_dex_id,
+        )
+
+        for lv in range(old_level + 1, new_level + 1):
+            try:
+                lv_moves = learnsets_remote.moves_at_level(
+                    active.species_dex_id, lv,
+                )
+            except Exception:
+                log.exception("moves_at_level lookup failed for L%d", lv)
+                continue
+            for move_key in lv_moves:
+                if move_key in existing_keys:
+                    continue
+                current = get_pokemon_moves(active.id)
+                if len(current) < 4:
+                    occupied = {m.slot for m in current}
+                    free = next(
+                        s for s in range(4) if s not in occupied
+                    )
+                    md = moves_remote.get_move_data(move_key)
+                    max_pp = md.pp if md is not None else 35
+                    try:
+                        set_pokemon_move(
+                            active.id, free, move_key, max_pp=max_pp,
+                        )
+                    except Exception:
+                        log.exception(
+                            "auto-learn set_pokemon_move failed for %s",
+                            move_key,
+                        )
+                        continue
+                    existing_keys.add(move_key)
+                    move_display = (
+                        md.name if md is not None
+                        else move_key.replace("-", " ").title()
+                    )
+                    try:
+                        rumps.notification(
+                            title="Tokenmon",
+                            subtitle="New move!",
+                            message=f"{display} learned {move_display}!",
+                        )
+                    except Exception:
+                        log.exception("auto-learn notification failed")
+                else:
+                    try:
+                        queue_move_learn(active.id, move_key, lv)
+                    except Exception:
+                        log.exception(
+                            "queue_move_learn failed for %s", move_key,
+                        )
+                        continue
+                    existing_keys.add(move_key)
 
     def _statusbar_button(self):
         try:
@@ -709,15 +869,13 @@ class TokenmonApp(rumps.App):
 
     @rumps.timer(PROXIMITY_TICK_S)
     def proximity_tick(self, _sender) -> None:
-        """Fade the companion overlay when the cursor approaches AND make
-        the sprite clickable when the cursor sits inside its frame, so
-        clicks on the Pokémon open the text bubble while clicks elsewhere
-        still pass through to whatever's underneath. No-op when companion
-        mode is off."""
+        """Fade the companion overlay when the cursor approaches so it
+        doesn't sit in front of whatever the user is trying to click.
+        The window stays click-through permanently — companion is
+        purely visual."""
         if not self._companion_mode or not self._overlay.visible:
             if self._overlay._proximity_alpha < 1.0:
                 self._overlay.set_proximity_alpha(1.0)
-            self._overlay.set_clickable(False)
             return
         if self._overlay._window is None:
             return
@@ -726,24 +884,12 @@ class TokenmonApp(rumps.App):
             from tokenmon.companion.proximity import proximity_alpha
             loc = NSEvent.mouseLocation()
             frame = self._overlay._window.frame()
-            inside = (
-                frame.origin.x <= loc.x < frame.origin.x + frame.size.width
-                and frame.origin.y <= loc.y < frame.origin.y + frame.size.height
-            )
-            # While the text bubble is open, keep the sprite fully opaque
-            # — the user is mid-interaction; fading it would be jarring.
-            # We still gate clickability so the user can click the sprite
-            # again to close the bubble.
-            if self._overlay.bubble_open:
-                self._overlay.set_proximity_alpha(1.0)
-            else:
-                cx = float(frame.origin.x) + float(frame.size.width) / 2.0
-                cy = float(frame.origin.y) + float(frame.size.height) / 2.0
-                dx = float(loc.x) - cx
-                dy = float(loc.y) - cy
-                distance = (dx * dx + dy * dy) ** 0.5
-                self._overlay.set_proximity_alpha(proximity_alpha(distance))
-            self._overlay.set_clickable(inside)
+            cx = float(frame.origin.x) + float(frame.size.width) / 2.0
+            cy = float(frame.origin.y) + float(frame.size.height) / 2.0
+            dx = float(loc.x) - cx
+            dy = float(loc.y) - cy
+            distance = (dx * dx + dy * dy) ** 0.5
+            self._overlay.set_proximity_alpha(proximity_alpha(distance))
         except Exception:
             log.exception("proximity tick failed")
 
@@ -755,6 +901,7 @@ class TokenmonApp(rumps.App):
         self._maybe_roll_encounters()
         self._tick_affection()
         self._tick_pending_drops()
+        self._tick_hp_regen()
         self._tick_mood()
         self._tick_dock()
         self._tick_orientation()
@@ -762,6 +909,136 @@ class TokenmonApp(rumps.App):
             # Refresh now so the menubar title picks up the new level immediately
             # (otherwise we'd wait up to 30s for the next refresh).
             self.refresh(None)
+
+    def _companion_sprite_speed(self) -> float:
+        """Map the active Pokémon's HP into a 0.25..1.0 GIF playback
+        multiplier. Used by every overlay-sprite call site so the
+        companion's animation visibly drags when the Pokémon is
+        unwell."""
+        try:
+            from tokenmon.pokemon.stats import final_stats
+            from tokenmon.sprite_speed import hp_playback_speed
+            active = box.get_active_pokemon()
+            if active is None:
+                return 1.0
+            xp = query_xp_for_pokemon(active.id)
+            growth = pokemon.growth_rate_of(active.species_dex_id)
+            level, _, _ = pokemon.level_from_xp(xp, growth)
+            hp_max = final_stats(
+                active.species_dex_id, active.ivs,
+                max(1, level), active.nature,
+            )[0]
+            return hp_playback_speed(active.hp_current, hp_max)
+        except Exception:
+            log.exception("companion sprite speed compute failed")
+            return 1.0
+
+    def _refresh_companion_sprite_speed(self) -> None:
+        """Reload the companion sprite with the current HP-derived
+        playback speed. Cheap — re-uses the on-disk sprite cache.
+
+        Picks front- vs back-sprite path according to ``_last_orientation``
+        so an HP refresh post-battle (engaged → back) doesn't accidentally
+        flash the front sprite back into place.
+        """
+        if not self._companion_mode:
+            return
+        if self._pokemon_sprite is None:
+            return
+        try:
+            target = self._pokemon_sprite
+            if self._last_orientation == "back":
+                back = pokemon.ensure_sprite(
+                    self._pokemon_dex_id,
+                    shiny=self._pokemon_is_shiny, back=True,
+                )
+                if back is not None:
+                    target = back
+            self._overlay.update_sprite(
+                target,
+                speed=self._companion_sprite_speed(),
+            )
+        except Exception:
+            log.exception("companion sprite speed refresh failed")
+
+    def _tick_hp_regen(self) -> None:
+        """Restore the active Pokémon's HP at one point per
+        ``HP_REGEN_TOKENS_PER_HP`` output-tokens trained on it,
+        clamped to its current max HP. Skips while a battle is in
+        progress so combat damage drives HP during a fight rather
+        than fighting the regen counter.
+
+        ``_hp_regen_remainder`` accumulates partial chunks across
+        ticks so a slow stream of small requests still adds up over
+        time — e.g. 600 + 600 = 1200 yields 1 HP plus a 200 carry.
+        """
+        # Battle in progress → freeze regen.
+        if getattr(self._popover, "_battle_session", None) is not None:
+            return
+        try:
+            active = box.get_active_pokemon()
+        except Exception:
+            log.exception("active lookup in hp_regen tick failed")
+            return
+        if active is None:
+            self._hp_regen_active_id = None
+            return
+        # Active Pokémon changed → reset baseline; no retroactive heal.
+        if self._hp_regen_active_id != active.id:
+            self._hp_regen_active_id = active.id
+            try:
+                self._hp_regen_last_xp = query_xp_for_pokemon(active.id)
+            except Exception:
+                log.exception("xp baseline read failed")
+                self._hp_regen_last_xp = 0
+            self._hp_regen_remainder = 0
+            return
+        # Already at full → nothing to do (and don't spam carry-over).
+        if active.hp_current is None:
+            return
+        # Pull current XP and compute the delta since the last tick.
+        try:
+            current_xp = query_xp_for_pokemon(active.id)
+        except Exception:
+            log.exception("xp lookup in hp_regen tick failed")
+            return
+        delta = current_xp - self._hp_regen_last_xp
+        self._hp_regen_last_xp = current_xp
+        if delta <= 0:
+            return
+        pool = self._hp_regen_remainder + int(delta)
+        hp_to_add = pool // HP_REGEN_TOKENS_PER_HP
+        self._hp_regen_remainder = pool % HP_REGEN_TOKENS_PER_HP
+        if hp_to_add <= 0:
+            return
+        # Compute current max HP from the active's IVs + level so the
+        # regen respects post-level-up cap increases.
+        try:
+            from tokenmon.pokemon.stats import final_stats
+            from tokenmon.storage import set_pokemon_hp
+            growth = pokemon.growth_rate_of(active.species_dex_id)
+            level, _, _ = pokemon.level_from_xp(current_xp, growth)
+            hp_max = final_stats(
+                active.species_dex_id, active.ivs, max(1, level), active.nature,
+            )[0]
+        except Exception:
+            log.exception("hp_max compute in regen tick failed")
+            return
+        new_hp = min(hp_max, int(active.hp_current) + hp_to_add)
+        try:
+            if new_hp >= hp_max:
+                # Fully healed → store NULL for the implicit-full
+                # semantics so the regen tick stops firing for this
+                # Pokémon until it takes damage again.
+                set_pokemon_hp(active.id, None)
+                # Reset remainder so the next damage cycle starts fresh.
+                self._hp_regen_remainder = 0
+            else:
+                set_pokemon_hp(active.id, new_hp)
+        except Exception:
+            log.exception("hp_regen persist failed")
+        # HP changed → companion's GIF speed may need to update too.
+        self._refresh_companion_sprite_speed()
 
     def _tick_dock(self, *, throttle_s: float = 0.0) -> None:
         """Re-check the focused window. NSWorkspace's activate notification
@@ -898,7 +1175,10 @@ class TokenmonApp(rumps.App):
         self._overlay.set_persistent(self._companion_mode)
         if self._companion_mode:
             try:
-                self._overlay.update_sprite(self._pokemon_sprite)
+                self._overlay.update_sprite(
+                    self._pokemon_sprite,
+                    speed=self._companion_sprite_speed(),
+                )
                 self._overlay.show()
                 self._install_active_app_observer()
                 self._install_input_monitor()
@@ -1116,6 +1396,7 @@ class TokenmonApp(rumps.App):
             self._overlay.animate_sprite_turn(
                 front_path=front, back_path=back,
                 mirrored=mirrored, zoom=zoom,
+                speed=self._companion_sprite_speed(),
             )
             self._last_orientation = want
         except Exception:

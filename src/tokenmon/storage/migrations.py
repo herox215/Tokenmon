@@ -101,6 +101,73 @@ CREATE TABLE IF NOT EXISTS pending_drops (
     item_key TEXT PRIMARY KEY,
     count    INTEGER NOT NULL DEFAULT 0
 );
+
+-- Player singleton: scalar stats that aren't per-Pokémon (money for now,
+-- room for badges/playtime later). Single-row enforced via CHECK.
+CREATE TABLE IF NOT EXISTS player_stats (
+    id    INTEGER PRIMARY KEY CHECK (id = 1),
+    money INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO player_stats (id, money) VALUES (1, 0);
+
+-- Per-Pokémon move slots (0..3). Filled at catch time and updated by
+-- the move-learn dialog when a Pokémon levels up to a new learnset entry.
+-- ``current_pp`` decays during a battle and resets to max post-battle.
+CREATE TABLE IF NOT EXISTS pokemon_moves (
+    pokemon_id INTEGER NOT NULL,
+    slot       INTEGER NOT NULL CHECK (slot >= 0 AND slot < 4),
+    move_key   TEXT    NOT NULL,
+    current_pp INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (pokemon_id, slot)
+);
+CREATE INDEX IF NOT EXISTS idx_pokemon_moves_pid ON pokemon_moves(pokemon_id);
+
+-- Move-learn queue: one row per pending learn opportunity.
+-- Resolved by the user via the inline dialog in the active-Pokémon /
+-- box-detail panes (Learn → set move slot, Skip → just drop the row).
+CREATE TABLE IF NOT EXISTS pending_move_learns (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    pokemon_id        INTEGER NOT NULL,
+    move_key          TEXT    NOT NULL,
+    learned_at_level  INTEGER NOT NULL,
+    queued_utc        TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_move_learns_pid ON pending_move_learns(pokemon_id);
+
+-- Trainers: spawned via ``trainer.maybe_spawn``, resolved by the battle
+-- pane to 'won' / 'lost' / 'ran'. Pre-battle the player only sees the
+-- name + difficulty; team is materialised in trainer_pokemon.
+CREATE TABLE IF NOT EXISTS trainers (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    spawned_utc   TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    difficulty    TEXT NOT NULL CHECK (difficulty IN ('easy','medium','hard')),
+    seed          INTEGER NOT NULL,
+    resolved      TEXT,           -- NULL | won | lost | ran
+    resolved_utc  TEXT,
+    money_reward  INTEGER,
+    xp_reward     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_trainers_resolved ON trainers(resolved);
+
+CREATE TABLE IF NOT EXISTS trainer_pokemon (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trainer_id      INTEGER NOT NULL,
+    slot            INTEGER NOT NULL,
+    species_dex_id  INTEGER NOT NULL,
+    level           INTEGER NOT NULL,
+    nature          TEXT    NOT NULL,
+    iv_hp           INTEGER NOT NULL DEFAULT 0,
+    iv_attack       INTEGER NOT NULL DEFAULT 0,
+    iv_defense      INTEGER NOT NULL DEFAULT 0,
+    iv_sp_attack    INTEGER NOT NULL DEFAULT 0,
+    iv_sp_defense   INTEGER NOT NULL DEFAULT 0,
+    iv_speed        INTEGER NOT NULL DEFAULT 0,
+    moves_json      TEXT    NOT NULL,
+    fainted         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_trainer_pokemon_tid ON trainer_pokemon(trainer_id);
 """
 
 
@@ -280,6 +347,18 @@ _IV_COLUMNS: tuple[str, ...] = (
 )
 
 
+def _ensure_hp_current_column(conn: sqlite3.Connection) -> None:
+    """Add ``pokemon.hp_current`` so battle damage persists across
+    fights. NULL means "full HP" (the implicit default for any Pokémon
+    that hasn't been in a battle yet); a positive integer is the
+    actual remaining HP. We never write 0 here as a "fainted" marker —
+    callers reset to NULL after revival or assign max_hp on auto-heal.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(pokemon)")}
+    if "hp_current" not in cols:
+        conn.execute("ALTER TABLE pokemon ADD COLUMN hp_current INTEGER")
+
+
 def _ensure_iv_columns(conn: sqlite3.Connection) -> None:
     """Add the six IV columns to pokemon + encounters and backfill any rows
     that pre-date the column with a deterministic id-seeded roll. Idempotent.
@@ -373,6 +452,7 @@ def init_db(path: Path | None = None) -> None:
         _ensure_gender_shiny_columns(conn)
         _ensure_pokemon_source_column(conn)
         _ensure_iv_columns(conn)
+        _ensure_hp_current_column(conn)
         _migrate_encounter_balls_to_items(conn)
         _backfill_pokedex_seen(conn)
         _backfill_inventory(conn)

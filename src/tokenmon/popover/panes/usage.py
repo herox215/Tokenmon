@@ -153,8 +153,8 @@ class UsageController(PaneController):
         # Token-usage chart — anchored at fixed y so per-model row count
         # can't push it into the toggles below. Sits between the cost
         # summary and the footer toolbar.
-        chart_h = 104
-        chart_y = 142  # 8 px above the topmost switch (top=134)
+        chart_h = 100
+        chart_y = 144  # 4 px above the debug-button row (top=138)
         chart_frame = NSMakeRect(
             margin_x, chart_y, CONTENT_WIDTH - 32, chart_h,
         )
@@ -230,6 +230,55 @@ class UsageController(PaneController):
         quit_btn.setTarget_(self.popover)
         quit_btn.setAction_(b"quitApp:")
         view.addSubview_(quit_btn)
+
+        # Debug-button row — sits between the toggle switches and the
+        # chart. Force-spawning bypasses probability + cooldown but
+        # respects pending-guard, so a second click while one is queued
+        # navigates to the existing pending entity instead of stacking.
+        debug_y = 116
+        half_w = (CONTENT_WIDTH - margin_x * 2 - 8) // 2
+
+        spawn_trainer_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin_x, debug_y, half_w, 22)
+        )
+        spawn_trainer_btn.setTitle_("🐛 Spawn trainer")
+        spawn_trainer_btn.setBezelStyle_(1)
+
+        def _spawn_trainer(_s):
+            try:
+                from tokenmon import trainer as trainer_mod
+                from tokenmon.popover.widgets import PANE_TRAINER_PREVIEW
+                trainer_mod.maybe_spawn(force=True)
+                self.popover._show_pane(PANE_TRAINER_PREVIEW)
+            except Exception:
+                log.exception("trainer force-spawn failed")
+
+        h_t = make_handler(_spawn_trainer)
+        self._handlers.append(h_t)
+        spawn_trainer_btn.setTarget_(h_t)
+        spawn_trainer_btn.setAction_(b"fire:")
+        view.addSubview_(spawn_trainer_btn)
+
+        spawn_wild_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin_x + half_w + 8, debug_y, half_w, 22)
+        )
+        spawn_wild_btn.setTitle_("🐛 Spawn wild")
+        spawn_wild_btn.setBezelStyle_(1)
+
+        def _spawn_wild(_s):
+            try:
+                from tokenmon import encounter as enc_mod
+                from tokenmon.popover.widgets import PANE_ENCOUNTER
+                enc_mod.maybe_spawn(force=True)
+                self.popover._show_pane(PANE_ENCOUNTER)
+            except Exception:
+                log.exception("wild encounter force-spawn failed")
+
+        h_w = make_handler(_spawn_wild)
+        self._handlers.append(h_w)
+        spawn_wild_btn.setTarget_(h_w)
+        spawn_wild_btn.setAction_(b"fire:")
+        view.addSubview_(spawn_wild_btn)
 
         return view
 

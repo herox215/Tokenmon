@@ -111,13 +111,56 @@ class _ItemsPaneRowHandler(NSObject):
             except Exception:
                 pass
             return
+
+        # Healing items branch: potion → use_potion. Potions return
+        # ``(old_hp, new_hp, hp_max)`` on success and trigger a brief
+        # animated HP fill on the active-Pokémon pane.
+        from tokenmon.items import POTION_HEAL_AMOUNTS
+        item = items.get(self._item_key)
+        item_name = item.display_name if item is not None else self._item_key
+        if self._item_key in POTION_HEAL_AMOUNTS:
+            try:
+                result = box.use_potion(active.id, self._item_key)
+            except Exception:
+                log.exception("use_potion failed")
+                return
+            popover = self._ctrl.popover
+            if result is None:
+                try:
+                    rumps.notification(
+                        title="Tokenmon",
+                        subtitle=f"{item_name} had no effect",
+                        message=(
+                            f"{pokemon.display_name(active.nickname, active.species_dex_id)} "
+                            f"is already at full HP."
+                        ),
+                    )
+                except Exception:
+                    pass
+                popover._show_pane(PANE_ITEMS)
+                return
+            old_hp, new_hp, hp_max = result
+            # Hand-off to the active-Pokémon pane for the fill animation.
+            popover._hp_anim_from_hp = old_hp
+            popover._hp_anim_to_hp = new_hp
+            popover._hp_anim_max = hp_max
+            try:
+                rumps.notification(
+                    title="Tokenmon",
+                    subtitle=f"Used {item_name}!",
+                    message=f"+{new_hp - old_hp} HP ({new_hp}/{hp_max}).",
+                )
+            except Exception:
+                pass
+            from tokenmon.popover.widgets import PANE_POKEMON
+            popover._show_pane(PANE_POKEMON)
+            return
+
         try:
             evolved = box.use_stone(active.id, self._item_key)
         except Exception:
             log.exception("use_stone failed")
             return
-        item = items.get(self._item_key)
-        item_name = item.display_name if item is not None else self._item_key
         popover = self._ctrl.popover
         if evolved is None:
             try:

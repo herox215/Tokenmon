@@ -17,7 +17,7 @@ def test_set_orientation_uses_back_when_present(tmp_path, monkeypatch):
     back.write_bytes(b"GIF89a back")
     o = PokemonOverlay()
     captured: list = []
-    monkeypatch.setattr(o, "update_sprite", lambda p: captured.append(p))
+    monkeypatch.setattr(o, "update_sprite", lambda p, **_kw: captured.append(p))
     o.set_sprite_orientation(front_path=front, back_path=back)
     assert captured == [back]
 
@@ -30,7 +30,7 @@ def test_set_orientation_falls_back_to_front_when_back_missing(
     front.write_bytes(b"GIF89a front")
     o = PokemonOverlay()
     captured: list = []
-    monkeypatch.setattr(o, "update_sprite", lambda p: captured.append(p))
+    monkeypatch.setattr(o, "update_sprite", lambda p, **_kw: captured.append(p))
     o.set_sprite_orientation(front_path=front, back_path=None)
     assert captured == [front]
 
@@ -44,7 +44,7 @@ def test_set_orientation_falls_back_when_back_path_does_not_exist(
     nonexistent_back = tmp_path / "back.gif"  # never written
     o = PokemonOverlay()
     captured: list = []
-    monkeypatch.setattr(o, "update_sprite", lambda p: captured.append(p))
+    monkeypatch.setattr(o, "update_sprite", lambda p, **_kw: captured.append(p))
     o.set_sprite_orientation(front_path=front, back_path=nonexistent_back)
     assert captured == [front]
 
@@ -56,7 +56,7 @@ def test_set_orientation_silently_skips_when_front_missing(
     from tokenmon.overlay import PokemonOverlay
     o = PokemonOverlay()
     captured: list = []
-    monkeypatch.setattr(o, "update_sprite", lambda p: captured.append(p))
+    monkeypatch.setattr(o, "update_sprite", lambda p, **_kw: captured.append(p))
     o.set_sprite_orientation(
         front_path=tmp_path / "missing.gif", back_path=None,
     )
@@ -72,7 +72,7 @@ def test_set_orientation_passes_mirror_flag_through(tmp_path, monkeypatch):
     front.write_bytes(b"GIF89a")
     back.write_bytes(b"GIF89a")
     o = PokemonOverlay()
-    monkeypatch.setattr(o, "update_sprite", lambda _p: None)
+    monkeypatch.setattr(o, "update_sprite", lambda _p, **_kw: None)
     mirror_calls: list[bool] = []
     monkeypatch.setattr(o, "set_sprite_mirror", lambda v: mirror_calls.append(v))
 

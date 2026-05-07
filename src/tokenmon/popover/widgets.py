@@ -36,6 +36,16 @@ CONTENT_WIDTH = POPOVER_WIDTH - SIDEBAR_WIDTH
 # Pane id constants — sentinel value for the conditional encounter slot
 # can never collide with the 0..4 indices used for the four base panes.
 PANE_ENCOUNTER = -1
+# Trainer-battle slot: shows the preview when a trainer is pending.
+# Battle + reward sub-panes are reached imperatively from preview, so
+# they don't need their own sidebar slots.
+PANE_TRAINER_PREVIEW = -2
+PANE_BATTLE = -3
+PANE_BATTLE_REWARD = -4
+# Move-learn modal: takes over the sidebar (along with the Usage tab)
+# when the active Pokémon has 4 moves and a queued learn — user must
+# pick which existing move to forget before navigating elsewhere.
+PANE_MOVE_LEARN = -5
 PANE_POKEMON = 0
 PANE_TOKENDEX = 1
 PANE_BOX = 2

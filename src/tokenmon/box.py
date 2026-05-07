@@ -193,6 +193,54 @@ def use_stone(
     return evolved
 
 
+def use_potion(
+    pokemon_id: int, potion_key: str, *, path: Path = DB_PATH,
+) -> tuple[int, int, int] | None:
+    """Apply a healing item to ``pokemon_id``.
+
+    Returns ``(old_hp, new_hp, hp_max)`` on success. Returns ``None``
+    when the potion is unknown OR the Pokémon is already at max HP
+    (we don't burn a potion on a no-op heal). Decrements one
+    ``potion_key`` from inventory on success only.
+    """
+    from tokenmon.items import POTION_HEAL_AMOUNTS
+    from tokenmon.pokemon.stats import final_stats
+    from tokenmon.storage import (
+        decrement_inventory,
+        query_xp_for_pokemon,
+        set_pokemon_hp,
+    )
+
+    heal = POTION_HEAL_AMOUNTS.get(potion_key)
+    if heal is None or heal <= 0:
+        return None
+    row = get_pokemon_by_id(pokemon_id, path=path)
+    if row is None:
+        return None
+    try:
+        xp = query_xp_for_pokemon(pokemon_id, path=path)
+        growth = pokemon.growth_rate_of(row.species_dex_id)
+        level, _, _ = pokemon.level_from_xp(xp, growth)
+        hp_max = final_stats(
+            row.species_dex_id, row.ivs, max(1, level), row.nature,
+        )[0]
+    except Exception:  # pragma: no cover — defensive
+        return None
+    old_hp = int(row.hp_current) if row.hp_current is not None else hp_max
+    if old_hp >= hp_max:
+        return None  # already full — don't waste the potion
+    new_hp = min(hp_max, old_hp + heal)
+    if new_hp >= hp_max:
+        set_pokemon_hp(pokemon_id, None, path=path)  # NULL = full
+    else:
+        set_pokemon_hp(pokemon_id, new_hp, path=path)
+    try:
+        decrement_inventory(potion_key, 1, path=path)
+    except Exception:  # pragma: no cover — non-fatal
+        pass
+    return old_hp, new_hp, hp_max
+
+
 def maybe_evolve(pokemon_id: int, path: Path = DB_PATH) -> int | None:
     """If the Pokemon's trained XP has crossed an evolution threshold, mutate
     its species_dex_id to the new form in the DB and return the new species

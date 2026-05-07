@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import logging
 
+import objc
 from AppKit import (
+    NSBezierPath,
     NSColor,
     NSFont,
     NSImage,
     NSImageView,
     NSTextAlignmentCenter,
     NSTextField,
+    NSTimer,
     NSView,
 )
 from Foundation import NSMakeRect
@@ -42,6 +45,87 @@ from tokenmon.tokendex import _XPBarView
 from tokenmon.ui_helpers import fmt_affection as _fmt_affection
 
 log = logging.getLogger("tokenmon.popover.panes.pokemon")
+
+
+HP_ANIM_FRAMES = 24    # 24 × 0.04 s = ~1.0 s fill duration
+HP_ANIM_INTERVAL = 0.04
+
+
+class _AnimatedHPBar(NSView):
+    """HP bar that tweens from ``start_hp`` to ``end_hp`` (vs ``hp_max``)
+    over ~1 s on first display. Used by the active-Pokémon pane to
+    visualise potion heals — the user clicks "Use Potion" in the items
+    pane and is bounced here with the bar already fill-animating.
+
+    Colour follows the same green/orange/red threshold rules as
+    ``battle._HPBar`` so the visualisation is consistent across panes.
+    """
+
+    def initWithFrame_from_to_max_(  # noqa: N802
+        self, frame, start_hp, end_hp, hp_max,
+    ):
+        self = objc.super(_AnimatedHPBar, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._start = max(0, int(start_hp))
+        self._end = max(0, int(end_hp))
+        self._max = max(1, int(hp_max))
+        self._current = self._start
+        self._frame = 0
+        self._timer = None
+        return self
+
+    def viewDidMoveToWindow(self):  # noqa: N802
+        try:
+            objc.super(_AnimatedHPBar, self).viewDidMoveToWindow()
+        except Exception:
+            pass
+        if self._timer is None and self.window() is not None:
+            self._timer = (
+                NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    HP_ANIM_INTERVAL, self, b"_step:", None, True,
+                )
+            )
+
+    def _step_(self, _t):  # noqa: N802
+        self._frame += 1
+        if self._frame >= HP_ANIM_FRAMES:
+            self._current = self._end
+            if self._timer is not None:
+                try:
+                    self._timer.invalidate()
+                except Exception:
+                    pass
+                self._timer = None
+            self.setNeedsDisplay_(True)
+            return
+        t = self._frame / HP_ANIM_FRAMES
+        eased = 1.0 - (1.0 - t) ** 3
+        self._current = self._start + (self._end - self._start) * eased
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, _rect):  # noqa: N802
+        bounds = self.bounds()
+        # Track
+        NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.18).set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            bounds, 4, 4,
+        ).fill()
+        if self._current <= 0:
+            return
+        frac = max(0.0, min(1.0, self._current / self._max))
+        if frac > 0.5:
+            r, g, b = 0.36, 0.78, 0.20
+        elif frac > 0.2:
+            r, g, b = 1.00, 0.65, 0.10
+        else:
+            r, g, b = 0.95, 0.30, 0.30
+        fill_w = bounds.size.width * frac
+        fill = NSMakeRect(0, 0, fill_w, bounds.size.height)
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0).set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            fill, 4, 4,
+        ).fill()
 
 
 class PokemonController(PaneController):
@@ -104,7 +188,21 @@ class PokemonController(PaneController):
         )
         sp = pokemon.ensure_sprite(species, shiny=row.is_shiny)
         if sp is not None and sp.exists():
-            img = NSImage.alloc().initWithContentsOfFile_(str(sp))
+            # GIF playback slows below 80% HP — same speed-curve drives
+            # both this sprite and the desktop companion's.
+            try:
+                from tokenmon.pokemon.stats import final_stats
+                from tokenmon.sprite_speed import (
+                    hp_playback_speed, load_animated_image,
+                )
+                hp_max = final_stats(
+                    species, row.ivs, max(1, level), row.nature,
+                )[0]
+                speed = hp_playback_speed(row.hp_current, hp_max)
+                img = load_animated_image(sp, speed=speed)
+            except Exception:
+                log.exception("HP-aware sprite load failed; falling back")
+                img = NSImage.alloc().initWithContentsOfFile_(str(sp))
             if img is not None:
                 iv.setImage_(img)
         view.addSubview_(iv)
@@ -199,7 +297,56 @@ class PokemonController(PaneController):
 
         bar_w = 260
         bar_x = (CONTENT_WIDTH - bar_w) // 2
-        bar_y = lvl_y - 14
+
+        # HP block — shows the persisted current HP vs the level's max.
+        # Reuses the battle pane's coloured-by-threshold ``_HPBar`` so
+        # the visualisation matches what the user sees in combat.
+        # When the popover sets ``_hp_anim_from_hp`` (e.g. just-used
+        # potion), the bar animates from that value to the actual
+        # current HP over ~1 s instead of snapping.
+        try:
+            from tokenmon.pokemon.stats import final_stats
+            from tokenmon.popover.panes.battle import _HPBar
+            hp_max = final_stats(
+                species, row.ivs, max(1, level), row.nature,
+            )[0]
+            hp_cur = (
+                int(row.hp_current) if row.hp_current is not None
+                else hp_max
+            )
+            hp_cur = max(0, min(hp_cur, hp_max))
+            hp_y = lvl_y - 14
+            anim_from = getattr(self.popover, "_hp_anim_from_hp", None)
+            anim_to = getattr(self.popover, "_hp_anim_to_hp", None)
+            if anim_from is not None and anim_to is not None:
+                # Single-shot animation — clear the hint after consuming.
+                hp_bar = _AnimatedHPBar.alloc().initWithFrame_from_to_max_(
+                    NSMakeRect(bar_x, hp_y, bar_w, 8),
+                    int(anim_from), int(anim_to), hp_max,
+                )
+                self.popover._hp_anim_from_hp = None
+                self.popover._hp_anim_to_hp = None
+                self.popover._hp_anim_max = None
+                hp_label_value = anim_to
+            else:
+                hp_bar = _HPBar.alloc().initWithFrame_current_max_(
+                    NSMakeRect(bar_x, hp_y, bar_w, 8), hp_cur, hp_max,
+                )
+                hp_label_value = hp_cur
+            view.addSubview_(hp_bar)
+            view.addSubview_(_label(
+                NSMakeRect(0, hp_y - 16, CONTENT_WIDTH, 14),
+                f"{hp_label_value} / {hp_max} HP",
+                font=NSFont.systemFontOfSize_(11),
+                color=NSColor.tertiaryLabelColor(),
+                align=NSTextAlignmentCenter,
+            ))
+            after_hp_y = hp_y - 16 - 12  # text + small gap before XP
+        except Exception:
+            log.exception("HP block render failed")
+            after_hp_y = lvl_y - 14
+
+        bar_y = after_hp_y - 8
         progress = into / needed if needed > 0 else (
             1.0 if level >= pokemon.MAX_LEVEL else 0.0
         )
@@ -218,7 +365,38 @@ class PokemonController(PaneController):
             align=NSTextAlignmentCenter,
         ))
 
+        # Move-learn inline dialog: when this Pokémon has queued moves
+        # to learn from a recent level-up, surface the prompt here so
+        # the user can act on it without leaving the pane.
         affection_y = xp_y - 22
+        try:
+            from tokenmon.popover.panes._move_learn_inline import (
+                build_move_learn_inline,
+            )
+            consumed_h = build_move_learn_inline(
+                view, self, pokemon_id=row.id,
+                top_y=xp_y - 30,
+            )
+        except Exception:
+            log.exception("move-learn inline build failed")
+            consumed_h = 0
+        affection_y -= consumed_h
+
+        # Move grid: shows the four learned moves with hover tooltips
+        # for power/accuracy/PP. Backfills missing moves from the
+        # learnset so a Pokémon caught before this feature still shows
+        # something sensible.
+        try:
+            self._backfill_initial_moves(row.id, row.species_dex_id, level)
+            from tokenmon.popover.panes._move_grid import build_move_grid
+            grid_h = build_move_grid(
+                view, pokemon_id=row.id, top_y=affection_y - 4,
+            )
+        except Exception:
+            log.exception("move grid build failed")
+            grid_h = 0
+        affection_y -= grid_h
+
         view.addSubview_(_label(
             NSMakeRect(0, affection_y, CONTENT_WIDTH, 16),
             f"Affection   {_fmt_affection(row.affection)}",
@@ -246,6 +424,36 @@ class PokemonController(PaneController):
         ))
 
         return view
+
+    def _backfill_initial_moves(
+        self, pokemon_id: int, species_dex_id: int, level: int,
+    ) -> None:
+        """If this Pokémon has no rows in ``pokemon_moves`` yet (caught
+        before the trainer-battle feature, or via legacy code path),
+        seed it with the latest 4 level-up moves the species would
+        know at its current level. PokeAPI lookups + cache reads run
+        synchronously here, but the caller is already inside a pane
+        build; cold-cache cost is bounded to ~4 fetches × ~200 ms.
+        """
+        try:
+            from tokenmon import learnsets_remote, moves_remote
+            from tokenmon.storage import get_pokemon_moves, set_pokemon_move
+        except Exception:
+            log.exception("move backfill imports failed")
+            return
+        try:
+            existing = get_pokemon_moves(pokemon_id)
+            if existing:
+                return
+            keys = learnsets_remote.initial_moves(
+                species_dex_id, max(1, level),
+            )
+            for slot, key in enumerate(keys[:4]):
+                md = moves_remote.get_move_data(key)
+                max_pp = md.pp if md is not None else 35
+                set_pokemon_move(pokemon_id, slot, key, max_pp=max_pp)
+        except Exception:
+            log.exception("move backfill failed for #%d", pokemon_id)
 
     # ---- pat interaction state machine -------------------------------
 

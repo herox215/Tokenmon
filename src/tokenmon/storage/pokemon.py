@@ -16,6 +16,7 @@ __all__ = [
     "update_pokemon_species",
     "update_pokemon_nickname",
     "bump_affection",
+    "set_pokemon_hp",
 ]
 
 
@@ -32,12 +33,18 @@ class Pokemon:
     gender: str | None = None  # 'M', 'F', or None for genderless species
     # Per-instance IVs (0..31), order: HP, Attack, Defense, Sp.Atk, Sp.Def, Speed.
     ivs: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0)
+    # Persisted current-HP across battles. None means "full" — either the
+    # Pokémon hasn't fought yet or it healed to max. A positive integer
+    # is the actual remaining HP. Battle init reads this; battle reward
+    # writes the post-battle HP back here.
+    hp_current: int | None = None
 
 
 _POKEMON_COLUMNS = (
     "id, caught_date, species_dex_id, nature, characteristic, "
     "nickname, is_shiny, affection, gender, "
-    "iv_hp, iv_attack, iv_defense, iv_sp_attack, iv_sp_defense, iv_speed"
+    "iv_hp, iv_attack, iv_defense, iv_sp_attack, iv_sp_defense, iv_speed, "
+    "hp_current"
 )
 
 
@@ -56,6 +63,10 @@ def _row_to_pokemon(row: tuple) -> Pokemon:
             int(row[9] or 0), int(row[10] or 0), int(row[11] or 0),
             int(row[12] or 0), int(row[13] or 0), int(row[14] or 0),
         ) if len(row) > 14 else (0, 0, 0, 0, 0, 0),
+        hp_current=(
+            int(row[15]) if len(row) > 15 and row[15] is not None
+            else None
+        ),
     )
 
 
@@ -200,3 +211,23 @@ def bump_affection(
             "SELECT affection FROM pokemon WHERE id = ?", (int(pokemon_id),),
         ).fetchone()
     return int(row[0]) if row is not None else 0
+
+
+def set_pokemon_hp(
+    pokemon_id: int, hp_current: int | None, *, path: Path | None = None,
+) -> None:
+    """Persist a Pokémon's post-battle current HP. ``None`` clears the
+    column (= "full HP" semantics). Negative values clamp to 0
+    (fainted); the next battle init auto-revives a 0-HP Pokémon to
+    full so the user isn't soft-locked without a heal mechanic."""
+    if path is None:
+        path = DB_PATH
+    if hp_current is None:
+        value = None
+    else:
+        value = max(0, int(hp_current))
+    with _connect(path) as conn:
+        conn.execute(
+            "UPDATE pokemon SET hp_current = ? WHERE id = ?",
+            (value, int(pokemon_id)),
+        )
