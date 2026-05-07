@@ -67,10 +67,11 @@ def check_level_up(app, now: float) -> None:
         # Suppress the level-up animation while an evolution animation is
         # already running (level-up and evolution often coincide).
         if app._companion_mode and not app._overlay.evolution_running:
+            from tokenmon.menubar import ticks
             try:
                 app._overlay.update_sprite(
                     app._pokemon_sprite,
-                    speed=app._companion_sprite_speed(),
+                    speed=ticks.companion_sprite_speed(app),
                 )
                 app._overlay.show_level_up()
             except Exception:

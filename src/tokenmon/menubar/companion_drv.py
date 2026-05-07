@@ -71,12 +71,13 @@ def on_input_event(app) -> None:
     Bumps orientation immediately and (throttled) re-checks the dock
     target so we follow same-app window switches with ~200 ms latency
     instead of waiting up to 5 s for the periodic tick."""
+    from tokenmon.menubar import ticks
     try:
-        app._tick_orientation()
+        ticks.tick_orientation(app)
     except Exception:
         log.exception("orientation tick failed")
     try:
-        app._tick_dock(throttle_s=0.2)
+        ticks.tick_dock(app, throttle_s=0.2)
     except Exception:
         log.exception("dock tick failed")
 
@@ -134,12 +135,13 @@ def on_active_app_changed(app, _bundle_id: str | None) -> None:
     windows of the same app (which doesn't fire this notification)."""
     if not app._companion_mode:
         return
+    from tokenmon.menubar import ticks
     try:
         dock_to_focused_window(app, force=True)
     except Exception:
         log.exception("dock to focused window failed")
     try:
-        app._tick_orientation(force=True)
+        ticks.tick_orientation(app, force=True)
     except Exception:
         log.exception("orientation tick after app change failed")
 

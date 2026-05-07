@@ -204,8 +204,9 @@ def tick_dock(app, *, throttle_s: float = 0.0) -> None:
         app._last_dock_check_mono = now_mono
     else:
         app._last_dock_check_mono = time.monotonic()
+    from tokenmon.menubar import companion_drv
     try:
-        app._dock_to_focused_window()
+        companion_drv.dock_to_focused_window(app)
     except Exception:
         log.exception("dock tick failed")
 
