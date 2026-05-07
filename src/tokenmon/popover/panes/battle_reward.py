@@ -153,25 +153,47 @@ def _award_rewards(
     money: int,
     xp_per_defeat: int,
     item_drops: dict[str, int],
+    loss_penalty: int = 0,
     player_pokemon_id: int,
     path=DB_PATH,
 ) -> tuple[int, int, dict[str, int]]:
     """Atomically apply the rewards: money + XP credit + trainer
-    resolved. XP is independent of the win-state — partial-defeat XP
-    still flows. Returns the (actual_money, actual_xp_total, items)
-    tuple credited.
+    resolved. Returns the ``(money_delta, xp_total, items)`` tuple
+    actually credited — ``money_delta`` may be negative on loss.
+
+    Trainer-only: this helper is invoked exclusively from the trainer
+    reward pane. Wild encounters use a different code path, so the
+    ``loss_penalty`` here is by construction trainer-scoped.
+
+    Status branching:
+      * ``won``:  money + per-defeat XP + drops are credited.
+      * ``lost``: ``loss_penalty`` is deducted from the wallet, no
+        XP, no drops. ``add_money`` clamps the wallet at 0 internally,
+        so the deduction can't go negative.
+      * ``ran``: defensively credits nothing — running away is a
+        retreat, not a defeat.
 
     XP credit goes through a synthetic ``requests`` row tagged with
     ``model='<battle>'`` so the existing XP-tracking aggregation
     (``query_xp_for_pokemon`` sums ``output_tokens`` per
     trained_pokemon_id) picks it up without a new schema.
     """
-    money_credit = money if status == "won" else 0
-    xp_credit = xp_per_defeat * defeated_count
-    items_credit = item_drops if status == "won" else {}
+    if status == "won":
+        money_credit = int(money)
+        xp_credit = int(xp_per_defeat) * int(defeated_count)
+        items_credit = item_drops
+    elif status == "lost":
+        money_credit = -int(loss_penalty)
+        xp_credit = 0
+        items_credit = {}
+    else:
+        # "ran" or unknown — don't pay, don't punish.
+        money_credit = 0
+        xp_credit = 0
+        items_credit = {}
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with _connect(path) as conn:
-        if money_credit > 0:
+        if money_credit != 0:
             add_money(money_credit, conn=conn)
         if xp_credit > 0:
             conn.execute(
@@ -261,6 +283,7 @@ class BattleRewardController(PaneController):
                     money=rewards.money,
                     xp_per_defeat=rewards.xp_per_defeat,
                     item_drops=rewards.item_drops,
+                    loss_penalty=rewards.loss_penalty,
                     player_pokemon_id=player_id,
                 )
             except Exception:
@@ -303,16 +326,36 @@ class BattleRewardController(PaneController):
                 log.exception("PP reset failed")
 
         # Render the summary.
+        is_loss = status == "lost"
         if status == "won":
             headline = "🏆 You won!"
             color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
                 0.36, 0.78, 0.20, 1.0,
             )
-        else:
-            headline = "💔 You blacked out…"
+        elif is_loss:
+            headline = "💔 You blacked out!"
             color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
                 0.95, 0.30, 0.30, 1.0,
             )
+        else:
+            headline = "Battle ended"
+            color = NSColor.secondaryLabelColor()
+
+        # Resolve the historical money_reward for the already-resolved
+        # path. Re-rendering must show the exact value persisted on
+        # first close, even if compute_rewards drifts later.
+        if already_resolved and trainer is not None:
+            historical_money = (
+                int(trainer.money_reward) if trainer.money_reward is not None
+                else 0
+            )
+        else:
+            if status == "won" and rewards is not None:
+                historical_money = int(rewards.money)
+            elif is_loss and rewards is not None:
+                historical_money = -int(rewards.loss_penalty)
+            else:
+                historical_money = 0
 
         # Top-down y_cursor — start a small margin below the pane top.
         y_cursor = POPOVER_HEIGHT - 12
@@ -366,8 +409,10 @@ class BattleRewardController(PaneController):
                     view.addSubview_(iv)
         y_cursor -= 8
 
-        # Pokémon name + level (or level-up flash)
-        if mon_row is not None:
+        # Pokémon name + level. On WIN we also show the animated XP
+        # bar + level-up flash. On LOSS XP isn't credited, so we skip
+        # the bar entirely and just label the active mon for context.
+        if mon_row is not None and not is_loss:
             try:
                 growth = pokemon.growth_rate_of(mon_row.species_dex_id)
                 old_level, old_into, old_needed = pokemon.level_from_xp(
@@ -429,17 +474,49 @@ class BattleRewardController(PaneController):
                 ))
             except Exception:
                 log.exception("XP bar render failed")
+        elif mon_row is not None and is_loss:
+            # Just a name+level line, no XP rendering.
+            try:
+                growth = pokemon.growth_rate_of(mon_row.species_dex_id)
+                cur_level, _into, _needed = pokemon.level_from_xp(
+                    new_xp, growth,
+                )
+                mon_name = pokemon.display_name(
+                    mon_row.nickname, mon_row.species_dex_id,
+                )
+                y_cursor -= 18
+                view.addSubview_(_label(
+                    NSMakeRect(20, y_cursor, CONTENT_WIDTH - 40, 18),
+                    f"{mon_name}  —  Lv {cur_level}",
+                    font=NSFont.boldSystemFontOfSize_(13),
+                    color=NSColor.labelColor(),
+                    align=NSTextAlignmentCenter,
+                ))
+                y_cursor -= 6
+            except Exception:
+                log.exception("loss-pane name render failed")
 
         y_cursor -= 14  # gap before stats block
 
-        # Stats lines
-        money = rewards.money if (rewards and status == "won") else 0
-        xp_total = new_xp - old_xp
-        for line in [
-            f"Pokémon defeated: {defeated}",
-            f"Money: +${money}",
-            f"XP: +{xp_total}",
-        ]:
+        # Stats lines. On WIN we show defeated count + money gained +
+        # XP gained. On LOSS we show defeated count + money lost (no
+        # XP line — would always read +0). historical_money is
+        # negative on loss so we render it as "Lost $N".
+        if is_loss:
+            penalty = -historical_money  # positive magnitude for display
+            stats_lines = [
+                f"Pokémon defeated: {defeated}",
+                f"Lost ${penalty} on the way to a Pokémon Center.",
+            ]
+        else:
+            money = historical_money
+            xp_total = new_xp - old_xp
+            stats_lines = [
+                f"Pokémon defeated: {defeated}",
+                f"Money: +${money}",
+                f"XP: +{xp_total}",
+            ]
+        for line in stats_lines:
             y_cursor -= 18
             view.addSubview_(_label(
                 NSMakeRect(40, y_cursor, CONTENT_WIDTH - 80, 18),

@@ -49,3 +49,32 @@ def test_item_drops_empty_for_v1():
     it without API churn."""
     r = compute_rewards(_team([20]), "easy")
     assert r.item_drops == {}
+
+
+def test_loss_penalty_scales_and_caps():
+    """Loss penalty is positive, scales with avg level + difficulty,
+    and is capped by ``100 × avg_level`` so a level-1 wipe doesn't
+    bankrupt the player."""
+    low = compute_rewards(_team([5]), "easy").loss_penalty
+    high = compute_rewards(_team([50]), "easy").loss_penalty
+    assert low > 0
+    assert high > low
+
+    # Difficulty multiplier flows through.
+    easy_pen = compute_rewards(_team([20]), "easy").loss_penalty
+    hard_pen = compute_rewards(_team([20]), "hard").loss_penalty
+    assert hard_pen > easy_pen
+
+    # Cap: at avg_level = 10 with mult=1.0 the raw formula returns
+    # 50 + 20*10*0.5 = 150, well under the 100*10 = 1000 cap. Sanity
+    # check that the value is in range and never negative.
+    r10 = compute_rewards(_team([10]), "easy")
+    assert 0 < r10.loss_penalty <= 100 * 10
+
+
+def test_loss_penalty_default_zero_on_dataclass():
+    """Rewards.loss_penalty defaults to 0 so callers that pre-date
+    Bug 3 keep working."""
+    from tokenmon.battle.models import Rewards
+    r = Rewards(money=10, xp_per_defeat=5, item_drops={})
+    assert r.loss_penalty == 0
