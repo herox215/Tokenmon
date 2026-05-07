@@ -22,6 +22,9 @@ from AppKit import (
     NSButton,
     NSColor,
     NSFont,
+    NSImage,
+    NSImageScaleProportionallyUpOrDown,
+    NSImageView,
     NSTextAlignmentCenter,
     NSTimer,
     NSView,
@@ -295,87 +298,140 @@ class BattleRewardController(PaneController):
                 0.95, 0.30, 0.30, 1.0,
             )
 
+        # Top-down y_cursor — start a small margin below the pane top.
+        y_cursor = POPOVER_HEIGHT - 12
+
+        # Headline
+        y_cursor -= 28
         view.addSubview_(_label(
-            NSMakeRect(20, POPOVER_HEIGHT - 60, CONTENT_WIDTH - 40, 28),
+            NSMakeRect(20, y_cursor, CONTENT_WIDTH - 40, 28),
             headline,
             font=NSFont.boldSystemFontOfSize_(20),
             color=color,
             align=NSTextAlignmentCenter,
         ))
+        y_cursor -= 6
+
+        # Pokémon sprite — front view of the active mon. Same crisp-
+        # pixel scaling pattern used by the battle pane.
+        try:
+            from tokenmon.storage import get_pokemon_by_id
+            mon_row = get_pokemon_by_id(player_id)
+        except Exception:
+            log.exception("active Pokémon lookup failed")
+            mon_row = None
+
+        sprite_size = 96
+        y_cursor -= sprite_size
+        if mon_row is not None:
+            try:
+                sp = pokemon.ensure_sprite(
+                    mon_row.species_dex_id,
+                    shiny=bool(mon_row.is_shiny),
+                )
+            except Exception:
+                log.exception("reward-pane sprite load failed")
+                sp = None
+            if sp is not None and sp.exists():
+                sprite_x = (CONTENT_WIDTH - sprite_size) // 2
+                iv = NSImageView.alloc().initWithFrame_(
+                    NSMakeRect(sprite_x, y_cursor, sprite_size, sprite_size)
+                )
+                iv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+                iv.setAnimates_(True)
+                iv.setWantsLayer_(True)
+                layer = iv.layer()
+                if layer is not None:
+                    layer.setMagnificationFilter_("nearest")
+                    layer.setMinificationFilter_("nearest")
+                img = NSImage.alloc().initWithContentsOfFile_(str(sp))
+                if img is not None:
+                    iv.setImage_(img)
+                    view.addSubview_(iv)
+        y_cursor -= 8
+
+        # Pokémon name + level (or level-up flash)
+        if mon_row is not None:
+            try:
+                growth = pokemon.growth_rate_of(mon_row.species_dex_id)
+                old_level, old_into, old_needed = pokemon.level_from_xp(
+                    old_xp, growth,
+                )
+                new_level, new_into, new_needed = pokemon.level_from_xp(
+                    new_xp, growth,
+                )
+                level_changed = new_level > old_level
+                start_progress = (
+                    0.0 if level_changed
+                    else (
+                        old_into / max(1, old_needed)
+                        if old_needed > 0 else 0.0
+                    )
+                )
+                end_progress = (
+                    new_into / max(1, new_needed)
+                    if new_needed > 0 else 1.0
+                )
+                mon_name = pokemon.display_name(
+                    mon_row.nickname, mon_row.species_dex_id,
+                )
+                y_cursor -= 18
+                view.addSubview_(_label(
+                    NSMakeRect(20, y_cursor, CONTENT_WIDTH - 40, 18),
+                    (
+                        f"⭐ {mon_name} leveled up to L{new_level}!"
+                        if level_changed
+                        else f"{mon_name}  —  Lv {new_level}"
+                    ),
+                    font=NSFont.boldSystemFontOfSize_(13),
+                    color=(
+                        NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                            1.0, 0.85, 0.0, 1.0,
+                        ) if level_changed else NSColor.labelColor()
+                    ),
+                    align=NSTextAlignmentCenter,
+                ))
+                y_cursor -= 6
+
+                # Animated XP bar
+                y_cursor -= 14
+                bar = _AnimatedXPBar.alloc().initWithFrame_start_end_(
+                    NSMakeRect(40, y_cursor, CONTENT_WIDTH - 80, 14),
+                    start_progress, end_progress,
+                )
+                view.addSubview_(bar)
+                y_cursor -= 4
+
+                # Into / needed text
+                y_cursor -= 14
+                view.addSubview_(_label(
+                    NSMakeRect(40, y_cursor, CONTENT_WIDTH - 80, 14),
+                    f"{new_into:,} / {new_needed:,} XP",
+                    font=NSFont.systemFontOfSize_(10),
+                    color=NSColor.tertiaryLabelColor(),
+                    align=NSTextAlignmentCenter,
+                ))
+            except Exception:
+                log.exception("XP bar render failed")
+
+        y_cursor -= 14  # gap before stats block
 
         # Stats lines
         money = rewards.money if (rewards and status == "won") else 0
         xp_total = new_xp - old_xp
-        lines = [
+        for line in [
             f"Pokémon defeated: {defeated}",
             f"Money: +${money}",
             f"XP: +{xp_total}",
-        ]
-        for i, line in enumerate(lines):
+        ]:
+            y_cursor -= 18
             view.addSubview_(_label(
-                NSMakeRect(40, POPOVER_HEIGHT - 130 - i * 26, CONTENT_WIDTH - 80, 20),
+                NSMakeRect(40, y_cursor, CONTENT_WIDTH - 80, 18),
                 line,
-                font=NSFont.systemFontOfSize_(13),
+                font=NSFont.systemFontOfSize_(12),
                 align=NSTextAlignmentCenter,
             ))
-
-        # Animated XP bar — shows the active Pokémon's level + how the
-        # XP gained advances the bar. Tweens from old_progress to
-        # new_progress over ~1.4 s. Level-up flash if the level changed.
-        try:
-            from tokenmon.storage import get_pokemon_by_id
-            mon_row = get_pokemon_by_id(player_id)
-            growth = pokemon.growth_rate_of(mon_row.species_dex_id)
-            old_level, old_into, old_needed = pokemon.level_from_xp(
-                old_xp, growth,
-            )
-            new_level, new_into, new_needed = pokemon.level_from_xp(
-                new_xp, growth,
-            )
-            level_changed = new_level > old_level
-            if level_changed:
-                start_progress = 0.0
-            else:
-                start_progress = (
-                    old_into / max(1, old_needed) if old_needed > 0 else 0.0
-                )
-            end_progress = (
-                new_into / max(1, new_needed) if new_needed > 0 else 1.0
-            )
-            mon_name = pokemon.display_name(
-                mon_row.nickname, mon_row.species_dex_id,
-            )
-
-            bar_y = POPOVER_HEIGHT - 240
-            view.addSubview_(_label(
-                NSMakeRect(40, bar_y + 22, CONTENT_WIDTH - 80, 16),
-                (
-                    f"⭐ {mon_name} leveled up to L{new_level}!"
-                    if level_changed
-                    else f"{mon_name} — Lv {new_level}"
-                ),
-                font=NSFont.boldSystemFontOfSize_(12),
-                color=(
-                    NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                        1.0, 0.85, 0.0, 1.0,
-                    ) if level_changed else NSColor.labelColor()
-                ),
-                align=NSTextAlignmentCenter,
-            ))
-            bar = _AnimatedXPBar.alloc().initWithFrame_start_end_(
-                NSMakeRect(40, bar_y, CONTENT_WIDTH - 80, 14),
-                start_progress, end_progress,
-            )
-            view.addSubview_(bar)
-            view.addSubview_(_label(
-                NSMakeRect(40, bar_y - 18, CONTENT_WIDTH - 80, 14),
-                f"{new_into:,} / {new_needed:,} XP",
-                font=NSFont.systemFontOfSize_(10),
-                color=NSColor.tertiaryLabelColor(),
-                align=NSTextAlignmentCenter,
-            ))
-        except Exception:
-            log.exception("XP bar render failed")
+            y_cursor -= 4
 
         # Continue button
         cont = NSButton.alloc().initWithFrame_(
