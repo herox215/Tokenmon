@@ -50,17 +50,19 @@ def test_pending_trainer_blocks_new_spawn(db_path, monkeypatch):
     assert trainer.maybe_spawn(force=True, path=db_path) is None
 
 
-def test_cooldown_blocks_new_spawn(db_path, monkeypatch):
-    """A spawn within COOLDOWN_SECONDS of the last is rejected."""
+def test_cooldown_blocks_natural_spawn(db_path, monkeypatch):
+    """A natural spawn within COOLDOWN_SECONDS of the last is rejected.
+    ``force=True`` still bypasses cooldown — used by the debug button."""
     monkeypatch.setattr(trainer, "_RNG", _DummyRNG(0.0))
     first = trainer.maybe_spawn(force=True, path=db_path)
     assert first is not None
-    # Resolve so the pending guard doesn't block — only cooldown should.
-    mark_trainer_resolved(
-        first.id, status="ran", path=db_path,
-    )
-    # Even with force=True, cooldown blocks.
-    assert trainer.maybe_spawn(force=True, path=db_path) is None
+    mark_trainer_resolved(first.id, status="ran", path=db_path)
+    # Natural spawn (force=False) is blocked by cooldown.
+    assert trainer.maybe_spawn(
+        output_tokens=2000, force=False, path=db_path,
+    ) is None
+    # Force bypasses cooldown — debug button needs this.
+    assert trainer.maybe_spawn(force=True, path=db_path) is not None
 
 
 def test_spawn_probability_zero_below_min():

@@ -101,13 +101,18 @@ def maybe_spawn(
     ``force=True`` bypasses the probability roll (still respects pending
     + cooldown). Used by debug helpers; production callers leave it off.
     """
+    # Pending guard is a correctness invariant — never spawn a second
+    # trainer while one is queued, even with force=True (the storage
+    # layer's "latest unresolved" query would still pick the older one).
     if get_pending_trainer(path) is not None:
         return None
-    if get_pending_encounter(path) is not None:
-        return None
-    if _last_spawn_seconds_ago(path) < SPAWN_COOLDOWN_SECONDS:
-        return None
     if not force:
+        # Production-path gates: don't crowd the user while they have a
+        # wild encounter pending, respect the cooldown, then probability.
+        if get_pending_encounter(path) is not None:
+            return None
+        if _last_spawn_seconds_ago(path) < SPAWN_COOLDOWN_SECONDS:
+            return None
         prob = spawn_probability(output_tokens)
         if prob <= 0.0 or _RNG.random() >= prob:
             return None

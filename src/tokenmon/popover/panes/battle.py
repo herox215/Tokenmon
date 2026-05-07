@@ -21,8 +21,12 @@ from AppKit import (
     NSButton,
     NSColor,
     NSFont,
+    NSImage,
+    NSImageScaleProportionallyUpOrDown,
+    NSImageView,
     NSTextAlignmentCenter,
     NSTextAlignmentLeft,
+    NSTextAlignmentRight,
     NSView,
 )
 from Foundation import NSMakeRect
@@ -249,45 +253,111 @@ class BattleController(PaneController):
         opp = session["opp_states"][session["active_opp_idx"]]
         player = session["player_state"]
 
-        # Opponent block (top)
+        sprite_size = 96
+
+        # Opponent block (top half) — sprite top-right, name + HP top-left.
+        # Front-view sprite for the foe.
+        try:
+            front_path = pokemon.ensure_sprite(opp.species_dex_id)
+        except Exception:
+            log.exception("opp sprite load failed")
+            front_path = None
+        if front_path is not None and front_path.exists():
+            iv = NSImageView.alloc().initWithFrame_(NSMakeRect(
+                CONTENT_WIDTH - sprite_size - 16,
+                POPOVER_HEIGHT - sprite_size - 16,
+                sprite_size, sprite_size,
+            ))
+            iv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+            iv.setAnimates_(True)
+            iv.setWantsLayer_(True)
+            layer = iv.layer()
+            if layer is not None:
+                layer.setMagnificationFilter_("nearest")
+                layer.setMinificationFilter_("nearest")
+            img = NSImage.alloc().initWithContentsOfFile_(str(front_path))
+            if img is not None:
+                iv.setImage_(img)
+                view.addSubview_(iv)
+
         view.addSubview_(_label(
-            NSMakeRect(20, POPOVER_HEIGHT - 40, CONTENT_WIDTH - 40, 20),
+            NSMakeRect(16, POPOVER_HEIGHT - 40,
+                       CONTENT_WIDTH - sprite_size - 40, 20),
             f"{opp.name}    Lv {opp.level}",
             font=NSFont.boldSystemFontOfSize_(13),
         ))
         opp_bar = _HPBar.alloc().initWithFrame_current_max_(
-            NSMakeRect(20, POPOVER_HEIGHT - 60, CONTENT_WIDTH - 40, 12),
+            NSMakeRect(16, POPOVER_HEIGHT - 60,
+                       CONTENT_WIDTH - sprite_size - 40, 12),
             opp.hp_current, opp.hp_max,
         )
         view.addSubview_(opp_bar)
         view.addSubview_(_label(
-            NSMakeRect(20, POPOVER_HEIGHT - 80, CONTENT_WIDTH - 40, 14),
+            NSMakeRect(16, POPOVER_HEIGHT - 80,
+                       CONTENT_WIDTH - sprite_size - 40, 14),
             f"{opp.hp_current}/{opp.hp_max} HP",
             font=NSFont.systemFontOfSize_(10),
             color=NSColor.secondaryLabelColor(),
         ))
 
-        # Player block (middle)
+        # Player block (middle) — back-view sprite bottom-left, name + HP
+        # bottom-right (mirroring the GBA layout).
+        player_sprite_y = POPOVER_HEIGHT - 230
+        try:
+            # Back sprite — fall back to front silently if unavailable.
+            from tokenmon.storage import get_pokemon_by_id
+            row = get_pokemon_by_id(session["player_pokemon_id"])
+            shiny = bool(row.is_shiny) if row is not None else False
+            back_path = pokemon.ensure_sprite(
+                player.species_dex_id, shiny=shiny, back=True,
+            )
+            if back_path is None:
+                back_path = pokemon.ensure_sprite(
+                    player.species_dex_id, shiny=shiny,
+                )
+        except Exception:
+            log.exception("player sprite load failed")
+            back_path = None
+        if back_path is not None and back_path.exists():
+            iv2 = NSImageView.alloc().initWithFrame_(NSMakeRect(
+                16, player_sprite_y, sprite_size, sprite_size,
+            ))
+            iv2.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+            iv2.setAnimates_(True)
+            iv2.setWantsLayer_(True)
+            layer = iv2.layer()
+            if layer is not None:
+                layer.setMagnificationFilter_("nearest")
+                layer.setMinificationFilter_("nearest")
+            img = NSImage.alloc().initWithContentsOfFile_(str(back_path))
+            if img is not None:
+                iv2.setImage_(img)
+                view.addSubview_(iv2)
+
+        info_x = 16 + sprite_size + 16
+        info_w = CONTENT_WIDTH - info_x - 16
         view.addSubview_(_label(
-            NSMakeRect(20, POPOVER_HEIGHT - 130, CONTENT_WIDTH - 40, 20),
+            NSMakeRect(info_x, player_sprite_y + sprite_size - 18, info_w, 18),
             f"{player.name}    Lv {player.level}",
             font=NSFont.boldSystemFontOfSize_(13),
+            align=NSTextAlignmentRight,
         ))
         player_bar = _HPBar.alloc().initWithFrame_current_max_(
-            NSMakeRect(20, POPOVER_HEIGHT - 150, CONTENT_WIDTH - 40, 12),
+            NSMakeRect(info_x, player_sprite_y + sprite_size - 36, info_w, 12),
             player.hp_current, player.hp_max,
         )
         view.addSubview_(player_bar)
         view.addSubview_(_label(
-            NSMakeRect(20, POPOVER_HEIGHT - 170, CONTENT_WIDTH - 40, 14),
+            NSMakeRect(info_x, player_sprite_y + sprite_size - 54, info_w, 14),
             f"{player.hp_current}/{player.hp_max} HP",
             font=NSFont.systemFontOfSize_(10),
             color=NSColor.secondaryLabelColor(),
+            align=NSTextAlignmentRight,
         ))
 
-        # Battle log (last 4 lines)
+        # Battle log (last 4 lines) — sits between sprite block and moves.
         log_lines = session["log"][-4:]
-        log_y = POPOVER_HEIGHT - 270
+        log_y = player_sprite_y - 90
         for i, line in enumerate(log_lines):
             view.addSubview_(_label(
                 NSMakeRect(20, log_y + (3 - i) * 18, CONTENT_WIDTH - 40, 16),
