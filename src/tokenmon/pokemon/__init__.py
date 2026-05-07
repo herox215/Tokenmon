@@ -20,6 +20,7 @@ from .data import (
     NATURES,
     CHARACTERISTICS,
     STONE_EVOLUTIONS,
+    TRADE_EVOLUTION_TARGETS,
     TYPE_COLORS,
     _BASE_IDS,
     _LINE_OF,
@@ -49,6 +50,7 @@ from .level import (
     level_from_xp,
     line_of,
     name_of,
+    next_evolution_hint,
     species_seen_through,
     stage_thresholds,
     stone_evolution_for,
@@ -99,7 +101,7 @@ __all__ = [
     "ALL_NAMES", "EVOLUTIONS", "GEN1_BASE_FORMS", "GEN1_BASE_STATS",
     "GEN1_CATCH_RATES", "GEN1_DAY_ONLY", "GEN1_GENDERLESS", "GEN1_NIGHT_ONLY",
     "GEN1_TYPES", "GROWTH_RATES", "NATURES", "CHARACTERISTICS",
-    "STONE_EVOLUTIONS", "TYPE_COLORS",
+    "STONE_EVOLUTIONS", "TRADE_EVOLUTION_TARGETS", "TYPE_COLORS",
     # sprites
     "BACK_SPRITE_DIR", "SHINY_BACK_SPRITE_DIR",
     "SHINY_SPRITE_DIR", "SHINY_SPRITE_URL_TMPL",
@@ -108,7 +110,8 @@ __all__ = [
     # level
     "MAX_LEVEL", "catch_rate_of", "current_stage_of", "display_name",
     "evolution_chain", "growth_rate_of", "level_from_xp",
-    "line_of", "name_of", "species_seen_through", "stage_thresholds",
+    "line_of", "name_of", "next_evolution_hint",
+    "species_seen_through", "stage_thresholds",
     "stone_evolution_for", "types_of", "unlocked_stages_of", "xp_for_level",
     # stats
     "BASE_STAT_MAX", "IV_MAX", "RADAR_SCALE_MAX", "STAT_LABELS", "STAT_ORDER",

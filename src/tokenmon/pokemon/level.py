@@ -11,8 +11,21 @@ from .data import (
     GEN1_TYPES,
     GROWTH_RATES,
     STONE_EVOLUTIONS,
+    TRADE_EVOLUTION_TARGETS,
     _LINE_OF,
+    _TRADE_LEVEL,
 )
+
+
+# Stone-key → display name. Keep this here (next to next_evolution_hint)
+# rather than in data.py so the inert table stays UI-string-free.
+_STONE_DISPLAY_NAMES: dict[str, str] = {
+    "fire-stone":    "Fire Stone",
+    "water-stone":   "Water Stone",
+    "thunder-stone": "Thunder Stone",
+    "leaf-stone":    "Leaf Stone",
+    "moon-stone":    "Moon Stone",
+}
 
 MAX_LEVEL = 100
 
@@ -210,3 +223,76 @@ def unlocked_stages_of(base_dex_id: int, xp: int) -> list[int]:
         else:
             break
     return out
+
+
+def _next_level_evolution(dex_id: int) -> tuple[int, int] | None:
+    """Find ``(level, evolved_dex_id)`` describing the immediate next
+    level-driven evolution from ``dex_id``, or ``None`` if there isn't one.
+
+    EVOLUTIONS is keyed by base form: e.g. ``EVOLUTIONS[1] == [(16, 2), (32, 3)]``
+    means "Bulbasaur (1) → Ivysaur (2) at L16 → Venusaur (3) at L32". For an
+    in-line dex_id we therefore look at the chain belonging to its base
+    form and pick the next entry past the current stage.
+    """
+    base = _LINE_OF.get(dex_id, dex_id)
+    chain = EVOLUTIONS.get(base, [])
+    if not chain:
+        return None
+    if dex_id == base:
+        return chain[0]
+    for i, (_lvl, evo) in enumerate(chain):
+        if evo == dex_id and i + 1 < len(chain):
+            return chain[i + 1]
+    return None
+
+
+def next_evolution_hint(dex_id: int) -> str | None:
+    """Return a formatted English string describing how/when the species
+    ``dex_id`` evolves next, or ``None`` if it does not evolve.
+
+    Examples:
+        next_evolution_hint(1)   → "Evolves into Ivysaur at level 16"
+        next_evolution_hint(64)  → "Evolves into Alakazam via trade"
+        next_evolution_hint(25)  → "Use Thunder Stone to evolve into Raichu"
+        next_evolution_hint(133) → "Use Fire Stone to evolve into Flareon, …"
+        next_evolution_hint(3)   → None
+    """
+    parts: list[str] = []
+
+    # Level-driven evolution (or the trade-disguised-as-level-30 case).
+    nxt = _next_level_evolution(int(dex_id))
+    if nxt is not None:
+        level, evolved = nxt
+        evo_name = ALL_NAMES.get(evolved, f"#{evolved}")
+        if level == _TRADE_LEVEL and evolved in TRADE_EVOLUTION_TARGETS:
+            parts.append(f"Evolves into {evo_name} via trade")
+        else:
+            parts.append(f"Evolves into {evo_name} at level {level}")
+
+    # Stone-driven evolution(s). Eevee has three branches; everything else
+    # has a single stone target.
+    stones = STONE_EVOLUTIONS.get(int(dex_id), {})
+    if stones:
+        stone_phrases: list[str] = []
+        for stone_key, evolved in stones.items():
+            stone_name = _STONE_DISPLAY_NAMES.get(
+                stone_key,
+                stone_key.replace("-", " ").title(),
+            )
+            evo_name = ALL_NAMES.get(evolved, f"#{evolved}")
+            stone_phrases.append(
+                f"Use {stone_name} to evolve into {evo_name}"
+            )
+        if len(stone_phrases) == 1:
+            parts.append(stone_phrases[0])
+        elif len(stone_phrases) == 2:
+            parts.append(" or ".join(stone_phrases))
+        else:
+            # Oxford-or for 3+ branches (Eevee).
+            parts.append(
+                ", ".join(stone_phrases[:-1]) + ", or " + stone_phrases[-1]
+            )
+
+    if not parts:
+        return None
+    return ". ".join(parts)

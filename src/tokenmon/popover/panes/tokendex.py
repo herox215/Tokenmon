@@ -259,7 +259,19 @@ class TokendexController(PaneController):
             align=NSTextAlignmentCenter,
         ))
 
-        desc_y_top = genus_y - 12
+        # Evolution hint line — always reserved (18 px) so the description
+        # box doesn't shift between species with/without an evolution.
+        evo_hint = pokemon.next_evolution_hint(dex_id) or ""
+        evo_y = genus_y - 18
+        view.addSubview_(_label(
+            NSMakeRect(0, evo_y, CONTENT_WIDTH, 14),
+            evo_hint,
+            font=NSFont.systemFontOfSize_(11),
+            color=NSColor.tertiaryLabelColor(),
+            align=NSTextAlignmentCenter,
+        ))
+
+        desc_y_top = evo_y - 8
         desc_h = desc_y_top - 16
         desc_field = NSTextField.alloc().initWithFrame_(
             NSMakeRect(20, 16, CONTENT_WIDTH - 40, desc_h)
