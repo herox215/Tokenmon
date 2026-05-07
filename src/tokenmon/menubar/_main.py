@@ -21,6 +21,7 @@ from tokenmon.menubar import (
     encounter_roll as _encounter_roll,
     icon as _icon,
     levelup as _levelup,
+    ticks as _ticks,
 )
 from tokenmon.overlay import PokemonOverlay
 from tokenmon.popover import TokenmonPopover
@@ -385,249 +386,25 @@ class TokenmonApp(rumps.App):
             self.refresh(None)
 
     def _companion_sprite_speed(self) -> float:
-        """Map the active Pokémon's HP into a 0.25..1.0 GIF playback
-        multiplier. Used by every overlay-sprite call site so the
-        companion's animation visibly drags when the Pokémon is
-        unwell."""
-        try:
-            from tokenmon.pokemon.stats import final_stats
-            from tokenmon.sprite_speed import hp_playback_speed
-            active = box.get_active_pokemon()
-            if active is None:
-                return 1.0
-            xp = query_xp_for_pokemon(active.id)
-            growth = pokemon.growth_rate_of(active.species_dex_id)
-            level, _, _ = pokemon.level_from_xp(xp, growth)
-            hp_max = final_stats(
-                active.species_dex_id, active.ivs,
-                max(1, level), active.nature,
-            )[0]
-            return hp_playback_speed(active.hp_current, hp_max)
-        except Exception:
-            log.exception("companion sprite speed compute failed")
-            return 1.0
+        return _ticks.companion_sprite_speed(self)
 
     def _refresh_companion_sprite_speed(self) -> None:
-        """Reload the companion sprite with the current HP-derived
-        playback speed. Cheap — re-uses the on-disk sprite cache.
-
-        Picks front- vs back-sprite path according to ``_last_orientation``
-        so an HP refresh post-battle (engaged → back) doesn't accidentally
-        flash the front sprite back into place.
-        """
-        if not self._companion_mode:
-            return
-        if self._pokemon_sprite is None:
-            return
-        try:
-            target = self._pokemon_sprite
-            if self._last_orientation == "back":
-                back = pokemon.ensure_sprite(
-                    self._pokemon_dex_id,
-                    shiny=self._pokemon_is_shiny, back=True,
-                )
-                if back is not None:
-                    target = back
-            self._overlay.update_sprite(
-                target,
-                speed=self._companion_sprite_speed(),
-            )
-        except Exception:
-            log.exception("companion sprite speed refresh failed")
+        _ticks.refresh_companion_sprite_speed(self)
 
     def _tick_hp_regen(self) -> None:
-        """Restore the active Pokémon's HP at one point per
-        ``HP_REGEN_TOKENS_PER_HP`` output-tokens trained on it,
-        clamped to its current max HP. Skips while a battle is in
-        progress so combat damage drives HP during a fight rather
-        than fighting the regen counter.
-
-        ``_hp_regen_remainder`` accumulates partial chunks across
-        ticks so a slow stream of small requests still adds up over
-        time — e.g. 600 + 600 = 1200 yields 1 HP plus a 200 carry.
-        """
-        # Battle in progress → freeze regen.
-        if getattr(self._popover, "_battle_session", None) is not None:
-            return
-        try:
-            active = box.get_active_pokemon()
-        except Exception:
-            log.exception("active lookup in hp_regen tick failed")
-            return
-        if active is None:
-            self._hp_regen_active_id = None
-            return
-        # Active Pokémon changed → reset baseline; no retroactive heal.
-        if self._hp_regen_active_id != active.id:
-            self._hp_regen_active_id = active.id
-            try:
-                self._hp_regen_last_xp = query_xp_for_pokemon(active.id)
-            except Exception:
-                log.exception("xp baseline read failed")
-                self._hp_regen_last_xp = 0
-            self._hp_regen_remainder = 0
-            return
-        # Already at full → nothing to do (and don't spam carry-over).
-        if active.hp_current is None:
-            return
-        # Pull current XP and compute the delta since the last tick.
-        try:
-            current_xp = query_xp_for_pokemon(active.id)
-        except Exception:
-            log.exception("xp lookup in hp_regen tick failed")
-            return
-        delta = current_xp - self._hp_regen_last_xp
-        self._hp_regen_last_xp = current_xp
-        if delta <= 0:
-            return
-        pool = self._hp_regen_remainder + int(delta)
-        hp_to_add = pool // HP_REGEN_TOKENS_PER_HP
-        self._hp_regen_remainder = pool % HP_REGEN_TOKENS_PER_HP
-        if hp_to_add <= 0:
-            return
-        # Compute current max HP from the active's IVs + level so the
-        # regen respects post-level-up cap increases.
-        try:
-            from tokenmon.pokemon.stats import final_stats
-            from tokenmon.storage import set_pokemon_hp
-            growth = pokemon.growth_rate_of(active.species_dex_id)
-            level, _, _ = pokemon.level_from_xp(current_xp, growth)
-            hp_max = final_stats(
-                active.species_dex_id, active.ivs, max(1, level), active.nature,
-            )[0]
-        except Exception:
-            log.exception("hp_max compute in regen tick failed")
-            return
-        new_hp = min(hp_max, int(active.hp_current) + hp_to_add)
-        try:
-            if new_hp >= hp_max:
-                # Fully healed → store NULL for the implicit-full
-                # semantics so the regen tick stops firing for this
-                # Pokémon until it takes damage again.
-                set_pokemon_hp(active.id, None)
-                # Reset remainder so the next damage cycle starts fresh.
-                self._hp_regen_remainder = 0
-            else:
-                set_pokemon_hp(active.id, new_hp)
-        except Exception:
-            log.exception("hp_regen persist failed")
-        # HP changed → companion's GIF speed may need to update too.
-        self._refresh_companion_sprite_speed()
+        _ticks.tick_hp_regen(self)
 
     def _tick_dock(self, *, throttle_s: float = 0.0) -> None:
-        """Re-check the focused window. NSWorkspace's activate notification
-        only fires on app changes, but the user can also:
-          - switch between windows of the same app (cmd-`, click)
-          - drag a window to a new position
-          - move a window to another screen
-
-        Called from two places:
-          1. The 5-s activity_poll — long-running drift detection.
-          2. The input monitor on every key/click (very frequent) —
-             gives snappy response to cmd-` and clicks on other windows.
-
-        ``throttle_s`` enforces a minimum gap between successive checks
-        so per-keystroke calls don't spam CGWindowListCopyWindowInfo.
-        Pass 0 for the periodic tick (always run); pass e.g. 0.2 for
-        input-driven calls.
-        """
-        if not self._companion_mode or not self._overlay.visible:
-            return
-        if self._overlay.evolution_running or self._overlay.wiggling:
-            return
-        if throttle_s > 0.0:
-            now_mono = time.monotonic()
-            if (now_mono - self._last_dock_check_mono) < throttle_s:
-                return
-            self._last_dock_check_mono = now_mono
-        else:
-            self._last_dock_check_mono = time.monotonic()
-        try:
-            self._dock_to_focused_window()
-        except Exception:
-            log.exception("dock tick failed")
+        _ticks.tick_dock(self, throttle_s=throttle_s)
 
     def _tick_mood(self) -> None:
-        """Apply the time-of-day mood modifier (night dims the sprite) on
-        the 5-s tick. No-op when companion mode is off."""
-        if not self._companion_mode or not self._overlay.visible:
-            return
-        try:
-            from tokenmon.companion.mood import mood_modifiers
-            from zoneinfo import ZoneInfo
-            mods = mood_modifiers(datetime.now(ZoneInfo(TZ)))
-            self._overlay.set_mood_alpha(mods.alpha_multiplier)
-        except Exception:
-            log.exception("mood modifier apply failed")
+        _ticks.tick_mood(self)
 
     def _tick_pending_drops(self) -> None:
-        """Diff pending_drops against the last snapshot. Newly-arrived items
-        get a floating overlay animation when the desktop overlay is on.
-
-        Snapshot is updated unconditionally so a claim (which empties the
-        table) doesn't "look like" -N new drops on the next tick."""
-        try:
-            from tokenmon.storage import query_pending_drops
-            current = dict(query_pending_drops())
-        except Exception:
-            log.exception("query_pending_drops failed in tick")
-            return
-        new_drops: dict[str, int] = {}
-        for key, count in current.items():
-            delta = int(count) - int(self._last_pending_snapshot.get(key, 0))
-            if delta > 0:
-                new_drops[key] = delta
-        self._last_pending_snapshot = current
-        # Drops only animate while the companion is on. Wiggle the sprite
-        # first to announce the drop, then float the items up so they
-        # appear to come "out of" the wiggling Pokémon.
-        if new_drops and self._companion_mode:
-            try:
-                self._overlay.wiggle()
-            except Exception:
-                log.exception("wiggle failed")
-            try:
-                self._overlay.show_floating_items(new_drops)
-            except Exception:
-                log.exception("show_floating_items failed")
+        _ticks.tick_pending_drops(self)
 
     def _tick_affection(self) -> None:
-        """Grow the active Pokemon's affection by 1 every
-        AFFECTION_TICKS_PER_POINT polls. Counter resets when the active
-        Pokemon changes (or there's no active), so swapping pets doesn't
-        leak partial progress. While the proxy has been idle (no requests in
-        the last AFFECTION_IDLE_GATE_SEC) the counter is held in place — an
-        unattended laptop shouldn't bond a Pokemon for free."""
-        try:
-            active_id = box.get_active_pokemon_id()
-        except Exception:
-            log.exception("get_active_pokemon_id failed in affection tick")
-            return
-        if active_id is None:
-            self._affection_ticks = 0
-            self._affection_active_id = None
-            return
-        if active_id != self._affection_active_id:
-            self._affection_active_id = active_id
-            self._affection_ticks = 0
-        # Idle gate — no recent token activity means no growth this tick.
-        try:
-            last_ts = latest_request_ts()
-        except Exception:
-            log.exception("latest_request_ts failed in affection tick")
-            return
-        if last_ts is None:
-            return
-        idle_sec = (datetime.now(timezone.utc) - last_ts).total_seconds()
-        if idle_sec > AFFECTION_IDLE_GATE_SEC:
-            return
-        self._affection_ticks += 1
-        if self._affection_ticks >= AFFECTION_TICKS_PER_POINT:
-            self._affection_ticks = 0
-            try:
-                bump_affection(active_id)
-            except Exception:
-                log.exception("bump_affection failed")
+        _ticks.tick_affection(self)
 
     def restart_proxy(self, _sender) -> None:
         ok, msg = _restart_proxies_via_launchctl()
@@ -697,53 +474,7 @@ class TokenmonApp(rumps.App):
         _companion_drv.dock_to_focused_window(self, force=force)
 
     def _tick_orientation(self, *, force: bool = False) -> None:
-        """Choose front vs. back sprite based on how recently the user
-        provided input. Within INTERACTION_TIMEOUT_S of an input event →
-        back (Pokémon looks at the window content). Otherwise → front
-        (looks at the user). Position stays fixed at the focused window's
-        bottom-RIGHT in both states; the back sprite is horizontally
-        mirrored so it still appears to face the content area (which is
-        to the LEFT of the sprite at the right anchor).
-
-        ``force=True`` re-applies even if state hasn't changed.
-        """
-        if not self._companion_mode or not self._overlay.visible:
-            return
-        mon = self._input_monitor
-        idle_s = mon.seconds_since_last_input() if mon is not None else None
-        want = "front"
-        if idle_s is not None and idle_s <= INTERACTION_TIMEOUT_S:
-            want = "back"
-        if not force and want == self._last_orientation:
-            return
-        try:
-            front = pokemon.ensure_sprite(
-                self._pokemon_dex_id, shiny=self._pokemon_is_shiny,
-            )
-            if front is None:
-                return
-            back = None
-            if want == "back":
-                back = pokemon.ensure_sprite(
-                    self._pokemon_dex_id,
-                    shiny=self._pokemon_is_shiny, back=True,
-                )
-            # Mirror the back sprite — the unmirrored gen-V back sprite
-            # has the Pokémon's head turned to the right (3/4 view), but
-            # at the right anchor we want it facing left toward content.
-            mirrored = (want == "back")
-            # Back sprites get an extra zoom to compensate for PokeAPI
-            # rendering them smaller within the canvas. Front sprites
-            # stay at zoom=1.0.
-            zoom = COMPANION_BACK_ZOOM if want == "back" else 1.0
-            self._overlay.animate_sprite_turn(
-                front_path=front, back_path=back,
-                mirrored=mirrored, zoom=zoom,
-                speed=self._companion_sprite_speed(),
-            )
-            self._last_orientation = want
-        except Exception:
-            log.exception("orientation swap failed")
+        _ticks.tick_orientation(self, force=force)
 
     def toggle_weather(self, _sender) -> None:
         self._use_weather = not self._use_weather
