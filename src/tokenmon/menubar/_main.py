@@ -8,39 +8,24 @@ and shows a warning state if the proxy is down.
 from __future__ import annotations
 
 import logging
-import subprocess
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
-from urllib.error import URLError
-from urllib.request import urlopen
 
 import objc
 import rumps
 from AppKit import (
-    NSColor,
     NSEventMaskLeftMouseUp,
     NSEventMaskRightMouseUp,
-    NSEventTypeRightMouseDown,
-    NSEventTypeRightMouseUp,
-    NSFont,
-    NSImage,
-    NSImageScaleProportionallyUpOrDown,
-    NSImageView,
-    NSTextField,
     NSTimer,
-    NSView,
 )
-from Foundation import NSMakeRect, NSObject
+from Foundation import NSObject
 
 from tokenmon import box, config, items, items_remote, pokemon, tokendex
 from tokenmon.menubar_sprite import SpriteAnimator
 from tokenmon.overlay import PokemonOverlay
 from tokenmon.popover import TokenmonPopover
-from tokenmon.pricing import cost_for
-from tokenmon.proxy import HOST, PORT
 from tokenmon.storage import (
-    Totals,
     bump_affection,
     init_db,
     latest_request_ts,
@@ -129,92 +114,14 @@ class _ButtonWireHandler(NSObject):
             log.exception("button wiring failed")
 
 
-from tokenmon.ui_helpers import fmt_tokens as _fmt_tokens, fmt_usd as _fmt_usd
+from tokenmon.ui_helpers import fmt_tokens as _fmt_tokens
 
 # Health helpers moved to menubar.health; aliased here to keep callers in
 # this module unchanged during the split.
 from tokenmon.menubar.health import (
-    active_provider_endpoints as _active_provider_endpoints,
-    ping as _ping,
     proxy_health as _proxy_health,
     restart_proxies_via_launchctl as _restart_proxies_via_launchctl,
 )
-
-
-from tokenmon.tokendex import _XPBarView  # ObjC class — defined once, imported here
-
-
-def _label(frame, text, *, font=None, color=None) -> NSTextField:
-    f = NSTextField.alloc().initWithFrame_(frame)
-    f.setStringValue_(text)
-    f.setBezeled_(False)
-    f.setDrawsBackground_(False)
-    f.setEditable_(False)
-    f.setSelectable_(False)
-    f.setFont_(font or NSFont.menuFontOfSize_(13))
-    f.setTextColor_(color or NSColor.labelColor())
-    return f
-
-
-def _make_pokemon_view(
-    sprite: Path | None,
-    name_label: str,
-    level: int,
-    xp_into: int,
-    xp_needed: int,
-) -> NSView:
-    """Custom NSView for an NSMenuItem: animated sprite + name + level + XP bar.
-    Uses pyobjc directly because rumps' MenuItem.icon is a static NSImage."""
-    width, height = 260, 96
-    container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, width, height))
-
-    sprite_size = 72
-    img_view = NSImageView.alloc().initWithFrame_(
-        NSMakeRect(12, (height - sprite_size) / 2, sprite_size, sprite_size)
-    )
-    if sprite is not None and sprite.exists():
-        img = NSImage.alloc().initWithContentsOfFile_(str(sprite))
-        if img is not None:
-            img_view.setImage_(img)
-    img_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
-    img_view.setAnimates_(True)
-    container.addSubview_(img_view)
-
-    text_x = sprite_size + 24
-    text_w = width - text_x - 8
-
-    name_y = height - 30
-    container.addSubview_(_label(
-        NSMakeRect(text_x, name_y, text_w, 18),
-        name_label,
-        font=NSFont.boldSystemFontOfSize_(13),
-    ))
-
-    level_y = name_y - 20
-    container.addSubview_(_label(
-        NSMakeRect(text_x, level_y, text_w, 16),
-        f"Lv {level}" if level < pokemon.MAX_LEVEL else "Lv MAX",
-        font=NSFont.menuFontOfSize_(12),
-    ))
-
-    bar_y = level_y - 14
-    bar_w = text_w - 4
-    progress = xp_into / xp_needed if xp_needed > 0 else (1.0 if level >= pokemon.MAX_LEVEL else 0.0)
-    bar = _XPBarView.alloc().initWithFrame_progress_(
-        NSMakeRect(text_x, bar_y, bar_w, 8), progress,
-    )
-    container.addSubview_(bar)
-
-    xp_y = bar_y - 16
-    xp_text = "MAX" if level >= pokemon.MAX_LEVEL else f"{xp_into:,} / {xp_needed:,} XP"
-    container.addSubview_(_label(
-        NSMakeRect(text_x, xp_y, text_w, 14),
-        xp_text,
-        font=NSFont.menuFontOfSize_(10),
-        color=NSColor.secondaryLabelColor(),
-    ))
-
-    return container
 
 
 class TokenmonApp(rumps.App):
@@ -778,83 +685,6 @@ class TokenmonApp(rumps.App):
             )
             self._last_known_level = self._compute_current_level()
             self._sync_menubar_icon()
-
-    def _pokemon_menu_item(self) -> rumps.MenuItem:
-        dex_id = self._pokemon_dex_id
-        label = f"#{dex_id:03d}  {pokemon.name_of(dex_id)}"
-        try:
-            xp = query_xp_for_date(date.today(), TZ)
-        except Exception:
-            log.exception("failed to compute today's xp")
-            xp = 0
-        rate = pokemon.growth_rate_of(self._line_base_id)
-        level, into, needed = pokemon.level_from_xp(xp, rate)
-        item = rumps.MenuItem(label)
-        view = _make_pokemon_view(self._pokemon_sprite, label, level, into, needed)
-        item._menuitem.setView_(view)
-        return item
-
-    def _build_menu(self, totals: Totals, by_model: dict[str, Totals], proxy_up: bool) -> list:
-        items: list = []
-        items.append(self._pokemon_menu_item())
-        items.append(rumps.MenuItem("📖 Open Tokendex", callback=self.open_tokendex))
-        toggle = rumps.MenuItem("Show Pokémon in menubar", callback=self.toggle_menubar_pokemon)
-        toggle.state = 1 if self._show_pokemon else 0
-        items.append(toggle)
-        items.append(None)
-        if not proxy_up:
-            items.append(rumps.MenuItem("⚠️  Proxy offline — calls are NOT being tracked!"))
-            items.append(rumps.MenuItem("Restart proxy", callback=self.restart_proxy))
-            items.append(None)
-        # XP / "active" tokens count only the model's output: it's the only
-        # token category comparable across providers (cached input doesn't
-        # exist in OpenRouter, while it dominates Anthropic-via-Claude-Code).
-        active = totals.output_tokens
-        items.extend([
-            rumps.MenuItem(f"Today: {_fmt_tokens(active)} tokens (output)"),
-            rumps.MenuItem(f"  Output:   {_fmt_tokens(totals.output_tokens)}"),
-            rumps.MenuItem(f"  Input:    {_fmt_tokens(totals.input_tokens)}"),
-            rumps.MenuItem(f"  Requests: {totals.request_count}"),
-            None,
-        ])
-        total_cost = 0.0
-        priced_tokens = 0
-        all_tokens = 0
-        if by_model:
-            items.append(rumps.MenuItem("Per model:"))
-            for model, t in by_model.items():
-                cost, has_price = cost_for(
-                    model,
-                    input_tokens=t.input_tokens,
-                    output_tokens=t.output_tokens,
-                    cache_read_tokens=t.cache_read_tokens,
-                    cache_creation_tokens=t.cache_creation_tokens,
-                )
-                total_cost += cost
-                model_tokens = (
-                    t.input_tokens + t.output_tokens
-                    + t.cache_read_tokens + t.cache_creation_tokens
-                )
-                all_tokens += model_tokens
-                if has_price:
-                    priced_tokens += model_tokens
-                visible_tokens = t.output_tokens
-                cost_str = _fmt_usd(cost) if has_price else "?"
-                items.append(
-                    rumps.MenuItem(
-                        f"  {model}: {_fmt_tokens(visible_tokens)} out ({cost_str})"
-                    )
-                )
-            items.append(None)
-            cost_line = f"Estimated cost: {_fmt_usd(total_cost)}"
-            if all_tokens > 0 and priced_tokens < all_tokens:
-                coverage = priced_tokens / all_tokens
-                cost_line += f"  ({coverage:.0%} price coverage)"
-            items.append(rumps.MenuItem(cost_line))
-            items.append(None)
-        items.append(rumps.MenuItem("Refresh", callback=self.refresh))
-        items.append(rumps.MenuItem("Quit", callback=rumps.quit_application))
-        return items
 
     @rumps.timer(REFRESH_INTERVAL_SEC)
     def auto_refresh(self, _sender) -> None:
