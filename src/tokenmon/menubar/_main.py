@@ -848,15 +848,13 @@ class TokenmonApp(rumps.App):
 
     @rumps.timer(PROXIMITY_TICK_S)
     def proximity_tick(self, _sender) -> None:
-        """Fade the companion overlay when the cursor approaches AND make
-        the sprite clickable when the cursor sits inside its frame, so
-        clicks on the Pokémon open the text bubble while clicks elsewhere
-        still pass through to whatever's underneath. No-op when companion
-        mode is off."""
+        """Fade the companion overlay when the cursor approaches so it
+        doesn't sit in front of whatever the user is trying to click.
+        The window stays click-through permanently — companion is
+        purely visual."""
         if not self._companion_mode or not self._overlay.visible:
             if self._overlay._proximity_alpha < 1.0:
                 self._overlay.set_proximity_alpha(1.0)
-            self._overlay.set_clickable(False)
             return
         if self._overlay._window is None:
             return
@@ -865,24 +863,12 @@ class TokenmonApp(rumps.App):
             from tokenmon.companion.proximity import proximity_alpha
             loc = NSEvent.mouseLocation()
             frame = self._overlay._window.frame()
-            inside = (
-                frame.origin.x <= loc.x < frame.origin.x + frame.size.width
-                and frame.origin.y <= loc.y < frame.origin.y + frame.size.height
-            )
-            # While the text bubble is open, keep the sprite fully opaque
-            # — the user is mid-interaction; fading it would be jarring.
-            # We still gate clickability so the user can click the sprite
-            # again to close the bubble.
-            if self._overlay.bubble_open:
-                self._overlay.set_proximity_alpha(1.0)
-            else:
-                cx = float(frame.origin.x) + float(frame.size.width) / 2.0
-                cy = float(frame.origin.y) + float(frame.size.height) / 2.0
-                dx = float(loc.x) - cx
-                dy = float(loc.y) - cy
-                distance = (dx * dx + dy * dy) ** 0.5
-                self._overlay.set_proximity_alpha(proximity_alpha(distance))
-            self._overlay.set_clickable(inside)
+            cx = float(frame.origin.x) + float(frame.size.width) / 2.0
+            cy = float(frame.origin.y) + float(frame.size.height) / 2.0
+            dx = float(loc.x) - cx
+            dy = float(loc.y) - cy
+            distance = (dx * dx + dy * dy) ** 0.5
+            self._overlay.set_proximity_alpha(proximity_alpha(distance))
         except Exception:
             log.exception("proximity tick failed")
 

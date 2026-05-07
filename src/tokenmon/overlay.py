@@ -14,15 +14,9 @@ from pathlib import Path
 import objc
 from AppKit import (
     NSBackingStoreBuffered,
-    NSBezelStyleRounded,
     NSColor,
     NSCompositingOperationSourceAtop,
     NSCompositingOperationSourceOver,
-    NSCursor,
-    NSEvent,
-    NSEventMaskLeftMouseDown,
-    NSEventMaskOtherMouseDown,
-    NSEventMaskRightMouseDown,
     NSFloatingWindowLevel,
     NSFont,
     NSGraphicsContext,
@@ -31,10 +25,8 @@ from AppKit import (
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
     NSRectFillUsingOperation,
-    NSPanel,
     NSScreen,
     NSShadow,
-    NSStatusWindowLevel,
     NSTextAlignmentCenter,
     NSTextField,
     NSTimer,
@@ -45,7 +37,6 @@ from AppKit import (
     NSWindowCollectionBehaviorStationary,
     NSWindowCollectionBehaviorTransient,
     NSWindowStyleMaskBorderless,
-    NSWindowStyleMaskNonactivatingPanel,
 )
 from Foundation import NSMakeRect, NSMakeSize, NSObject
 
@@ -129,78 +120,26 @@ class _LevelUpHandler(NSObject):
             log.exception("level-up teardown failed")
 
 
-class _BubbleWindow(NSPanel):
-    """NSPanel subclass for the companion text bubble.
-
-    Tokenmon is an LSUIElement (status-bar-only) app. macOS routes
-    keystrokes to whichever app is active app-wide, NOT to whichever
-    window claims to be key — so a plain NSWindow that becomes key here
-    would still see no keystrokes because Tokenmon isn't the foreground
-    app.
-
-    NSPanel + ``NSWindowStyleMaskNonactivatingPanel`` is the canonical
-    fix: a non-activating panel can become key WITHOUT activating its
-    host app, and macOS happily routes keystrokes to it. The user's
-    previously-frontmost app stays frontmost; only the typing focus
-    moves into the bubble.
-
-    Borderless panels default ``canBecomeKeyWindow`` to False, so we
-    still override. ``canBecomeMainWindow`` stays False — accessory
-    panels never want main-window status.
-    """
-
-    def canBecomeKeyWindow(self):  # noqa: N802
-        return True
-
-    def canBecomeMainWindow(self):  # noqa: N802
-        return False
-
-
 class _CompanionImageView(NSImageView):
-    """NSImageView that forwards mouse-downs to the overlay so clicking
-    the sprite opens (or closes) the companion text bubble, AND disables
-    image interpolation in its draw path so animated pixel-art GIFs stay
-    crisp when scaled (96×96 native → 128×128 view → ±1.05 layer-zoom
-    transform).
+    """NSImageView subclass that disables image interpolation in its
+    draw path so animated pixel-art GIFs stay crisp when scaled
+    (96×96 native → 128×128 view → ±1.05 layer-zoom transform).
 
-    Click reachability is gated by the overlay's ``ignoresMouseEvents``
-    flag, which is toggled by the menubar's 20 Hz proximity tick: when
-    the cursor sits inside the sprite's frame the window accepts events,
-    otherwise clicks pass through to whatever's underneath.
-
-    The drawRect_ override mirrors the popover's ``_CrispImageView`` —
-    layer-level magnification filters alone aren't enough for animated
-    GIFs because each frame goes through NSImageView's draw pipeline,
+    Mirrors the popover's ``_CrispImageView`` — layer-level
+    magnification filters alone aren't enough for animated GIFs
+    because each frame goes through NSImageView's draw pipeline,
     which would otherwise apply default bilinear interpolation.
+
+    The overlay window stays click-through (``ignoresMouseEvents=True``)
+    permanently, so this view never sees a mouseDown. Companion mode
+    is purely visual.
     """
-
-    def initWithFrame_overlay_(self, frame, overlay):  # noqa: N802
-        self = objc.super(_CompanionImageView, self).initWithFrame_(frame)
-        if self is None:
-            return None
-        self._companion_overlay = overlay
-        return self
-
-    def acceptsFirstMouse_(self, _event):  # noqa: N802
-        return True
-
-    def resetCursorRects(self):  # noqa: N802
-        self.addCursorRect_cursor_(self.bounds(), NSCursor.pointingHandCursor())
 
     def drawRect_(self, rect):  # noqa: N802
         ctx = NSGraphicsContext.currentContext()
         if ctx is not None:
             ctx.setImageInterpolation_(NSImageInterpolationNone)
         objc.super(_CompanionImageView, self).drawRect_(rect)
-
-    def mouseDown_(self, _event):  # noqa: N802
-        overlay = getattr(self, "_companion_overlay", None)
-        if overlay is None:
-            return
-        try:
-            overlay._on_sprite_clicked()
-        except Exception:
-            log.exception("sprite click handler failed")
 
 
 WIGGLE_FRAMES = 6         # 6 frames @ 50 ms = 300 ms total wiggle duration
@@ -601,16 +540,6 @@ class PokemonOverlay:
         # keeps PyObjC from GC'ing the NSTimer target.
         self._wiggling: bool = False
         self._wiggle_handler = None
-        # Companion text bubble — opened on sprite click. NSPanel +
-        # NSTextField; toggles on subsequent clicks. None when not
-        # currently shown. ``_bubble_dismisser`` is the global NSEvent
-        # monitor that auto-closes the bubble when the user clicks
-        # outside our windows. ``_bubble_submit_handler`` is the strong
-        # ref to the NSObject target the text field invokes on Enter.
-        self._bubble_window: NSPanel | None = None
-        self._bubble_field: NSTextField | None = None
-        self._bubble_dismisser = None
-        self._bubble_submit_handler = None
         # Generic alert banner (encounter pending, token burst, …).
         self._alert_label: NSTextField | None = None
         self._alert_handler: _LevelUpHandler | None = None
@@ -648,7 +577,7 @@ class PokemonOverlay:
         )
         win.setReleasedWhenClosed_(False)
 
-        img_view = _CompanionImageView.alloc().initWithFrame_overlay_(rect, self)
+        img_view = _CompanionImageView.alloc().initWithFrame_(rect)
         img_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
         img_view.setAnimates_(True)
         # Crisp pixel-art scaling — sprites stay sharp when scaled to 128×128.
@@ -835,9 +764,6 @@ class PokemonOverlay:
         if self._window is not None:
             self._window.orderOut_(None)
         self._visible = False
-        # Don't leave a dangling text bubble when the sprite vanishes.
-        if self._bubble_window is not None:
-            self._close_bubble()
 
     def set_persistent(self, persistent: bool) -> None:
         """Toggle companion-mode persistence. When True, level-up / evolution
@@ -959,200 +885,6 @@ class PokemonOverlay:
                 pass
             self._alert_label = None
         self._alert_handler = None
-
-    # --- Click-through gating + text bubble ------------------------------
-
-    def set_clickable(self, clickable: bool) -> None:
-        """Toggle the overlay window between click-through (events pass to
-        whatever's underneath) and clickable (mouseDown_ on the sprite
-        fires our handler). Called from the menubar's proximity tick to
-        only intercept clicks when the cursor is over the sprite."""
-        if self._window is None:
-            return
-        try:
-            self._window.setIgnoresMouseEvents_(not bool(clickable))
-        except Exception:
-            log.exception("setIgnoresMouseEvents_ failed")
-
-    @property
-    def bubble_open(self) -> bool:
-        return self._bubble_window is not None
-
-    def _on_sprite_clicked(self) -> None:
-        """Toggle the companion text bubble: show if hidden, hide if
-        already up."""
-        if self._bubble_window is not None:
-            self._close_bubble()
-        else:
-            self._open_bubble()
-
-    def _open_bubble(self) -> None:
-        if self._window is None:
-            return
-        # Position the bubble to the right of the sprite, vertically
-        # centred. The bubble window is a borderless 220×40 NSWindow with
-        # a single NSTextField inside.
-        sprite_frame = self._window.frame()
-        bubble_w = 220
-        bubble_h = 40
-        bx = float(sprite_frame.origin.x) + float(sprite_frame.size.width) + 6
-        by = float(sprite_frame.origin.y) + (
-            float(sprite_frame.size.height) - bubble_h
-        ) / 2
-        rect = NSMakeRect(bx, by, bubble_w, bubble_h)
-        # NonactivatingPanel is the bit that lets keystrokes reach the
-        # field while Tokenmon stays a background app. Without it the
-        # text caret blinks but typing goes to whatever app actually has
-        # the active state.
-        win = _BubbleWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            rect,
-            NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
-            NSBackingStoreBuffered, False,
-        )
-        win.setOpaque_(False)
-        win.setBackgroundColor_(NSColor.clearColor())
-        win.setHasShadow_(True)
-        # NSStatusWindowLevel sits above NSFloatingWindowLevel (the sprite)
-        # and above floats from other apps, so the bubble stays in front
-        # even when another window steals focus.
-        win.setLevel_(NSStatusWindowLevel)
-        # Stationary + CanJoinAllSpaces so it shows on every Space without
-        # following Space switches. Transient is intentionally OMITTED —
-        # transient panels get auto-dismissed by some system actions and
-        # would slip behind / disappear unexpectedly.
-        win.setCollectionBehavior_(
-            NSWindowCollectionBehaviorCanJoinAllSpaces
-            | NSWindowCollectionBehaviorStationary
-            | NSWindowCollectionBehaviorIgnoresCycle
-        )
-        win.setReleasedWhenClosed_(False)
-        win.setMovable_(False)
-        win.setHidesOnDeactivate_(False)
-
-        # Field fills the entire window edge-to-edge so there's no
-        # transparent gap around it. We deliberately drop the system
-        # rounded-bezel: it renders with macOS vibrancy / translucency
-        # which the user reads as "transparent". Instead we set an
-        # explicit dark background color and a CALayer cornerRadius for
-        # rounded corners — yielding a solid, clearly-visible block.
-        field = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(0, 0, bubble_w, bubble_h)
-        )
-        field.setBezeled_(False)
-        field.setBordered_(False)
-        field.setDrawsBackground_(True)
-        bg = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-            0.16, 0.16, 0.18, 1.0,
-        )
-        field.setBackgroundColor_(bg)
-        field.setTextColor_(NSColor.whiteColor())
-        field.setEditable_(True)
-        field.setSelectable_(True)
-        field.setStringValue_("")
-        # Placeholder rendered light-gray so it's readable on the dark
-        # background — default placeholder color is too dark to see here.
-        from Foundation import NSAttributedString
-        from AppKit import NSFontAttributeName, NSForegroundColorAttributeName
-        ph_attrs = {
-            NSFontAttributeName: NSFont.systemFontOfSize_(13),
-            NSForegroundColorAttributeName: NSColor.colorWithCalibratedWhite_alpha_(
-                1.0, 0.45,
-            ),
-        }
-        field.setPlaceholderAttributedString_(
-            NSAttributedString.alloc().initWithString_attributes_(
-                "Sag was zum Pokémon…", ph_attrs,
-            )
-        )
-        field.setFont_(NSFont.systemFontOfSize_(13))
-        # Round the corners via CALayer so the dark background renders as
-        # a pill-shape rather than a hard rectangle.
-        field.setWantsLayer_(True)
-        layer = field.layer()
-        if layer is not None:
-            layer.setCornerRadius_(8.0)
-            layer.setMasksToBounds_(True)
-            layer.setBackgroundColor_(bg.CGColor())
-
-        # Press Return → action fires → close bubble. NSTextField default
-        # only sends action on Enter (sendsActionOnEndEditing=False), so
-        # focus loss won't trigger this — the global outside-click
-        # dismisser handles that case.
-        from tokenmon.popover._handlers import make_handler
-        submit_handler = make_handler(lambda _s: self._close_bubble())
-        self._bubble_submit_handler = submit_handler
-        field.setTarget_(submit_handler)
-        field.setAction_(b"fire:")
-
-        win.setContentView_(field)
-        # makeKeyAndOrderFront brings the bubble to front AND makes it
-        # key — required so the text field receives keystrokes. With the
-        # _BubbleWindow override of canBecomeKeyWindow, this works for a
-        # borderless window too.
-        win.makeKeyAndOrderFront_(None)
-        try:
-            win.makeFirstResponder_(field)
-        except Exception:
-            log.exception("makeFirstResponder_ failed")
-
-        self._bubble_window = win
-        self._bubble_field = field
-        self._install_bubble_dismisser()
-
-    def _close_bubble(self) -> None:
-        self._uninstall_bubble_dismisser()
-        if self._bubble_window is not None:
-            try:
-                self._bubble_window.orderOut_(None)
-                self._bubble_window.close()
-            except Exception:
-                log.exception("bubble close failed")
-        self._bubble_window = None
-        self._bubble_field = None
-        self._bubble_submit_handler = None
-
-    def _install_bubble_dismisser(self) -> None:
-        """Install a global NSEvent monitor that closes the bubble on any
-        mouse-down event delivered to another app. The global monitor
-        does NOT see clicks inside Tokenmon's own windows, so:
-          - clicks on the sprite go to ``_CompanionImageView.mouseDown_``
-            (which toggles the bubble closed via _on_sprite_clicked)
-          - clicks inside the bubble (e.g. positioning the text caret)
-            are handled by the NSPanel itself
-          - clicks anywhere else fire this handler → close.
-        """
-        if self._bubble_dismisser is not None:
-            return
-        mask = (
-            NSEventMaskLeftMouseDown
-            | NSEventMaskRightMouseDown
-            | NSEventMaskOtherMouseDown
-        )
-
-        def _handler(_event):
-            try:
-                self._close_bubble()
-            except Exception:
-                log.exception("bubble outside-click dismisser failed")
-
-        try:
-            self._bubble_dismisser = (
-                NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-                    mask, _handler,
-                )
-            )
-        except Exception:
-            log.exception("bubble dismisser install failed")
-            self._bubble_dismisser = None
-
-    def _uninstall_bubble_dismisser(self) -> None:
-        if self._bubble_dismisser is None:
-            return
-        try:
-            NSEvent.removeMonitor_(self._bubble_dismisser)
-        except Exception:
-            log.exception("bubble dismisser remove failed")
-        self._bubble_dismisser = None
 
     # --- Floating-item drift animation -----------------------------------
 
