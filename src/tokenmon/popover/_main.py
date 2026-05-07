@@ -36,8 +36,13 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSMakeSize, NSObject
 
-from tokenmon import config, items
-from tokenmon.storage import get_pending_encounter, get_pending_trainer
+from tokenmon import box, config, items
+from tokenmon.storage import (
+    get_pending_encounter,
+    get_pending_trainer,
+    get_pokemon_moves,
+    query_pending_move_learns,
+)
 
 log = logging.getLogger("tokenmon.popover")
 
@@ -53,6 +58,7 @@ from tokenmon.popover.widgets import (
     PANE_BOX,
     PANE_ENCOUNTER,
     PANE_ITEMS,
+    PANE_MOVE_LEARN,
     PANE_POKEMON,
     PANE_TOKENDEX,
     PANE_TRAINER_PREVIEW,
@@ -72,6 +78,23 @@ from tokenmon.ui_helpers import (
     fmt_tokens as _fmt_tokens,
     fmt_usd as _fmt_usd,
 )
+
+
+def _force_move_learn_active() -> bool:
+    """True when the active Pokémon has all 4 move slots filled AND a
+    pending move-learn is queued. The popover's sidebar locks down to
+    just the move-learn tab + the Usage tab in that case so the user
+    must pick a move to forget before browsing elsewhere."""
+    try:
+        active = box.get_active_pokemon()
+        if active is None:
+            return False
+        existing = get_pokemon_moves(active.id)
+        if len(existing) < 4:
+            return False
+        return bool(query_pending_move_learns(active.id))
+    except Exception:
+        return False
 
 
 class _RightClickHandler(NSObject):
@@ -189,6 +212,32 @@ class TokenmonPopover(NSObject):
         for btn in self._sidebar_buttons:
             btn.removeFromSuperview()
         self._sidebar_buttons = []
+
+        # Force-modal: if the active Pokémon has 4 moves AND a pending
+        # learn, the sidebar is locked to just the move-learn tab and
+        # the Usage tab so the user must resolve the move-overflow
+        # before doing anything else. Other panes are hidden entirely.
+        if _force_move_learn_active():
+            self._sidebar_pane_ids = [PANE_MOVE_LEARN, PANE_USAGE]
+            self._sidebar.setPaneIds_(self._sidebar_pane_ids)
+            slot_h = _SidebarView.SLOT_HEIGHT
+            for slot_idx, (pane_id, fallback) in enumerate(
+                [(PANE_MOVE_LEARN, "📘"), (PANE_USAGE, "$")]
+            ):
+                y = POPOVER_HEIGHT - (slot_idx + 1) * slot_h
+                btn = NSButton.alloc().initWithFrame_(
+                    NSMakeRect(8, y + 8, SIDEBAR_WIDTH - 16, slot_h - 16)
+                )
+                btn.setTitle_(fallback)
+                btn.setBezelStyle_(NSBezelStyleRegularSquare)
+                btn.setBordered_(False)
+                btn.setFont_(NSFont.systemFontOfSize_(20))
+                btn.setTag_(pane_id)
+                btn.setTarget_(self)
+                btn.setAction_(b"sidebarClicked:")
+                self._sidebar.addSubview_(btn)
+                self._sidebar_buttons.append(btn)
+            return
 
         # Determine slot list — pending entities take the top slots.
         # Trainer takes priority over wild encounter when both happen
@@ -331,11 +380,14 @@ class TokenmonPopover(NSObject):
         )
         from tokenmon.popover.panes.usage import UsageController
 
+        from tokenmon.popover.panes.move_learn import MoveLearnController
+
         registry = {
             PANE_ENCOUNTER: EncounterController,
             PANE_TRAINER_PREVIEW: TrainerPreviewController,
             PANE_BATTLE: BattleController,
             PANE_BATTLE_REWARD: BattleRewardController,
+            PANE_MOVE_LEARN: MoveLearnController,
             PANE_POKEMON: PokemonController,
             PANE_TOKENDEX: TokendexController,
             PANE_BOX: BoxController,
@@ -488,25 +540,28 @@ class TokenmonPopover(NSObject):
         if self._popover.isShown():
             self._popover.close()
             return
-        # Auto-select a pending entity's pane whenever one is pending
-        # and the user is on a base pane. Trainer wins over wild
-        # encounter (the spawn loop prevents both being pending at once
-        # but be defensive).
-        base_panes = (PANE_POKEMON, PANE_TOKENDEX, PANE_BOX, PANE_USAGE)
-        try:
-            pending_trainer = get_pending_trainer()
-        except Exception:
-            log.exception("get_pending_trainer failed")
-            pending_trainer = None
-        try:
-            pending_enc = get_pending_encounter()
-        except Exception:
-            log.exception("get_pending_encounter failed")
-            pending_enc = None
-        if pending_trainer is not None and self._current_pane in base_panes:
-            self._current_pane = PANE_TRAINER_PREVIEW
-        elif pending_enc is not None and self._current_pane in base_panes:
-            self._current_pane = PANE_ENCOUNTER
+        # Force-modal first: a 4-move + pending-learn combination
+        # overrides everything else — the user has to resolve before
+        # anything (including pending encounters / trainers) becomes
+        # selectable.
+        if _force_move_learn_active():
+            self._current_pane = PANE_MOVE_LEARN
+        else:
+            base_panes = (PANE_POKEMON, PANE_TOKENDEX, PANE_BOX, PANE_USAGE)
+            try:
+                pending_trainer = get_pending_trainer()
+            except Exception:
+                log.exception("get_pending_trainer failed")
+                pending_trainer = None
+            try:
+                pending_enc = get_pending_encounter()
+            except Exception:
+                log.exception("get_pending_encounter failed")
+                pending_enc = None
+            if pending_trainer is not None and self._current_pane in base_panes:
+                self._current_pane = PANE_TRAINER_PREVIEW
+            elif pending_enc is not None and self._current_pane in base_panes:
+                self._current_pane = PANE_ENCOUNTER
         self._refresh_sidebar_pokemon_icon()
         self._show_pane(self._current_pane)
         # Activate so the popover gets keyboard focus and macOS-managed
