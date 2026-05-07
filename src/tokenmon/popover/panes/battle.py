@@ -44,6 +44,7 @@ from tokenmon.popover.widgets import (
     _label,
 )
 from tokenmon.storage import (
+    decrement_pp,
     get_pending_trainer,
     list_trainer_pokemon,
 )
@@ -378,6 +379,7 @@ class BattleController(PaneController):
 
         # Move picker — 2x2 grid of buttons
         moves = player.moves
+        move_pps = player.move_pps
         btn_w = (CONTENT_WIDTH - 60) // 2
         btn_h = 30
         for i, mv in enumerate(moves[:4]):
@@ -388,10 +390,13 @@ class BattleController(PaneController):
             btn = NSButton.alloc().initWithFrame_(
                 NSMakeRect(x, y, btn_w, btn_h)
             )
-            label = f"{mv.name}  ({mv.type})"
+            cur_pp = move_pps[i] if i < len(move_pps) else mv.pp
+            label = f"{mv.name} ({mv.type})  PP {cur_pp}/{mv.pp}"
             btn.setTitle_(label)
             btn.setBezelStyle_(1)
-            handler = self._make_move_handler(mv)
+            if cur_pp <= 0:
+                btn.setEnabled_(False)
+            handler = self._make_move_handler(mv, i)
             self._handlers.append(handler)
             btn.setTarget_(handler)
             btn.setAction_(b"fire:")
@@ -415,26 +420,50 @@ class BattleController(PaneController):
 
         return view
 
-    def _make_move_handler(self, move: Move):
-        def _click(_s):
-            self._do_player_move(move)
+    def _make_move_handler(self, move: Move, slot: int):
+        def _click(_s, move=move, slot=slot):
+            self._do_player_move(move, slot)
         return make_handler(_click)
 
-    def _do_player_move(self, player_move: Move) -> None:
+    def _do_player_move(self, player_move: Move, slot: int) -> None:
         session = self.popover._battle_session
         if session is None:
+            return
+        player_state = session["player_state"]
+        # Guard: refuse to spend a move with no PP. Logged + re-rendered
+        # so the user sees feedback (and the disabled button gets a
+        # fallback in case the click slipped through somehow).
+        if slot < len(player_state.move_pps) and player_state.move_pps[slot] <= 0:
+            session["log"].append(f"No PP left for {player_move.name}!")
+            self._rerender()
             return
         opp = session["opp_states"][session["active_opp_idx"]]
         # Pick opponent's move randomly from its moveset.
         opp_move = session["rng"].choice(opp.moves)
         result = resolve_turn(
-            session["player_state"], opp,
+            player_state, opp,
             player_move=player_move, opp_move=opp_move,
             rng=session["rng"],
         )
-        session["player_state"] = result.player_state
+        # Engine doesn't touch move_pps — decrement here, *after* the
+        # turn resolves, so result.player_state's PP tuple reflects the
+        # spend. (Decrementing first would let the engine's snapshot
+        # overwrite the new value via state_p = player.)
+        new_state = result.player_state
+        if new_state is not None and slot < len(new_state.move_pps):
+            new_pps = list(new_state.move_pps)
+            new_pps[slot] = max(0, new_pps[slot] - 1)
+            new_state = replace(new_state, move_pps=tuple(new_pps))
+        session["player_state"] = new_state
         session["opp_states"][session["active_opp_idx"]] = result.opp_state
         session["log"].extend(result.log)
+        # Persist the PP spend so it survives re-opening the popover or
+        # restarting the app. ``decrement_pp`` floors at 0, matching the
+        # in-memory clamp above.
+        try:
+            decrement_pp(session["player_pokemon_id"], slot)
+        except Exception:
+            log.exception("decrement_pp failed")
 
         if result.opp_fainted:
             session["defeated_count"] += 1
