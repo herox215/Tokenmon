@@ -21,6 +21,7 @@ from AppKit import (
     NSMenu,
     NSMenuItem,
     NSScrollView,
+    NSSegmentedControl,
     NSTextAlignmentCenter,
     NSTextField,
     NSView,
@@ -28,6 +29,7 @@ from AppKit import (
 from Foundation import NSMakeRect, NSObject
 
 from tokenmon import box, items, items_remote, pokemon
+from tokenmon.items import POCKETS, items_in_pocket
 from tokenmon.popover._actions import title_for_action
 from tokenmon.popover._handlers import make_handler
 from tokenmon.popover.animation import _ClaimAnimationHandler, build_claim_steps
@@ -251,32 +253,75 @@ class ItemsController(PaneController):
             claim_btn.setAction_(b"fire:")
             view.addSubview_(claim_btn)
 
+        # Pocket tabs — segmented control just below the title. Picks a
+        # subset of ITEMS to render in the rows below; the user can switch
+        # tabs even when a pocket is empty.
+        pocket_keys = [pk for pk, _ in POCKETS]
+        current_pocket = getattr(self.popover, "_items_pocket", "balls")
+        if current_pocket not in pocket_keys:
+            current_pocket = "balls"
+        seg_y = POPOVER_HEIGHT - 68
+        seg = NSSegmentedControl.alloc().initWithFrame_(
+            NSMakeRect(16, seg_y, CONTENT_WIDTH - 32, 24)
+        )
+        seg.setSegmentCount_(len(POCKETS))
+        for i, (_, label) in enumerate(POCKETS):
+            seg.setLabel_forSegment_(label, i)
+        try:
+            seg.setSelectedSegment_(pocket_keys.index(current_pocket))
+        except ValueError:
+            seg.setSelectedSegment_(0)
+        def _pocket_changed(sender):
+            try:
+                new_idx = int(sender.selectedSegment())
+            except Exception:
+                return
+            if 0 <= new_idx < len(pocket_keys):
+                self.popover._items_pocket = pocket_keys[new_idx]
+                self.popover._show_pane(PANE_ITEMS)
+        pocket_handler = make_handler(_pocket_changed)
+        self._handlers.append(pocket_handler)
+        seg.setTarget_(pocket_handler)
+        seg.setAction_(b"fire:")
+        view.addSubview_(seg)
+
         try:
             counts = query_item_counts()
         except Exception:
             log.exception("query_item_counts failed")
             counts = {}
 
+        # Filter to the active pocket, then keep only items the player owns.
+        pocket_items = items_in_pocket(current_pocket)
         owned_items = [
-            (key, item) for key, item in items.ITEMS.items()
+            (key, item) for key, item in pocket_items
             if int(counts.get(key, 0) or 0) > 0
         ]
+
+        # Header (title) eats POPOVER_HEIGHT-32..-10; the segmented control
+        # eats POPOVER_HEIGHT-68..-44. Leave a small gap above the scroll.
+        scroll_h = POPOVER_HEIGHT - 80
+
         if not owned_items:
+            pocket_label = next(
+                (label for pk, label in POCKETS if pk == current_pocket),
+                current_pocket,
+            )
+            empty_y = (POPOVER_HEIGHT - 80) // 2 + 8
             view.addSubview_(_label(
-                NSMakeRect(16, POPOVER_HEIGHT // 2 - 10, CONTENT_WIDTH - 32, 20),
-                "Inventory empty — generate tokens to receive items.",
+                NSMakeRect(16, empty_y, CONTENT_WIDTH - 32, 20),
+                f"Keine {pocket_label} im Beutel.",
                 font=NSFont.systemFontOfSize_(12),
                 color=NSColor.secondaryLabelColor(),
                 align=NSTextAlignmentCenter,
             ))
             return view
 
-        # Scrollable rows — Header occupies the top 44 px of the pane,
-        # everything below scrolls. Mirrors the Tokendex/Box pattern so
-        # the weather background stays visible behind the rows.
+        # Scrollable rows — Header + tab strip occupy the top 80 px of the
+        # pane, everything below scrolls. Mirrors the Tokendex/Box pattern
+        # so the weather background stays visible behind the rows.
         row_h = 56
         row_gap = 4
-        scroll_h = POPOVER_HEIGHT - 44
         content_h = max(len(owned_items) * (row_h + row_gap), scroll_h)
         scroll = NSScrollView.alloc().initWithFrame_(
             NSMakeRect(0, 0, CONTENT_WIDTH, scroll_h)

@@ -12,6 +12,8 @@ Each Item has:
   (e.g. quest rewards, evolution stones — to be added later).
 - cap: max stack size (default 99)
 - actions: tuple of action keys this item supports — currently only 'throw'
+- pocket: bag-pocket grouping for the Items pane tabs ('balls', 'medicine',
+  'evolution', 'misc'). Pure UI grouping — no DB schema impact.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ class Item:
     actions: tuple[str, ...] = ()
     sprite_name: str | None = None
     tok_chance: float | None = None
+    pocket: str = "misc"
 
 
 ITEMS: dict[str, Item] = {
@@ -45,6 +48,7 @@ ITEMS: dict[str, Item] = {
         actions=("throw",),
         sprite_name="poke-ball",
         tok_chance=1 / 5_000,
+        pocket="balls",
     ),
     "greatball": Item(
         key="greatball",
@@ -55,6 +59,7 @@ ITEMS: dict[str, Item] = {
         actions=("throw",),
         sprite_name="great-ball",
         tok_chance=1 / 10_000,
+        pocket="balls",
     ),
     "ultraball": Item(
         key="ultraball",
@@ -65,6 +70,7 @@ ITEMS: dict[str, Item] = {
         actions=("throw",),
         sprite_name="ultra-ball",
         tok_chance=1 / 50_000,
+        pocket="balls",
     ),
     "masterball": Item(
         key="masterball",
@@ -75,6 +81,7 @@ ITEMS: dict[str, Item] = {
         actions=("throw",),
         sprite_name="master-ball",
         tok_chance=1 / 500_000,
+        pocket="balls",
     ),
     # Evolution stones — used on the active Pokemon to trigger species-
     # specific stone evolutions. Rarer than Ultra Balls (~1 per 250k tokens).
@@ -87,6 +94,7 @@ ITEMS: dict[str, Item] = {
         actions=("use",),
         sprite_name="fire-stone",
         tok_chance=1 / 250_000,
+        pocket="evolution",
     ),
     "water-stone": Item(
         key="water-stone",
@@ -97,6 +105,7 @@ ITEMS: dict[str, Item] = {
         actions=("use",),
         sprite_name="water-stone",
         tok_chance=1 / 250_000,
+        pocket="evolution",
     ),
     "thunder-stone": Item(
         key="thunder-stone",
@@ -107,6 +116,7 @@ ITEMS: dict[str, Item] = {
         actions=("use",),
         sprite_name="thunder-stone",
         tok_chance=1 / 250_000,
+        pocket="evolution",
     ),
     "leaf-stone": Item(
         key="leaf-stone",
@@ -117,6 +127,7 @@ ITEMS: dict[str, Item] = {
         actions=("use",),
         sprite_name="leaf-stone",
         tok_chance=1 / 250_000,
+        pocket="evolution",
     ),
     "moon-stone": Item(
         key="moon-stone",
@@ -127,6 +138,7 @@ ITEMS: dict[str, Item] = {
         actions=("use",),
         sprite_name="moon-stone",
         tok_chance=1 / 250_000,
+        pocket="evolution",
     ),
     # Healing items — used on the active Pokémon to restore HP.
     "potion": Item(
@@ -138,6 +150,7 @@ ITEMS: dict[str, Item] = {
         actions=("use",),
         sprite_name="potion",
         tok_chance=1 / 5_000,
+        pocket="medicine",
     ),
 }
 
@@ -154,6 +167,24 @@ BALL_CATCH_MODIFIERS: dict[str, float] = {
     "ultraball": 2.0,
     "masterball": 255.0,
 }
+
+# Bag pockets — order = tab order in the Items pane. Each entry is
+# ``(pocket_key, label)``; the label is shown on the segmented control.
+POCKETS: tuple[tuple[str, str], ...] = (
+    ("balls", "Bälle"),
+    ("medicine", "Heilung"),
+    ("evolution", "Power-Items"),
+    ("misc", "Sonstiges"),
+)
+
+
+def items_in_pocket(pocket_key: str) -> list[tuple[str, "Item"]]:
+    """Return the ITEMS entries belonging to ``pocket_key``, preserving the
+    declaration order of ``ITEMS`` (which is also the in-pane render order).
+    Pure helper — does not consult inventory counts; the caller filters by
+    ownership."""
+    return [(k, it) for k, it in ITEMS.items() if it.pocket == pocket_key]
+
 
 def all_keys() -> list[str]:
     return list(ITEMS.keys())
