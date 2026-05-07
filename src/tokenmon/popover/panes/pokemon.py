@@ -235,6 +235,21 @@ class PokemonController(PaneController):
             consumed_h = 0
         affection_y -= consumed_h
 
+        # Move grid: shows the four learned moves with hover tooltips
+        # for power/accuracy/PP. Backfills missing moves from the
+        # learnset so a Pokémon caught before this feature still shows
+        # something sensible.
+        try:
+            self._backfill_initial_moves(row.id, row.species_dex_id, level)
+            from tokenmon.popover.panes._move_grid import build_move_grid
+            grid_h = build_move_grid(
+                view, pokemon_id=row.id, top_y=affection_y - 4,
+            )
+        except Exception:
+            log.exception("move grid build failed")
+            grid_h = 0
+        affection_y -= grid_h
+
         view.addSubview_(_label(
             NSMakeRect(0, affection_y, CONTENT_WIDTH, 16),
             f"Affection   {_fmt_affection(row.affection)}",
@@ -262,6 +277,36 @@ class PokemonController(PaneController):
         ))
 
         return view
+
+    def _backfill_initial_moves(
+        self, pokemon_id: int, species_dex_id: int, level: int,
+    ) -> None:
+        """If this Pokémon has no rows in ``pokemon_moves`` yet (caught
+        before the trainer-battle feature, or via legacy code path),
+        seed it with the latest 4 level-up moves the species would
+        know at its current level. PokeAPI lookups + cache reads run
+        synchronously here, but the caller is already inside a pane
+        build; cold-cache cost is bounded to ~4 fetches × ~200 ms.
+        """
+        try:
+            from tokenmon import learnsets_remote, moves_remote
+            from tokenmon.storage import get_pokemon_moves, set_pokemon_move
+        except Exception:
+            log.exception("move backfill imports failed")
+            return
+        try:
+            existing = get_pokemon_moves(pokemon_id)
+            if existing:
+                return
+            keys = learnsets_remote.initial_moves(
+                species_dex_id, max(1, level),
+            )
+            for slot, key in enumerate(keys[:4]):
+                md = moves_remote.get_move_data(key)
+                max_pp = md.pp if md is not None else 35
+                set_pokemon_move(pokemon_id, slot, key, max_pp=max_pp)
+        except Exception:
+            log.exception("move backfill failed for #%d", pokemon_id)
 
     # ---- pat interaction state machine -------------------------------
 
