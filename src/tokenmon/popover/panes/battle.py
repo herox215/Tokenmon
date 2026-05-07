@@ -96,10 +96,9 @@ def _player_battle_stats(active) -> BattleStats:
     from tokenmon.pokemon.stats import final_stats
     from tokenmon.storage import get_pokemon_moves, set_pokemon_move
 
-    ivs = (
-        active.iv_hp, active.iv_attack, active.iv_defense,
-        active.iv_sp_attack, active.iv_sp_defense, active.iv_speed,
-    )
+    # ``Pokemon.ivs`` is the canonical 6-tuple; older code expected
+    # flat ``iv_hp/...`` fields which the dataclass doesn't expose.
+    ivs = tuple(active.ivs)
     # Compute current level from XP.
     from tokenmon.storage import query_xp_for_pokemon
     xp = query_xp_for_pokemon(active.id)
