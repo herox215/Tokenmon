@@ -276,7 +276,10 @@ class TokenmonApp(rumps.App):
         self._last_dock_check_mono: float = 0.0
         if self._companion_mode:
             try:
-                self._overlay.update_sprite(self._pokemon_sprite)
+                self._overlay.update_sprite(
+                    self._pokemon_sprite,
+                    speed=self._companion_sprite_speed(),
+                )
                 self._overlay.show()
                 self._install_active_app_observer()
                 self._install_input_monitor()
@@ -417,7 +420,10 @@ class TokenmonApp(rumps.App):
         """Refresh the overlay's sprite (when the displayed Pokemon changes).
         Does NOT decide visibility — the overlay only appears on level-up events."""
         if self._overlay.visible:
-            self._overlay.update_sprite(self._pokemon_sprite)
+            self._overlay.update_sprite(
+                self._pokemon_sprite,
+                speed=self._companion_sprite_speed(),
+            )
 
     def _query_max_request_id(self) -> int:
         try:
@@ -564,7 +570,10 @@ class TokenmonApp(rumps.App):
             # already running (level-up and evolution often coincide).
             if self._companion_mode and not self._overlay.evolution_running:
                 try:
-                    self._overlay.update_sprite(self._pokemon_sprite)
+                    self._overlay.update_sprite(
+                        self._pokemon_sprite,
+                        speed=self._companion_sprite_speed(),
+                    )
                     self._overlay.show_level_up()
                 except Exception:
                     log.exception("overlay level-up animation failed")
@@ -901,6 +910,44 @@ class TokenmonApp(rumps.App):
             # (otherwise we'd wait up to 30s for the next refresh).
             self.refresh(None)
 
+    def _companion_sprite_speed(self) -> float:
+        """Map the active Pokémon's HP into a 0.25..1.0 GIF playback
+        multiplier. Used by every overlay-sprite call site so the
+        companion's animation visibly drags when the Pokémon is
+        unwell."""
+        try:
+            from tokenmon.pokemon.stats import final_stats
+            from tokenmon.sprite_speed import hp_playback_speed
+            active = box.get_active_pokemon()
+            if active is None:
+                return 1.0
+            xp = query_xp_for_pokemon(active.id)
+            growth = pokemon.growth_rate_of(active.species_dex_id)
+            level, _, _ = pokemon.level_from_xp(xp, growth)
+            hp_max = final_stats(
+                active.species_dex_id, active.ivs,
+                max(1, level), active.nature,
+            )[0]
+            return hp_playback_speed(active.hp_current, hp_max)
+        except Exception:
+            log.exception("companion sprite speed compute failed")
+            return 1.0
+
+    def _refresh_companion_sprite_speed(self) -> None:
+        """Reload the companion sprite with the current HP-derived
+        playback speed. Cheap — re-uses the on-disk sprite cache."""
+        if not self._companion_mode:
+            return
+        if self._pokemon_sprite is None:
+            return
+        try:
+            self._overlay.update_sprite(
+                self._pokemon_sprite,
+                speed=self._companion_sprite_speed(),
+            )
+        except Exception:
+            log.exception("companion sprite speed refresh failed")
+
     def _tick_hp_regen(self) -> None:
         """Restore the active Pokémon's HP at one point per
         ``HP_REGEN_TOKENS_PER_HP`` output-tokens trained on it,
@@ -977,6 +1024,8 @@ class TokenmonApp(rumps.App):
                 set_pokemon_hp(active.id, new_hp)
         except Exception:
             log.exception("hp_regen persist failed")
+        # HP changed → companion's GIF speed may need to update too.
+        self._refresh_companion_sprite_speed()
 
     def _tick_dock(self, *, throttle_s: float = 0.0) -> None:
         """Re-check the focused window. NSWorkspace's activate notification
@@ -1113,7 +1162,10 @@ class TokenmonApp(rumps.App):
         self._overlay.set_persistent(self._companion_mode)
         if self._companion_mode:
             try:
-                self._overlay.update_sprite(self._pokemon_sprite)
+                self._overlay.update_sprite(
+                    self._pokemon_sprite,
+                    speed=self._companion_sprite_speed(),
+                )
                 self._overlay.show()
                 self._install_active_app_observer()
                 self._install_input_monitor()

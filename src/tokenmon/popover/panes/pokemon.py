@@ -188,7 +188,21 @@ class PokemonController(PaneController):
         )
         sp = pokemon.ensure_sprite(species, shiny=row.is_shiny)
         if sp is not None and sp.exists():
-            img = NSImage.alloc().initWithContentsOfFile_(str(sp))
+            # GIF playback slows below 80% HP — same speed-curve drives
+            # both this sprite and the desktop companion's.
+            try:
+                from tokenmon.pokemon.stats import final_stats
+                from tokenmon.sprite_speed import (
+                    hp_playback_speed, load_animated_image,
+                )
+                hp_max = final_stats(
+                    species, row.ivs, max(1, level), row.nature,
+                )[0]
+                speed = hp_playback_speed(row.hp_current, hp_max)
+                img = load_animated_image(sp, speed=speed)
+            except Exception:
+                log.exception("HP-aware sprite load failed; falling back")
+                img = NSImage.alloc().initWithContentsOfFile_(str(sp))
             if img is not None:
                 iv.setImage_(img)
         view.addSubview_(iv)

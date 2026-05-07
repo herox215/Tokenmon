@@ -629,13 +629,26 @@ class PokemonOverlay:
         )
         self.move_to(x, y, animate=animate)
 
-    def update_sprite(self, sprite_path: Path | None) -> None:
+    def update_sprite(
+        self,
+        sprite_path: Path | None,
+        *,
+        speed: float = 1.0,
+    ) -> None:
+        """Set the companion's animated sprite. ``speed`` < 1.0 slows
+        the GIF playback (used for low-HP "limp" pacing) by mutating
+        each frame's duration on load."""
         if sprite_path is None or not sprite_path.exists():
             return
         self._ensure_window()
         if self._image_view is None:
             return
-        img = NSImage.alloc().initWithContentsOfFile_(str(sprite_path))
+        try:
+            from tokenmon.sprite_speed import load_animated_image
+            img = load_animated_image(sprite_path, speed=speed)
+        except Exception:
+            log.exception("animated load failed; falling back")
+            img = NSImage.alloc().initWithContentsOfFile_(str(sprite_path))
         if img is None:
             log.warning("could not load sprite %s into overlay", sprite_path)
             return
