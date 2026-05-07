@@ -12,17 +12,11 @@ import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-import objc
 import rumps
-from AppKit import (
-    NSEventMaskLeftMouseUp,
-    NSEventMaskRightMouseUp,
-    NSTimer,
-)
-from Foundation import NSObject
+from AppKit import NSTimer
 
 from tokenmon import box, config, items, items_remote, pokemon, tokendex
-from tokenmon.menubar_sprite import SpriteAnimator
+from tokenmon.menubar import icon as _icon
 from tokenmon.overlay import PokemonOverlay
 from tokenmon.popover import TokenmonPopover
 from tokenmon.storage import (
@@ -72,46 +66,6 @@ EGG = "🥚"
 EGG_DOWN = "⚠️"
 
 log = logging.getLogger("tokenmon.menubar")
-
-
-class _ButtonWireHandler(NSObject):
-    """One-shot NSTimer target that wires the status-bar button to our popover.
-    Has to fire AFTER applicationDidFinishLaunching, since rumps installs its
-    own NSMenu on the status item there. Scheduling a 0.1 s timer from
-    __init__ guarantees we run after launch finishes."""
-
-    def initWithApp_(self, app):  # noqa: N802
-        self = objc.super(_ButtonWireHandler, self).init()
-        if self is None:
-            return None
-        self._app = app
-        return self
-
-    def wire_(self, _timer):  # noqa: N802
-        try:
-            btn = self._app._statusbar_button()
-            if btn is None or self._app._popover is None:
-                return
-            try:
-                self._app._nsapp.nsstatusitem.setMenu_(None)
-            except Exception:
-                log.exception("setMenu_(None) failed")
-            # Receive both left and right mouse-up events so the popover can
-            # be shown on left-click and a fallback context menu on right.
-            try:
-                btn.cell().sendActionOn_(
-                    NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp
-                )
-            except Exception:
-                log.exception("sendActionOn_ failed")
-            btn.setTarget_(self._app._popover)
-            # IMPORTANT: the popover's buttonClicked_ must be decorated with
-            # @objc.IBAction. Without that, pyobjc's auto-bridged selector
-            # registers OK (respondsToSelector_ returns True) and performClick_
-            # works, but real mouse events don't dispatch through it.
-            btn.setAction_("buttonClicked:")
-        except Exception:
-            log.exception("button wiring failed")
 
 
 from tokenmon.ui_helpers import fmt_tokens as _fmt_tokens
@@ -223,7 +177,7 @@ class TokenmonApp(rumps.App):
         # Popover replaces the rumps dropdown. Wired after launch via a
         # short-lived NSTimer (see _ButtonWireHandler).
         self._popover = TokenmonPopover.alloc().initWithApp_(self)
-        self._button_wire_handler = _ButtonWireHandler.alloc().initWithApp_(self)
+        self._button_wire_handler = _icon._ButtonWireHandler.alloc().initWithApp_(self)
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             0.1, self._button_wire_handler, b"wire:", None, False,
         )
@@ -595,71 +549,22 @@ class TokenmonApp(rumps.App):
                     existing_keys.add(move_key)
 
     def _statusbar_button(self):
-        try:
-            return self._nsapp.nsstatusitem.button()
-        except (AttributeError, Exception):
-            return None
+        return _icon.statusbar_button(self)
 
     def _set_menubar_image(self, img) -> None:
-        btn = self._statusbar_button()
-        if btn is not None:
-            btn.setImage_(img)
+        _icon.set_menubar_image(self, img)
 
     def _update_tooltip(self) -> None:
-        btn = self._statusbar_button()
-        if btn is None:
-            return
-        try:
-            active = box.get_active_pokemon()
-            if active is not None:
-                xp = query_xp_for_pokemon(active.id)
-            else:
-                xp = query_xp_for_date(date.today(), TZ)
-        except Exception:
-            xp = 0
-        rate = pokemon.growth_rate_of(self._line_base_id)
-        level, into, needed = pokemon.level_from_xp(xp, rate)
-        name = pokemon.display_name(
-            active.nickname if active is not None else None,
-            self._pokemon_dex_id,
-        )
-        if level >= pokemon.MAX_LEVEL:
-            tooltip = f"{name} — Lv MAX • {xp:,} XP"
-        else:
-            tooltip = f"{name} — Lv {level} • {into:,}/{needed:,} XP"
-        btn.setToolTip_(tooltip)
+        _icon.update_tooltip(self)
 
     def _stop_animator(self, *, clear_image: bool = True) -> None:
-        if self._animator is not None:
-            self._animator.stop()
-            self._animator = None
-        if clear_image:
-            self._set_menubar_image(None)
+        _icon.stop_animator(self, clear_image=clear_image)
 
     def _start_animator(self) -> None:
-        # Don't blank the button while we're swapping animators — the new
-        # animator's first frame paints synchronously when its init runs, and
-        # any None state in between would cause the status-bar button to
-        # collapse to its empty width and shift the open popover.
-        self._stop_animator(clear_image=False)
-        if not self._show_pokemon or self._pokemon_sprite is None or not self._pokemon_sprite.exists():
-            self._set_menubar_image(None)
-            return
-        try:
-            anim = SpriteAnimator.alloc().initWithGifPath_setter_(
-                str(self._pokemon_sprite), self._set_menubar_image
-            )
-            self._animator = anim
-        except Exception:
-            log.exception("failed to start sprite animator")
-            self._animator = None
+        _icon.start_animator(self)
 
     def _sync_menubar_icon(self) -> None:
-        """Reconcile the title + image with the current state."""
-        if self._show_pokemon and self._pokemon_sprite is not None and self._pokemon_sprite.exists():
-            self._start_animator()
-        else:
-            self._stop_animator()
+        _icon.sync_menubar_icon(self)
 
     def _maybe_repick_for_new_day(self) -> None:
         today = date.today()
