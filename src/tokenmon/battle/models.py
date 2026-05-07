@@ -111,8 +111,16 @@ class TurnResult:
 @dataclass(frozen=True, slots=True)
 class Rewards:
     """End-of-battle payout. ``xp_per_defeat`` is per-Pokémon so the
-    UI can credit XP incrementally as opponents fall."""
+    UI can credit XP incrementally as opponents fall.
+
+    ``loss_penalty`` is the money the player loses on defeat (Pokémon-
+    style "lost $X on the way to a Pokémon Center"). It's a positive
+    integer; the reward pane converts it into a negative ``add_money``
+    delta. Default 0 keeps callers that ignore loss-state backwards
+    compatible.
+    """
 
     money: int
     xp_per_defeat: int
     item_drops: dict[str, int]
+    loss_penalty: int = 0
