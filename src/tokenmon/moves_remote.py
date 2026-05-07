@@ -65,6 +65,54 @@ def _save_to_disk() -> None:
     CACHE_PATH.write_text(json.dumps(payload, indent=2))
 
 
+def _extract_description(payload: dict) -> str:
+    """Pull a UI-friendly effect string out of the PokeAPI payload.
+
+    Preference order:
+    1. ``effect_entries`` (English) → ``short_effect`` (fallback ``effect``).
+       PokeAPI embeds ``$effect_chance`` placeholders; we substitute the
+       numeric chance from ``payload['effect_chance']`` (empty if absent).
+    2. The most recent English ``flavor_text_entries`` (newlines / form
+       feeds collapsed to spaces).
+    3. Empty string — UI hides the description line.
+
+    Cache slices written by older versions of this module won't carry
+    these fields; in that case we silently return ``""`` so existing
+    caches keep working without manual cleanup.
+    """
+    chance = payload.get("effect_chance")
+    chance_str = str(chance) if chance is not None else ""
+
+    entries = payload.get("effect_entries") or []
+    for entry in entries:
+        try:
+            lang = entry.get("language", {}).get("name")
+        except AttributeError:
+            continue
+        if lang != "en":
+            continue
+        text = entry.get("short_effect") or entry.get("effect") or ""
+        text = str(text).strip()
+        if text:
+            return text.replace("$effect_chance", chance_str)
+
+    flavors = payload.get("flavor_text_entries") or []
+    # Iterate in reverse so the newest game version wins.
+    for entry in reversed(flavors):
+        try:
+            lang = entry.get("language", {}).get("name")
+        except AttributeError:
+            continue
+        if lang != "en":
+            continue
+        text = entry.get("flavor_text") or ""
+        text = str(text).replace("\n", " ").replace("\f", " ").strip()
+        if text:
+            return text
+
+    return ""
+
+
 def _parse_move(payload: dict) -> Move | None:
     """Translate the relevant slice of a PokeAPI move payload into our
     typed ``Move``. Returns None if the payload is missing required
@@ -82,6 +130,7 @@ def _parse_move(payload: dict) -> Move | None:
         return None
     if category not in ("physical", "special", "status"):
         return None
+    description = _extract_description(payload)
     return Move(
         key=str(key),
         name=str(key).replace("-", " ").title(),
@@ -91,6 +140,7 @@ def _parse_move(payload: dict) -> Move | None:
         accuracy=int(accuracy) if accuracy is not None else None,
         pp=int(pp),
         priority=int(priority or 0),
+        description=description,
     )
 
 
@@ -118,7 +168,11 @@ def get_move_data(move_key: str, *, timeout: float = FETCH_TIMEOUT_SEC) -> Move 
     if move is None:
         log.warning("move payload malformed for %s", key)
         return None
-    # Cache only the slice we use, not the whole 30 KB payload.
+    # Cache only the slice we use, not the whole 30 KB payload. We keep
+    # the raw effect_entries / flavor_text_entries / effect_chance so
+    # ``_parse_move`` can derive the description from a cache hit too —
+    # entries written by older versions of this module simply won't have
+    # them, in which case ``_extract_description`` returns "" (safe).
     _moves[key] = {
         "name": move.key,
         "type": {"name": move.type},
@@ -127,6 +181,9 @@ def get_move_data(move_key: str, *, timeout: float = FETCH_TIMEOUT_SEC) -> Move 
         "accuracy": move.accuracy,
         "pp": move.pp,
         "priority": move.priority,
+        "effect_entries": payload.get("effect_entries") or [],
+        "flavor_text_entries": payload.get("flavor_text_entries") or [],
+        "effect_chance": payload.get("effect_chance"),
     }
     try:
         _save_to_disk()

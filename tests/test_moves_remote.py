@@ -27,8 +27,10 @@ def _reset_module_cache():
 
 
 def _fake_payload(name="tackle", type_="normal", category="physical",
-                  power=40, accuracy=100, pp=35, priority=0) -> dict:
-    return {
+                  power=40, accuracy=100, pp=35, priority=0,
+                  effect_entries=None, flavor_text_entries=None,
+                  effect_chance=None) -> dict:
+    payload = {
         "name": name,
         "type": {"name": type_},
         "damage_class": {"name": category},
@@ -37,6 +39,13 @@ def _fake_payload(name="tackle", type_="normal", category="physical",
         "pp": pp,
         "priority": priority,
     }
+    if effect_entries is not None:
+        payload["effect_entries"] = effect_entries
+    if flavor_text_entries is not None:
+        payload["flavor_text_entries"] = flavor_text_entries
+    if effect_chance is not None:
+        payload["effect_chance"] = effect_chance
+    return payload
 
 
 class _FakeResponse:
@@ -142,3 +151,116 @@ def test_unknown_category_returns_none(monkeypatch, db_path):
         ),
     )
     assert moves_remote.get_move_data("tackle") is None
+
+
+def test_description_substitutes_effect_chance(monkeypatch, db_path):
+    """``$effect_chance`` placeholders must be filled with the numeric
+    chance from the payload — otherwise the UI would literally show
+    ``may have $effect_chance% chance``."""
+    from tokenmon import moves_remote
+    payload = _fake_payload(
+        name="body-slam",
+        effect_chance=30,
+        effect_entries=[{
+            "effect": "Inflicts regular damage. May paralyze.",
+            "short_effect": "Inflicts damage; $effect_chance% chance to paralyze.",
+            "language": {"name": "en"},
+        }],
+    )
+    monkeypatch.setattr(
+        moves_remote.urllib.request, "urlopen",
+        lambda req, timeout: _FakeResponse(payload),
+    )
+    move = moves_remote.get_move_data("body-slam")
+    assert move is not None
+    assert move.description == (
+        "Inflicts damage; 30% chance to paralyze."
+    )
+
+
+def test_description_falls_back_to_flavor_text(monkeypatch, db_path):
+    """No effect entries → use the most recent English flavor text,
+    with newlines collapsed to spaces."""
+    from tokenmon import moves_remote
+    payload = _fake_payload(
+        name="tackle",
+        flavor_text_entries=[
+            {
+                "flavor_text": "Old\nflavor.",
+                "language": {"name": "en"},
+            },
+            {
+                "flavor_text": "A physical attack\nin which the user\fcharges.",
+                "language": {"name": "en"},
+            },
+            {
+                "flavor_text": "Deutsch.",
+                "language": {"name": "de"},
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        moves_remote.urllib.request, "urlopen",
+        lambda req, timeout: _FakeResponse(payload),
+    )
+    move = moves_remote.get_move_data("tackle")
+    assert move is not None
+    # Most recent English entry wins; \n + \f collapse to spaces.
+    assert move.description == "A physical attack in which the user charges."
+
+
+def test_description_empty_when_payload_lacks_text(monkeypatch, db_path):
+    """No effect entries, no flavor text → description is empty (and
+    the tooltip just hides the description line)."""
+    from tokenmon import moves_remote
+    monkeypatch.setattr(
+        moves_remote.urllib.request, "urlopen",
+        lambda req, timeout: _FakeResponse(_fake_payload()),
+    )
+    move = moves_remote.get_move_data("tackle")
+    assert move is not None
+    assert move.description == ""
+
+
+def test_description_survives_cache_round_trip(monkeypatch, db_path):
+    """Second call (cache hit) must yield the same description as the
+    first — i.e. the cached slice carries enough raw fields for
+    ``_parse_move`` to re-derive the text."""
+    from tokenmon import moves_remote
+    payload = _fake_payload(
+        effect_chance=10,
+        effect_entries=[{
+            "effect": "long form",
+            "short_effect": "Quick zap; $effect_chance% paralysis.",
+            "language": {"name": "en"},
+        }],
+    )
+    monkeypatch.setattr(
+        moves_remote.urllib.request, "urlopen",
+        lambda req, timeout: _FakeResponse(payload),
+    )
+    first = moves_remote.get_move_data("tackle")
+    second = moves_remote.get_move_data("tackle")  # cache hit
+    assert first is not None and second is not None
+    assert first.description == "Quick zap; 10% paralysis."
+    assert second.description == first.description
+
+
+def test_old_cache_without_description_fields_returns_empty(
+    monkeypatch, db_path,
+):
+    """Caches written by the pre-Bug-2 module won't have the new keys.
+    ``_parse_move`` must not blow up — it should just yield ``description=""``."""
+    from tokenmon import moves_remote
+    legacy_slice = {
+        "name": "tackle",
+        "type": {"name": "normal"},
+        "damage_class": {"name": "physical"},
+        "power": 40,
+        "accuracy": 100,
+        "pp": 35,
+        "priority": 0,
+    }
+    move = moves_remote._parse_move(legacy_slice)
+    assert move is not None
+    assert move.description == ""
