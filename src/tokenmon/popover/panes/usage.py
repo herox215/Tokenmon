@@ -231,6 +231,40 @@ class UsageController(PaneController):
         quit_btn.setAction_(b"quitApp:")
         view.addSubview_(quit_btn)
 
+        # Debug: force-spawn a trainer for testing battles. Sits in the
+        # gap between the Restart Proxy button on the left and the Quit
+        # button on the right. Force-spawn bypasses the probability +
+        # cooldown gates but still respects the pending-trainer guard,
+        # so a second click while one is queued is a no-op.
+        spawn_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin_x + 168, btn_y, 130, 24)
+        )
+        spawn_btn.setTitle_("🐛 Spawn trainer")
+        spawn_btn.setBezelStyle_(1)
+
+        def _spawn_trainer(_s):
+            try:
+                from tokenmon import trainer
+                from tokenmon.popover.widgets import PANE_TRAINER_PREVIEW
+                spawned = trainer.maybe_spawn(force=True)
+                # Navigate to the trainer preview either way — if a
+                # trainer was already pending, force returns None but we
+                # still want to show it.
+                self.popover._show_pane(PANE_TRAINER_PREVIEW)
+                if spawned is None:
+                    log.info(
+                        "trainer force-spawn skipped (already pending or "
+                        "cooldown active)"
+                    )
+            except Exception:
+                log.exception("trainer force-spawn failed")
+
+        spawn_handler = make_handler(_spawn_trainer)
+        self._handlers.append(spawn_handler)
+        spawn_btn.setTarget_(spawn_handler)
+        spawn_btn.setAction_(b"fire:")
+        view.addSubview_(spawn_btn)
+
         return view
 
     def _load_buckets(self) -> list[int]:
