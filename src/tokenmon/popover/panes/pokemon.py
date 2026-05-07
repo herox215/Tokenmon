@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import logging
 
+import objc
 from AppKit import (
+    NSBezierPath,
     NSColor,
     NSFont,
     NSImage,
     NSImageView,
     NSTextAlignmentCenter,
     NSTextField,
+    NSTimer,
     NSView,
 )
 from Foundation import NSMakeRect
@@ -42,6 +45,87 @@ from tokenmon.tokendex import _XPBarView
 from tokenmon.ui_helpers import fmt_affection as _fmt_affection
 
 log = logging.getLogger("tokenmon.popover.panes.pokemon")
+
+
+HP_ANIM_FRAMES = 24    # 24 × 0.04 s = ~1.0 s fill duration
+HP_ANIM_INTERVAL = 0.04
+
+
+class _AnimatedHPBar(NSView):
+    """HP bar that tweens from ``start_hp`` to ``end_hp`` (vs ``hp_max``)
+    over ~1 s on first display. Used by the active-Pokémon pane to
+    visualise potion heals — the user clicks "Use Potion" in the items
+    pane and is bounced here with the bar already fill-animating.
+
+    Colour follows the same green/orange/red threshold rules as
+    ``battle._HPBar`` so the visualisation is consistent across panes.
+    """
+
+    def initWithFrame_from_to_max_(  # noqa: N802
+        self, frame, start_hp, end_hp, hp_max,
+    ):
+        self = objc.super(_AnimatedHPBar, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._start = max(0, int(start_hp))
+        self._end = max(0, int(end_hp))
+        self._max = max(1, int(hp_max))
+        self._current = self._start
+        self._frame = 0
+        self._timer = None
+        return self
+
+    def viewDidMoveToWindow(self):  # noqa: N802
+        try:
+            objc.super(_AnimatedHPBar, self).viewDidMoveToWindow()
+        except Exception:
+            pass
+        if self._timer is None and self.window() is not None:
+            self._timer = (
+                NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    HP_ANIM_INTERVAL, self, b"_step:", None, True,
+                )
+            )
+
+    def _step_(self, _t):  # noqa: N802
+        self._frame += 1
+        if self._frame >= HP_ANIM_FRAMES:
+            self._current = self._end
+            if self._timer is not None:
+                try:
+                    self._timer.invalidate()
+                except Exception:
+                    pass
+                self._timer = None
+            self.setNeedsDisplay_(True)
+            return
+        t = self._frame / HP_ANIM_FRAMES
+        eased = 1.0 - (1.0 - t) ** 3
+        self._current = self._start + (self._end - self._start) * eased
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, _rect):  # noqa: N802
+        bounds = self.bounds()
+        # Track
+        NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.18).set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            bounds, 4, 4,
+        ).fill()
+        if self._current <= 0:
+            return
+        frac = max(0.0, min(1.0, self._current / self._max))
+        if frac > 0.5:
+            r, g, b = 0.36, 0.78, 0.20
+        elif frac > 0.2:
+            r, g, b = 1.00, 0.65, 0.10
+        else:
+            r, g, b = 0.95, 0.30, 0.30
+        fill_w = bounds.size.width * frac
+        fill = NSMakeRect(0, 0, fill_w, bounds.size.height)
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0).set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            fill, 4, 4,
+        ).fill()
 
 
 class PokemonController(PaneController):
@@ -203,6 +287,9 @@ class PokemonController(PaneController):
         # HP block — shows the persisted current HP vs the level's max.
         # Reuses the battle pane's coloured-by-threshold ``_HPBar`` so
         # the visualisation matches what the user sees in combat.
+        # When the popover sets ``_hp_anim_from_hp`` (e.g. just-used
+        # potion), the bar animates from that value to the actual
+        # current HP over ~1 s instead of snapping.
         try:
             from tokenmon.pokemon.stats import final_stats
             from tokenmon.popover.panes.battle import _HPBar
@@ -215,13 +302,27 @@ class PokemonController(PaneController):
             )
             hp_cur = max(0, min(hp_cur, hp_max))
             hp_y = lvl_y - 14
-            hp_bar = _HPBar.alloc().initWithFrame_current_max_(
-                NSMakeRect(bar_x, hp_y, bar_w, 8), hp_cur, hp_max,
-            )
+            anim_from = getattr(self.popover, "_hp_anim_from_hp", None)
+            anim_to = getattr(self.popover, "_hp_anim_to_hp", None)
+            if anim_from is not None and anim_to is not None:
+                # Single-shot animation — clear the hint after consuming.
+                hp_bar = _AnimatedHPBar.alloc().initWithFrame_from_to_max_(
+                    NSMakeRect(bar_x, hp_y, bar_w, 8),
+                    int(anim_from), int(anim_to), hp_max,
+                )
+                self.popover._hp_anim_from_hp = None
+                self.popover._hp_anim_to_hp = None
+                self.popover._hp_anim_max = None
+                hp_label_value = anim_to
+            else:
+                hp_bar = _HPBar.alloc().initWithFrame_current_max_(
+                    NSMakeRect(bar_x, hp_y, bar_w, 8), hp_cur, hp_max,
+                )
+                hp_label_value = hp_cur
             view.addSubview_(hp_bar)
             view.addSubview_(_label(
                 NSMakeRect(0, hp_y - 16, CONTENT_WIDTH, 14),
-                f"{hp_cur} / {hp_max} HP",
+                f"{hp_label_value} / {hp_max} HP",
                 font=NSFont.systemFontOfSize_(11),
                 color=NSColor.tertiaryLabelColor(),
                 align=NSTextAlignmentCenter,
