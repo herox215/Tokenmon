@@ -39,6 +39,7 @@ class Move:
     accuracy: int | None
     pp: int                    # Max PP — current PP tracked separately
     priority: int = 0          # Filtered out (only priority=0 in v1)
+    description: str = ""      # Short effect text from PokeAPI (UI tooltip)
 
 
 @dataclass(frozen=True, slots=True)

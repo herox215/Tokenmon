@@ -315,6 +315,24 @@ class MoveLearnController(PaneController):
             color=NSColor.secondaryLabelColor(),
             align=NSTextAlignmentCenter,
         ))
+        # Optional 3rd line: a trimmed description so the player can
+        # judge the move at a glance. Only rendered when the cache has
+        # an effect string (older cache entries / cache misses leave
+        # ``description`` empty and we fall back silently).
+        desc = (
+            (move_md.description or "").strip()
+            if move_md is not None else ""
+        )
+        if desc:
+            if len(desc) > 60:
+                desc = desc[:57].rstrip() + "..."
+            parent.addSubview_(_label(
+                NSMakeRect(x, y + 2, w, 12),
+                desc,
+                font=NSFont.systemFontOfSize_(9),
+                color=NSColor.tertiaryLabelColor(),
+                align=NSTextAlignmentCenter,
+            ))
 
     def _after_resolved(self) -> None:
         """One pending row claimed. If more are queued, re-render this

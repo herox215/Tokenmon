@@ -35,6 +35,7 @@ from tokenmon import box, learnsets_remote, moves_remote, pokemon
 from tokenmon.battle.engine import resolve_turn
 from tokenmon.battle.models import BattleStats, Move
 from tokenmon.popover._handlers import make_handler
+from tokenmon.popover.panes._move_tooltip import format_move_tooltip
 from tokenmon.popover.panes.base import PaneController
 from tokenmon.popover.widgets import (
     CONTENT_WIDTH,
@@ -376,26 +377,55 @@ class BattleController(PaneController):
                 align=NSTextAlignmentLeft,
             ))
 
-        # Move picker — 2x2 grid of buttons
+        # Move picker — 2x2 grid of buttons. Each button carries a
+        # multi-line tooltip with type / power / accuracy / PP and (when
+        # the cache has it) the move's effect text. Y-coordinates here
+        # are slightly above the original layout so we can fit a one-
+        # line description hint between the grid and the Run button
+        # without overlap.
         moves = player.moves
         btn_w = (CONTENT_WIDTH - 60) // 2
         btn_h = 30
+        pps = player.move_pps
         for i, mv in enumerate(moves[:4]):
             col = i % 2
             row = i // 2
             x = 20 + col * (btn_w + 20)
-            y = 80 - row * (btn_h + 8)
+            y = 102 - row * (btn_h + 8)
             btn = NSButton.alloc().initWithFrame_(
                 NSMakeRect(x, y, btn_w, btn_h)
             )
             label = f"{mv.name}  ({mv.type})"
             btn.setTitle_(label)
             btn.setBezelStyle_(1)
+            current_pp = pps[i] if i < len(pps) else mv.pp
+            try:
+                btn.setToolTip_(format_move_tooltip(mv, current_pp))
+            except Exception:
+                log.exception("setToolTip failed for move %s", mv.key)
             handler = self._make_move_handler(mv)
             self._handlers.append(handler)
             btn.setTarget_(handler)
             btn.setAction_(b"fire:")
             view.addSubview_(btn)
+
+        # Description hint row — sits between the 2×2 grid (bottom at
+        # y≈64) and the Run button (top at y=38). Shows the first move's
+        # description so the user has a visible answer to "what does
+        # this do?" without hovering. The full per-move text is still
+        # available via the per-button tooltip.
+        first = moves[0] if moves else None
+        hint_text = ""
+        if first is not None and (first.description or "").strip():
+            hint_text = f"{first.name}: {first.description.strip()}"
+        if hint_text:
+            view.addSubview_(_label(
+                NSMakeRect(20, 44, CONTENT_WIDTH - 40, 14),
+                hint_text,
+                font=NSFont.systemFontOfSize_(10),
+                color=NSColor.tertiaryLabelColor(),
+                align=NSTextAlignmentCenter,
+            ))
 
         # Run button
         run_btn = NSButton.alloc().initWithFrame_(

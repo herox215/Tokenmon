@@ -21,6 +21,7 @@ from AppKit import (
 )
 from Foundation import NSMakeRect
 
+from tokenmon.popover.panes._move_tooltip import format_move_tooltip
 from tokenmon.popover.widgets import CONTENT_WIDTH, _label
 
 log = logging.getLogger("tokenmon.popover.panes._move_grid")
@@ -48,22 +49,10 @@ class _MoveSlotView(NSView):
         border.stroke()
 
 
-def _make_tooltip(move, current_pp: int) -> str:
-    """Format the hover tooltip for one move. ``move`` is a Move
-    dataclass or None (cache miss; we fall back to slug-only)."""
-    if move is None:
-        return "Move data not loaded yet."
-    type_str = move.type.title()
-    cat_str = move.category.title()
-    power = move.power if move.power is not None else "—"
-    acc = f"{move.accuracy}%" if move.accuracy is not None else "Always hits"
-    pp_max = move.pp
-    return (
-        f"{move.name}\n"
-        f"Type: {type_str} · {cat_str}\n"
-        f"Power: {power} · Accuracy: {acc}\n"
-        f"PP: {current_pp}/{pp_max}"
-    )
+# The tooltip formatter lives in ``_move_tooltip`` so the battle pane
+# can share it; this thin wrapper keeps the existing import surface
+# stable for any in-tree callers/tests.
+_make_tooltip = format_move_tooltip
 
 
 def build_move_grid(
