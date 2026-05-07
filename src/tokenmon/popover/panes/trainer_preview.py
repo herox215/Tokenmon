@@ -78,6 +78,18 @@ class TrainerPreviewController(PaneController):
             log.exception("list_trainer_pokemon failed")
             team = []
 
+        # Belt-and-suspenders prefetch: maybe_spawn already kicked one
+        # off, but if the user opens the preview minutes later (e.g.
+        # via the sidebar after dismissing a notification) the in-
+        # memory cache may have been GC'd. Calling again is cheap
+        # because both move_remote and sprite caches return
+        # immediately on a hit.
+        try:
+            from tokenmon import trainer as trainer_mod
+            trainer_mod._kick_battle_asset_prefetch(trainer.id)
+        except Exception:
+            log.exception("preview-pane prefetch kick failed")
+
         # Header — trainer-class themed emoji. PokeAPI doesn't ship
         # trainer-class sprites (Nintendo IP), so we lean on emoji that
         # match the role: 🐛 Bug Catcher, 🥋 Black Belt, 🎣 Fisherman, etc.

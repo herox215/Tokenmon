@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -152,6 +153,12 @@ def maybe_spawn(
         ],
         path=path,
     )
+    # Battle init fetches PokeAPI move data for every move on every
+    # mon — synchronous on the UI thread. Kick off a daemon prefetch
+    # now so the typical "trainer notif → user clicks → preview →
+    # Fight" path lands on a warm cache and doesn't freeze the popover.
+    _kick_battle_asset_prefetch(trainer_id, path=path)
+
     return Trainer(
         id=trainer_id,
         spawned_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -159,3 +166,93 @@ def maybe_spawn(
         seed=seed, resolved=None, resolved_utc=None,
         money_reward=None, xp_reward=None,
     )
+
+
+def _prefetch_battle_assets(trainer_id: int, *, path: Path = DB_PATH) -> None:
+    """Background warm-up of the PokeAPI assets battle init will need.
+
+    Hits the move-data endpoint for every player + trainer move and
+    primes the sprite cache for every species in the matchup. All
+    fetches go through the existing disk-backed caches, so this is
+    safe to call multiple times — already-cached entries return
+    immediately.
+    """
+    try:
+        from tokenmon import moves_remote
+        from tokenmon.storage import (
+            get_pokemon_moves,
+            list_trainer_pokemon,
+            query_xp_for_pokemon,
+        )
+
+        seen_moves: set[str] = set()
+        seen_species: set[int] = set()
+
+        # Player's moves: cached row first, learnset fallback otherwise.
+        active = box.get_active_pokemon(path)
+        if active is not None:
+            seen_species.add(active.species_dex_id)
+            existing = get_pokemon_moves(active.id, path=path)
+            if existing:
+                player_keys = [m.move_key for m in existing]
+            else:
+                try:
+                    xp = query_xp_for_pokemon(active.id, path=path)
+                    growth = pokemon.growth_rate_of(active.species_dex_id)
+                    level, _, _ = pokemon.level_from_xp(xp, growth)
+                    player_keys = learnsets_remote.initial_moves(
+                        active.species_dex_id, max(1, level),
+                    )
+                except Exception:
+                    log.exception("player moves prefetch failed")
+                    player_keys = []
+            for k in player_keys:
+                if k not in seen_moves:
+                    seen_moves.add(k)
+                    try:
+                        moves_remote.get_move_data(k)
+                    except Exception:
+                        log.exception("move prefetch failed for %s", k)
+
+        # Trainer team moves + species.
+        try:
+            team_rows = list_trainer_pokemon(trainer_id, path=path)
+        except Exception:
+            log.exception("list_trainer_pokemon prefetch failed")
+            team_rows = []
+        for row in team_rows:
+            seen_species.add(row.species_dex_id)
+            for k in row.move_keys:
+                if k not in seen_moves:
+                    seen_moves.add(k)
+                    try:
+                        moves_remote.get_move_data(k)
+                    except Exception:
+                        log.exception("move prefetch failed for %s", k)
+
+        # Sprite cache — front for all species, back for the player's.
+        for dex_id in seen_species:
+            try:
+                pokemon.ensure_sprite(dex_id)
+            except Exception:
+                log.exception("front sprite prefetch failed for %d", dex_id)
+        if active is not None:
+            try:
+                pokemon.ensure_sprite(
+                    active.species_dex_id,
+                    shiny=bool(active.is_shiny), back=True,
+                )
+            except Exception:
+                log.exception("back sprite prefetch failed")
+    except Exception:
+        log.exception("battle asset prefetch hit unexpected error")
+
+
+def _kick_battle_asset_prefetch(trainer_id: int, *, path: Path = DB_PATH) -> None:
+    """Fire-and-forget the prefetch on a daemon thread."""
+    threading.Thread(
+        target=_prefetch_battle_assets,
+        args=(trainer_id,),
+        kwargs={"path": path},
+        daemon=True,
+    ).start()
