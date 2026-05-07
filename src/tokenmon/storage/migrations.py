@@ -347,6 +347,18 @@ _IV_COLUMNS: tuple[str, ...] = (
 )
 
 
+def _ensure_hp_current_column(conn: sqlite3.Connection) -> None:
+    """Add ``pokemon.hp_current`` so battle damage persists across
+    fights. NULL means "full HP" (the implicit default for any Pokémon
+    that hasn't been in a battle yet); a positive integer is the
+    actual remaining HP. We never write 0 here as a "fainted" marker —
+    callers reset to NULL after revival or assign max_hp on auto-heal.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(pokemon)")}
+    if "hp_current" not in cols:
+        conn.execute("ALTER TABLE pokemon ADD COLUMN hp_current INTEGER")
+
+
 def _ensure_iv_columns(conn: sqlite3.Connection) -> None:
     """Add the six IV columns to pokemon + encounters and backfill any rows
     that pre-date the column with a deterministic id-seeded roll. Idempotent.
@@ -440,6 +452,7 @@ def init_db(path: Path | None = None) -> None:
         _ensure_gender_shiny_columns(conn)
         _ensure_pokemon_source_column(conn)
         _ensure_iv_columns(conn)
+        _ensure_hp_current_column(conn)
         _migrate_encounter_balls_to_items(conn)
         _backfill_pokedex_seen(conn)
         _backfill_inventory(conn)

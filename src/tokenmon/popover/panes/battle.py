@@ -139,9 +139,18 @@ def _player_battle_stats(active) -> BattleStats:
         pps = [_FALLBACK_MOVE.pp]
 
     name = pokemon.display_name(active.nickname, active.species_dex_id)
+    # HP carries over between battles. ``active.hp_current is None``
+    # means a fresh / fully-healed Pokémon (use max). 0 means fainted —
+    # auto-revive to full at battle init so the user isn't soft-locked
+    # without a heal mechanic. Anything in (0, hp_max] is the actual
+    # remaining HP from the previous fight.
+    if active.hp_current is None or active.hp_current <= 0:
+        starting_hp = hp_max
+    else:
+        starting_hp = min(int(active.hp_current), hp_max)
     return BattleStats(
         species_dex_id=active.species_dex_id, level=level, types=types,
-        hp_max=hp_max, hp_current=hp_max,
+        hp_max=hp_max, hp_current=starting_hp,
         attack=atk, defense=defn, sp_attack=spa, sp_defense=spd,
         speed=spe, moves=tuple(moves), move_pps=tuple(pps), name=name,
     )

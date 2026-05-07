@@ -54,6 +54,7 @@ from tokenmon.storage import (
     mark_trainer_resolved,
     query_xp_for_pokemon,
     reset_pp_for_pokemon,
+    set_pokemon_hp,
 )
 from tokenmon.storage._db import _connect
 
@@ -269,6 +270,21 @@ class BattleRewardController(PaneController):
         except Exception:
             log.exception("post-reward XP lookup failed")
             new_xp = old_xp
+
+        # Persist the post-battle HP so damage carries over to the
+        # next fight. Fainted Pokémon (hp_current == 0) auto-revive at
+        # the next battle init — that's the soft-lock guard until we
+        # add a real heal mechanic.
+        if not already_resolved:
+            try:
+                final_player = session.get("player_state")
+                if final_player is not None:
+                    set_pokemon_hp(
+                        player_id,
+                        int(getattr(final_player, "hp_current", 0)),
+                    )
+            except Exception:
+                log.exception("post-battle HP persist failed")
 
             # Reset PP to max for the player's Pokémon (per plan: PP
             # regenerates fully outside battles).

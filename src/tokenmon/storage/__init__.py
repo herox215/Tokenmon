@@ -44,6 +44,7 @@ from .pokemon import (
     update_pokemon_species,
     update_pokemon_nickname,
     bump_affection,
+    set_pokemon_hp,
 )
 
 # Encounter
@@ -129,7 +130,7 @@ __all__ = [
     # pokemon
     "Pokemon", "insert_pokemon", "get_pokemon_for_date", "get_pokemon_by_id",
     "list_pokemon", "update_pokemon_species", "update_pokemon_nickname",
-    "bump_affection",
+    "bump_affection", "set_pokemon_hp",
     # encounter
     "Encounter", "insert_encounter", "get_pending_encounter",
     "mark_encounter_caught", "mark_encounter_ran", "update_encounter_hint",
