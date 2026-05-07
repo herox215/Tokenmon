@@ -318,7 +318,9 @@ class EncounterController(PaneController):
 
         row_h = 26
         rows_top = inv_header_y - 4
-        registry_keys = list(items.ITEMS.keys())
+        registry_keys = tuple(
+            k for k, it in items.ITEMS.items() if "throw" in it.actions
+        )
         for i, key in enumerate(registry_keys):
             item = items.ITEMS[key]
             count = int(counts.get(key, 0) or 0)
@@ -326,6 +328,10 @@ class EncounterController(PaneController):
             enabled = has_action and count > 0
 
             y = rows_top - (i + 1) * row_h
+            # Defensive: stop before we overlap the bottom button bar
+            # (btn_y=16 + btn_h=32 + 8 padding).
+            if y < (16 + 32 + 8):
+                break
             btn = NSButton.alloc().initWithFrame_(
                 NSMakeRect(16, y, CONTENT_WIDTH - 32, row_h - 2)
             )
