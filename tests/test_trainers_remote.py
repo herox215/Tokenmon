@@ -1,72 +1,38 @@
-"""Trainer-sprite slug + cache tests."""
+"""Trainer-avatar emoji-map tests."""
 from __future__ import annotations
-
-import io
-
-import pytest
 
 from tokenmon import trainers_remote
 
 
-def test_slug_lowercase_and_hyphenated():
-    assert trainers_remote._slug_for("Bug Catcher") == "bug-catcher"
-    assert trainers_remote._slug_for("Lass") == "lass"
-    assert trainers_remote._slug_for("Black Belt") == "black-belt"
+def test_known_titles_map_to_themed_emoji():
+    assert trainers_remote.emoji_for("Bug Catcher") == "🐛"
+    assert trainers_remote.emoji_for("Lass") == "👧"
+    assert trainers_remote.emoji_for("Black Belt") == "🥋"
+    assert trainers_remote.emoji_for("PokéManiac") == "🤓"
 
 
-def test_slug_strips_accents():
-    assert trainers_remote._slug_for("PokéManiac") == "pokemaniac"
-
-
-def test_slug_override_table_wins():
-    """Even if normalize would produce a different slug, an override
-    forces the canonical PokeAPI value (e.g. ``School Kid`` →
-    ``school-kid`` matches their hyphenated form)."""
-    assert trainers_remote._slug_for("Schoolkid") == "school-kid"
-
-
-def test_cache_hit_skips_network(tmp_path, monkeypatch, db_path):
-    # Pre-populate the cache.
-    monkeypatch.setattr(trainers_remote, "SPRITE_DIR", tmp_path)
-    p = tmp_path / "lass.png"
-    p.write_bytes(b"\x89PNG cached")
-    monkeypatch.setattr(
-        trainers_remote.urllib.request, "urlopen",
-        lambda *a, **kw: (_ for _ in ()).throw(OSError("network is down")),
+def test_unknown_title_returns_default():
+    assert (
+        trainers_remote.emoji_for("Bogus Class")
+        == trainers_remote.DEFAULT_EMOJI
     )
-    result = trainers_remote.ensure_trainer_sprite("Lass")
-    assert result == p
 
 
-def test_cache_miss_downloads(tmp_path, monkeypatch, db_path):
-    monkeypatch.setattr(trainers_remote, "SPRITE_DIR", tmp_path)
-
-    class _FakeResp:
-        def __init__(self):
-            self._buf = io.BytesIO(b"\x89PNG fake")
-        def read(self):
-            return self._buf.read()
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr(
-        trainers_remote.urllib.request, "urlopen",
-        lambda req, timeout: _FakeResp(),
-    )
-    result = trainers_remote.ensure_trainer_sprite("Bug Catcher")
-    assert result is not None
-    assert result.name == "bug-catcher.png"
-    assert result.read_bytes() == b"\x89PNG fake"
-
-
-def test_network_failure_returns_none(tmp_path, monkeypatch, db_path):
-    monkeypatch.setattr(trainers_remote, "SPRITE_DIR", tmp_path)
-    monkeypatch.setattr(
-        trainers_remote.urllib.request, "urlopen",
-        lambda *a, **kw: (_ for _ in ()).throw(OSError("404")),
-    )
+def test_ensure_trainer_sprite_returns_none():
+    """Compatibility shim — never returns a Path because PokeAPI doesn't
+    ship trainer-class sprites. Callers must fall back to emoji_for."""
+    assert trainers_remote.ensure_trainer_sprite("Bug Catcher") is None
     assert trainers_remote.ensure_trainer_sprite("Lass") is None
-    # No partial file lingering on disk.
-    assert not (tmp_path / "lass.png").exists()
+
+
+def test_every_pool_title_has_an_emoji():
+    """Defensive: nothing in the live trainer-name pool should fall
+    through to the generic default. New titles added to ``battle.names``
+    should also land in the emoji map."""
+    from tokenmon.battle.names import TITLES
+    fallbacks = [
+        t for t in TITLES if t not in trainers_remote._TITLE_EMOJI
+    ]
+    assert fallbacks == [], (
+        f"these titles need a themed emoji: {fallbacks}"
+    )

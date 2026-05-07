@@ -78,39 +78,22 @@ class TrainerPreviewController(PaneController):
             log.exception("list_trainer_pokemon failed")
             team = []
 
-        # Header — trainer-class sprite if PokeAPI has one, fallback
-        # to a 👤 emoji.
-        sprite_path = None
+        # Header — trainer-class themed emoji. PokeAPI doesn't ship
+        # trainer-class sprites (Nintendo IP), so we lean on emoji that
+        # match the role: 🐛 Bug Catcher, 🥋 Black Belt, 🎣 Fisherman, etc.
         try:
             from tokenmon import trainers_remote
-            sprite_path = trainers_remote.ensure_trainer_sprite(trainer.title)
+            avatar = trainers_remote.emoji_for(trainer.title)
         except Exception:
-            log.exception("trainer sprite lookup failed")
+            log.exception("trainer emoji lookup failed")
+            avatar = "👤"
 
-        sprite_size = 96
-        sprite_y = POPOVER_HEIGHT - 100
-        sprite_x = (CONTENT_WIDTH - sprite_size) // 2
-        if sprite_path is not None and sprite_path.exists():
-            iv = NSImageView.alloc().initWithFrame_(
-                NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size)
-            )
-            iv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
-            iv.setWantsLayer_(True)
-            layer = iv.layer()
-            if layer is not None:
-                layer.setMagnificationFilter_("nearest")
-                layer.setMinificationFilter_("nearest")
-            img = NSImage.alloc().initWithContentsOfFile_(str(sprite_path))
-            if img is not None:
-                iv.setImage_(img)
-                view.addSubview_(iv)
-        else:
-            view.addSubview_(_label(
-                NSMakeRect(20, POPOVER_HEIGHT - 80, CONTENT_WIDTH - 40, 36),
-                "👤",
-                font=NSFont.systemFontOfSize_(40),
-                align=NSTextAlignmentCenter,
-            ))
+        view.addSubview_(_label(
+            NSMakeRect(20, POPOVER_HEIGHT - 90, CONTENT_WIDTH - 40, 60),
+            avatar,
+            font=NSFont.systemFontOfSize_(48),
+            align=NSTextAlignmentCenter,
+        ))
         view.addSubview_(_label(
             NSMakeRect(20, POPOVER_HEIGHT - 120, CONTENT_WIDTH - 40, 22),
             f"{trainer.title} {trainer.name}",
