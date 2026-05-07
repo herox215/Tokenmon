@@ -94,6 +94,64 @@ def test_item_row_handler_dispatch_skips_when_pending_id_mismatches(
     assert pop._encounter_bag_open is False
 
 
+def test_encounter_bag_only_shows_throwable_items(db_path, monkeypatch):
+    """Bag-open inventory must filter the registry down to throw-capable
+    items (Poke balls). Stones/Potions have other actions and should be
+    omitted so the rows can't overflow into the bottom button bar.
+    """
+    from AppKit import NSButton
+
+    from tokenmon import items
+    from tokenmon.popover.panes import encounter as enc_pane
+    from tokenmon.popover.panes.encounter import EncounterController
+
+    class _Pending:
+        id = 42
+        species_dex_id = 25
+        level = 5
+        last_hint = None
+
+    monkeypatch.setattr(enc_pane, "get_pending_encounter", lambda: _Pending())
+    monkeypatch.setattr(
+        enc_pane, "query_item_counts",
+        lambda: {key: 5 for key in items.ITEMS},
+    )
+
+    pop = _FakePopover(bag_open=True)
+    ctrl = EncounterController(pop)
+    view = ctrl.build_view()
+    assert view is not None
+
+    titles: list[str] = []
+
+    def _collect(v):
+        for sub in v.subviews():
+            if isinstance(sub, NSButton):
+                t = str(sub.title())
+                if t:
+                    titles.append(t)
+            _collect(sub)
+
+    _collect(view)
+
+    # No stones, no potions in the inventory rows.
+    assert all("Stone" not in t for t in titles), titles
+    assert all("Potion" not in t for t in titles), titles
+
+    # Each ball display name appears as one inventory row (plus possible
+    # button-bar rows like "← Back" / "Run away" — those don't conflict).
+    ball_titles = [
+        t for t in titles
+        if any(
+            name in t
+            for name in ("Poké Ball", "Great Ball", "Ultra Ball", "Master Ball")
+        )
+    ]
+    assert len(ball_titles) == 4, ball_titles
+    for name in ("Poké Ball", "Great Ball", "Ultra Ball", "Master Ball"):
+        assert any(name in t for t in ball_titles), (name, ball_titles)
+
+
 def test_item_row_handler_dispatch_throw_triggers_catch_animation(
     db_path, monkeypatch,
 ):
