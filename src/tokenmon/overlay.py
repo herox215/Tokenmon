@@ -235,8 +235,8 @@ class _TurnHandler(NSObject):
     back sprites drawing their character smaller within the canvas.
     """
 
-    def initWithOverlay_target_xEnd_yEnd_xStart_yStart_(  # noqa: N802
-        self, overlay, target_path, x_end, y_end, x_start, y_start,
+    def initWithOverlay_target_xEnd_yEnd_xStart_yStart_speed_(  # noqa: N802
+        self, overlay, target_path, x_end, y_end, x_start, y_start, speed,
     ):
         self = objc.super(_TurnHandler, self).init()
         if self is None:
@@ -247,6 +247,7 @@ class _TurnHandler(NSObject):
         self._y_end = float(y_end)
         self._x_start = float(x_start)
         self._y_start = float(y_start)
+        self._speed = float(speed)
         self._frame = 0
         return self
 
@@ -270,7 +271,11 @@ class _TurnHandler(NSObject):
                 )
             elif self._frame == TURN_HALF:
                 # Edge-on swap: new sprite emerges at the target zoom.
-                self._overlay.update_sprite(self._target_path)
+                # Speed parameter is honoured here so the post-turn
+                # animation pacing matches the active Pokémon's HP.
+                self._overlay.update_sprite(
+                    self._target_path, speed=self._speed,
+                )
                 self._overlay._apply_scale(0.0, self._y_end)
             elif self._frame < TURN_FRAMES:
                 t = (self._frame - TURN_HALF) / (TURN_FRAMES - TURN_HALF)
@@ -657,7 +662,8 @@ class PokemonOverlay:
 
     def set_sprite_orientation(self, *, front_path: Path,
                                back_path: Path | None,
-                               mirrored: bool = False) -> None:
+                               mirrored: bool = False,
+                               speed: float = 1.0) -> None:
         """Swap between front and back sprite for the same species and
         optionally horizontally mirror the rendered sprite.
 
@@ -680,7 +686,7 @@ class PokemonOverlay:
         if not target.exists():
             log.warning("set_sprite_orientation: missing sprite %s", target)
             return
-        self.update_sprite(target)
+        self.update_sprite(target, speed=speed)
         self.set_sprite_mirror(mirrored)
 
     def set_sprite_mirror(self, mirrored: bool) -> None:
@@ -719,7 +725,8 @@ class PokemonOverlay:
     def animate_sprite_turn(self, *, front_path: Path,
                             back_path: Path | None,
                             mirrored: bool = False,
-                            zoom: float = 1.0) -> None:
+                            zoom: float = 1.0,
+                            speed: float = 1.0) -> None:
         """Animated front↔back swap that reads as a 2D turn: the sprite
         squishes horizontally to zero width, the image swaps at the
         edge-on point, and the new sprite expands back out (mirrored
@@ -745,8 +752,8 @@ class PokemonOverlay:
         x_end = (-1.0 if mirrored else 1.0) * float(zoom)
         y_end = float(zoom)
         x_start, y_start = self._current_scale
-        handler = _TurnHandler.alloc().initWithOverlay_target_xEnd_yEnd_xStart_yStart_(
-            self, target, x_end, y_end, x_start, y_start,
+        handler = _TurnHandler.alloc().initWithOverlay_target_xEnd_yEnd_xStart_yStart_speed_(
+            self, target, x_end, y_end, x_start, y_start, float(speed),
         )
         self._turn_handler = handler
         handler.start()

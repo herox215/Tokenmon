@@ -935,14 +935,27 @@ class TokenmonApp(rumps.App):
 
     def _refresh_companion_sprite_speed(self) -> None:
         """Reload the companion sprite with the current HP-derived
-        playback speed. Cheap — re-uses the on-disk sprite cache."""
+        playback speed. Cheap — re-uses the on-disk sprite cache.
+
+        Picks front- vs back-sprite path according to ``_last_orientation``
+        so an HP refresh post-battle (engaged → back) doesn't accidentally
+        flash the front sprite back into place.
+        """
         if not self._companion_mode:
             return
         if self._pokemon_sprite is None:
             return
         try:
+            target = self._pokemon_sprite
+            if self._last_orientation == "back":
+                back = pokemon.ensure_sprite(
+                    self._pokemon_dex_id,
+                    shiny=self._pokemon_is_shiny, back=True,
+                )
+                if back is not None:
+                    target = back
             self._overlay.update_sprite(
-                self._pokemon_sprite,
+                target,
                 speed=self._companion_sprite_speed(),
             )
         except Exception:
@@ -1383,6 +1396,7 @@ class TokenmonApp(rumps.App):
             self._overlay.animate_sprite_turn(
                 front_path=front, back_path=back,
                 mirrored=mirrored, zoom=zoom,
+                speed=self._companion_sprite_speed(),
             )
             self._last_orientation = want
         except Exception:
