@@ -2,27 +2,35 @@
 
 Reads ``popover._battle_session["resolved_status"]`` (set by the battle
 controller's ``_end_battle``) and pays out money / XP / item-drops in
-one DB transaction. Renders a "Won!" or "You blacked out…" headline
-plus the rewards earned, and offers a Continue button back to the
-active-Pokémon pane.
+one DB transaction. Renders the rewards plus an XP bar that animates
+from the player Pokémon's pre-battle progress to the post-battle one,
+flagging level-ups along the way.
 
 Atomic-rewards rule (per plan reviewer): money + xp + items all share
 one ``_connect`` transaction so a crash mid-payout can't partial-credit.
+XP credit happens via a synthetic ``requests`` row tagged with
+``model='<battle>'`` — the existing XP-tracking machinery (sums
+output_tokens by trained_pokemon_id) picks it up without a new schema.
 """
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from AppKit import (
+    NSBezierPath,
     NSButton,
     NSColor,
     NSFont,
     NSTextAlignmentCenter,
+    NSTimer,
     NSView,
 )
-from Foundation import NSMakeRect
+from Foundation import NSMakeRect, NSObject
 
-from tokenmon import items as items_registry
+import objc
+
+from tokenmon import items as items_registry, pokemon
 from tokenmon.battle.models import TrainerMon
 from tokenmon.battle.rewards import compute_rewards
 from tokenmon.battle.team_gen import DIFFICULTY_PROFILES
@@ -41,11 +49,96 @@ from tokenmon.storage import (
     get_trainer,
     list_trainer_pokemon,
     mark_trainer_resolved,
+    query_xp_for_pokemon,
     reset_pp_for_pokemon,
 )
 from tokenmon.storage._db import _connect
 
 log = logging.getLogger("tokenmon.popover.panes.battle_reward")
+
+
+# ---- Animated XP bar -----------------------------------------------------
+
+XP_BAR_FRAMES = 36          # 36 × 0.04 s = ~1.4 s fill duration
+XP_BAR_INTERVAL = 0.04
+
+
+class _AnimatedXPBar(NSView):
+    """XP bar that tweens from a start-progress to an end-progress over
+    ~1.4 s on first display. Used to visualise battle XP rewards in the
+    reward pane.
+
+    Progress values are 0..1 fractions WITHIN the new level. If the
+    Pokémon levelled up during the reward, the bar starts at 0 instead
+    of the pre-battle progress so the visual reads as "full level
+    gained, now {n}% of the way to the next" — a tradeoff vs. the
+    multi-step animation of "fill to 100, reset, fill to remainder",
+    which is jankier in 1.4 s.
+    """
+
+    def initWithFrame_start_end_(self, frame, start_progress, end_progress):  # noqa: N802
+        self = objc.super(_AnimatedXPBar, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._start = max(0.0, min(1.0, float(start_progress)))
+        self._end = max(0.0, min(1.0, float(end_progress)))
+        self._current = self._start
+        self._frame = 0
+        self._timer = None
+        return self
+
+    def viewDidMoveToWindow(self):  # noqa: N802
+        # Start the animation once the view is attached (after pane
+        # build). objc.super(...) raises if no super; we'll call it.
+        try:
+            objc.super(_AnimatedXPBar, self).viewDidMoveToWindow()
+        except Exception:
+            pass
+        if self._timer is None and self.window() is not None:
+            self._timer = (
+                NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    XP_BAR_INTERVAL, self, b"_step:", None, True,
+                )
+            )
+
+    def _step_(self, _t):  # noqa: N802
+        self._frame += 1
+        if self._frame >= XP_BAR_FRAMES:
+            self._current = self._end
+            if self._timer is not None:
+                try:
+                    self._timer.invalidate()
+                except Exception:
+                    pass
+                self._timer = None
+            self.setNeedsDisplay_(True)
+            return
+        t = self._frame / XP_BAR_FRAMES
+        # Ease-out cubic feels best for "fill" animations.
+        eased = 1.0 - (1.0 - t) ** 3
+        self._current = self._start + (self._end - self._start) * eased
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, _rect):  # noqa: N802
+        bounds = self.bounds()
+        # Track
+        NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.18).set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            bounds, 5, 5,
+        ).fill()
+        if self._current <= 0.0:
+            return
+        # Fill: blue → cyan gradient feel via a single solid
+        # blue-violet color (NSColor's gradient API is heavier than the
+        # visual return justifies here).
+        fill_w = bounds.size.width * self._current
+        fill = NSMakeRect(0, 0, fill_w, bounds.size.height)
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            0.36, 0.62, 1.0, 1.0,
+        ).set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            fill, 5, 5,
+        ).fill()
 
 
 def _award_rewards(
@@ -56,32 +149,40 @@ def _award_rewards(
     money: int,
     xp_per_defeat: int,
     item_drops: dict[str, int],
+    player_pokemon_id: int,
     path=DB_PATH,
 ) -> tuple[int, int, dict[str, int]]:
-    """Atomically apply the rewards: money + item-drops queued + trainer
+    """Atomically apply the rewards: money + XP credit + trainer
     resolved. XP is independent of the win-state — partial-defeat XP
     still flows. Returns the (actual_money, actual_xp_total, items)
-    tuple credited."""
+    tuple credited.
+
+    XP credit goes through a synthetic ``requests`` row tagged with
+    ``model='<battle>'`` so the existing XP-tracking aggregation
+    (``query_xp_for_pokemon`` sums ``output_tokens`` per
+    trained_pokemon_id) picks it up without a new schema.
+    """
     money_credit = money if status == "won" else 0
     xp_credit = xp_per_defeat * defeated_count
     items_credit = item_drops if status == "won" else {}
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with _connect(path) as conn:
         if money_credit > 0:
             add_money(money_credit, conn=conn)
-        for key, count in items_credit.items():
-            for _ in range(int(count)):
-                # add_to_pending currently doesn't take a conn — accept
-                # the small atomicity gap. If items become critical to
-                # the rewards path, plumb conn through items.py later.
-                pass
+        if xp_credit > 0:
+            conn.execute(
+                "INSERT INTO requests (ts_utc, model, output_tokens, "
+                "trained_pokemon_id) VALUES (?, '<battle>', ?, ?)",
+                (ts, int(xp_credit), int(player_pokemon_id)),
+            )
         conn.execute(
             """
             UPDATE trainers
-            SET resolved = ?, resolved_utc = datetime('now'),
+            SET resolved = ?, resolved_utc = ?,
                 money_reward = ?, xp_reward = ?
             WHERE id = ?
             """,
-            (status, money_credit, xp_credit, int(trainer_id)),
+            (status, ts, money_credit, xp_credit, int(trainer_id)),
         )
     # Items go through the existing pending_drops queue — separate writes.
     for key, count in items_credit.items():
@@ -140,6 +241,14 @@ class BattleRewardController(PaneController):
         # if already resolved, skip the credits and just show the
         # summary.
         already_resolved = trainer is not None and trainer.resolved is not None
+        player_id = session["player_pokemon_id"]
+        # Capture pre-credit XP so the bar can animate from it. After
+        # awarding, query again for the post-credit value.
+        try:
+            old_xp = query_xp_for_pokemon(player_id)
+        except Exception:
+            log.exception("pre-reward XP lookup failed")
+            old_xp = 0
         if not already_resolved and rewards is not None:
             try:
                 _award_rewards(
@@ -148,9 +257,15 @@ class BattleRewardController(PaneController):
                     money=rewards.money,
                     xp_per_defeat=rewards.xp_per_defeat,
                     item_drops=rewards.item_drops,
+                    player_pokemon_id=player_id,
                 )
             except Exception:
                 log.exception("reward award failed")
+        try:
+            new_xp = query_xp_for_pokemon(player_id)
+        except Exception:
+            log.exception("post-reward XP lookup failed")
+            new_xp = old_xp
 
             # Reset PP to max for the player's Pokémon (per plan: PP
             # regenerates fully outside battles).
@@ -190,7 +305,7 @@ class BattleRewardController(PaneController):
 
         # Stats lines
         money = rewards.money if (rewards and status == "won") else 0
-        xp_total = rewards.xp_per_defeat * defeated if rewards else 0
+        xp_total = new_xp - old_xp
         lines = [
             f"Pokémon defeated: {defeated}",
             f"Money: +${money}",
@@ -203,6 +318,64 @@ class BattleRewardController(PaneController):
                 font=NSFont.systemFontOfSize_(13),
                 align=NSTextAlignmentCenter,
             ))
+
+        # Animated XP bar — shows the active Pokémon's level + how the
+        # XP gained advances the bar. Tweens from old_progress to
+        # new_progress over ~1.4 s. Level-up flash if the level changed.
+        try:
+            from tokenmon.storage import get_pokemon_by_id
+            mon_row = get_pokemon_by_id(player_id)
+            growth = pokemon.growth_rate_of(mon_row.species_dex_id)
+            old_level, old_into, old_needed = pokemon.level_from_xp(
+                old_xp, growth,
+            )
+            new_level, new_into, new_needed = pokemon.level_from_xp(
+                new_xp, growth,
+            )
+            level_changed = new_level > old_level
+            if level_changed:
+                start_progress = 0.0
+            else:
+                start_progress = (
+                    old_into / max(1, old_needed) if old_needed > 0 else 0.0
+                )
+            end_progress = (
+                new_into / max(1, new_needed) if new_needed > 0 else 1.0
+            )
+            mon_name = pokemon.display_name(
+                mon_row.nickname, mon_row.species_dex_id,
+            )
+
+            bar_y = POPOVER_HEIGHT - 240
+            view.addSubview_(_label(
+                NSMakeRect(40, bar_y + 22, CONTENT_WIDTH - 80, 16),
+                (
+                    f"⭐ {mon_name} leveled up to L{new_level}!"
+                    if level_changed
+                    else f"{mon_name} — Lv {new_level}"
+                ),
+                font=NSFont.boldSystemFontOfSize_(12),
+                color=(
+                    NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                        1.0, 0.85, 0.0, 1.0,
+                    ) if level_changed else NSColor.labelColor()
+                ),
+                align=NSTextAlignmentCenter,
+            ))
+            bar = _AnimatedXPBar.alloc().initWithFrame_start_end_(
+                NSMakeRect(40, bar_y, CONTENT_WIDTH - 80, 14),
+                start_progress, end_progress,
+            )
+            view.addSubview_(bar)
+            view.addSubview_(_label(
+                NSMakeRect(40, bar_y - 18, CONTENT_WIDTH - 80, 14),
+                f"{new_into:,} / {new_needed:,} XP",
+                font=NSFont.systemFontOfSize_(10),
+                color=NSColor.tertiaryLabelColor(),
+                align=NSTextAlignmentCenter,
+            ))
+        except Exception:
+            log.exception("XP bar render failed")
 
         # Continue button
         cont = NSButton.alloc().initWithFrame_(
