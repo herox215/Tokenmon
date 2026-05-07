@@ -167,6 +167,7 @@ class TokenmonPopover(NSObject):
         self._box_selected_id: int | None = None
         self._pokedex_selected_dex: int | None = None
         self._stats_mode: str = "stats"
+        self._items_pocket: str = "balls"
         self._editing_nickname: bool = False
         self._encounter_bag_open: bool = False
         self._pending_reveal_pokemon: dict | None = None

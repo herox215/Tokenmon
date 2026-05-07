@@ -15,13 +15,14 @@ class _FakeApp:
 
 
 class _FakePopover:
-    def __init__(self, claim_active: bool = False):
+    def __init__(self, claim_active: bool = False, items_pocket: str = "balls"):
         self._app = _FakeApp()
         self._claim_active = claim_active
         self._claim_handler = None
         self._claim_payload: dict[str, int] = {}
         self._claim_views: list = []
         self._show_pane_calls: list[int] = []
+        self._items_pocket: str = items_pocket
 
     def _show_pane(self, idx: int) -> None:
         self._show_pane_calls.append(idx)
@@ -138,3 +139,42 @@ def test_items_pane_money_falls_back_to_zero_on_error(db_path, monkeypatch):
     # Must not propagate; fallback renders "$ 0".
     view = ctrl.build_view()
     assert _find_label_with_substring(view, "$ 0")
+
+
+def test_items_list_renders_pocket_tabs(db_path):
+    """The list view contains an NSSegmentedControl with 4 segments —
+    one per bag pocket."""
+    from AppKit import NSSegmentedControl
+    from tokenmon.popover.panes.items import ItemsController
+
+    pop = _FakePopover(claim_active=False, items_pocket="balls")
+    ctrl = ItemsController(pop)
+    view = ctrl.build_view()
+
+    def _walk(v):
+        yield v
+        for sub in v.subviews():
+            yield from _walk(sub)
+
+    segs = [v for v in _walk(view) if isinstance(v, NSSegmentedControl)]
+    assert len(segs) == 1
+    assert segs[0].segmentCount() == 4
+
+
+def test_items_list_empty_pocket_keeps_tabs_visible(db_path):
+    """An empty pocket renders the empty-state hint but keeps the tab
+    switcher rendered so the user can move on."""
+    from AppKit import NSSegmentedControl
+    from tokenmon.popover.panes.items import ItemsController
+
+    pop = _FakePopover(claim_active=False, items_pocket="evolution")
+    ctrl = ItemsController(pop)
+    view = ctrl.build_view()
+
+    def _walk(v):
+        yield v
+        for sub in v.subviews():
+            yield from _walk(sub)
+
+    segs = [v for v in _walk(view) if isinstance(v, NSSegmentedControl)]
+    assert len(segs) == 1
