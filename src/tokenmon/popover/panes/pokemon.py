@@ -199,7 +199,39 @@ class PokemonController(PaneController):
 
         bar_w = 260
         bar_x = (CONTENT_WIDTH - bar_w) // 2
-        bar_y = lvl_y - 14
+
+        # HP block — shows the persisted current HP vs the level's max.
+        # Reuses the battle pane's coloured-by-threshold ``_HPBar`` so
+        # the visualisation matches what the user sees in combat.
+        try:
+            from tokenmon.pokemon.stats import final_stats
+            from tokenmon.popover.panes.battle import _HPBar
+            hp_max = final_stats(
+                species, row.ivs, max(1, level), row.nature,
+            )[0]
+            hp_cur = (
+                int(row.hp_current) if row.hp_current is not None
+                else hp_max
+            )
+            hp_cur = max(0, min(hp_cur, hp_max))
+            hp_y = lvl_y - 14
+            hp_bar = _HPBar.alloc().initWithFrame_current_max_(
+                NSMakeRect(bar_x, hp_y, bar_w, 8), hp_cur, hp_max,
+            )
+            view.addSubview_(hp_bar)
+            view.addSubview_(_label(
+                NSMakeRect(0, hp_y - 16, CONTENT_WIDTH, 14),
+                f"{hp_cur} / {hp_max} HP",
+                font=NSFont.systemFontOfSize_(11),
+                color=NSColor.tertiaryLabelColor(),
+                align=NSTextAlignmentCenter,
+            ))
+            after_hp_y = hp_y - 16 - 12  # text + small gap before XP
+        except Exception:
+            log.exception("HP block render failed")
+            after_hp_y = lvl_y - 14
+
+        bar_y = after_hp_y - 8
         progress = into / needed if needed > 0 else (
             1.0 if level >= pokemon.MAX_LEVEL else 0.0
         )
