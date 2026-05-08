@@ -110,12 +110,13 @@ class _FakeSilhouette:
 
 
 class _FakePopover:
-    def __init__(self):
+    def __init__(self, battle_session=None):
         self._animated_image_views: list = []
         self._begin_reveal_calls = 0
         self._show_pane_calls: list[int] = []
         self._encounter_bag_open = False
         self._catch_anim_handler = None
+        self._battle_session = battle_session
 
     def _begin_catch_reveal(self):
         self._begin_reveal_calls += 1
@@ -148,11 +149,26 @@ def test_step_done_caught_triggers_reveal(db_path):
     assert pop._begin_reveal_calls == 1
 
 
-def test_step_done_failure_re_enters_bag_open(db_path):
+def test_step_done_failure_routes_to_battle_pane(db_path):
+    """Phase 5: failure path routes to PANE_BATTLE so the wild battle
+    resumes. The legacy `_encounter_bag_open` write is gone."""
     from tokenmon.popover.panes.catch_animation import CatchAnimationController
-    pop = _FakePopover()
+    from tokenmon.popover.widgets import PANE_BATTLE
+    pop = _FakePopover(battle_session={"kind": "wild"})
     payload = {"caught": False}
     ctrl = CatchAnimationController(pop, payload)
     ctrl.step("done", payload)
-    assert pop._encounter_bag_open is True
-    assert pop._show_pane_calls != []
+    assert PANE_BATTLE in pop._show_pane_calls
+    assert pop._encounter_bag_open is False
+
+
+def test_catch_anim_end_routes_to_battle_pane_when_session_active(db_path):
+    """The non-caught branch routes back to PANE_BATTLE so the in-fight
+    state resumes."""
+    from tokenmon.popover.panes.catch_animation import CatchAnimationController
+    from tokenmon.popover.widgets import PANE_BATTLE
+    pop = _FakePopover(battle_session={"kind": "wild"})
+    payload = {"caught": False}
+    ctrl = CatchAnimationController(pop, payload)
+    ctrl.end(payload)
+    assert PANE_BATTLE in pop._show_pane_calls

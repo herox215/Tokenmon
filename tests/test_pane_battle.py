@@ -192,3 +192,312 @@ def test_move_decrement_floors_at_zero(db_path, monkeypatch):
     rows = {r.slot: r.current_pp
             for r in storage.get_pokemon_moves(pid, path=db_path)}
     assert rows[0] == 0
+
+
+# ---- Phase 5: wild battles ---------------------------------------------
+
+
+def _build_wild_session(player_state, opp_state, *, player_pokemon_id, encounter_id):
+    return {
+        "kind": "wild",
+        "encounter_id": encounter_id,
+        "player_pokemon_id": player_pokemon_id,
+        "player_state": player_state,
+        "opp_state": opp_state,
+        "log": [],
+        "rng": random.Random(0),
+    }
+
+
+def test_wild_battle_init_builds_one_mon_session(db_path, monkeypatch):
+    from tokenmon import encounter as enc_mod
+    from tokenmon.popover.panes import battle as battle_mod
+    from tokenmon.popover.panes.battle import _init_wild_battle_session
+
+    pid = _seed_pokemon_with_moves(db_path)
+    enc = enc_mod.maybe_spawn(force=True, path=db_path)
+    assert enc is not None
+
+    # Stub _player_battle_stats / _opp_battle_stats to skip remote fetch.
+    player, opp = _make_states()
+    monkeypatch.setattr(battle_mod, "_player_battle_stats", lambda _a: player)
+    monkeypatch.setattr(battle_mod, "_wild_battle_stats", lambda _e: opp)
+
+    pop = _FakePopover()
+
+    class _Active:
+        id = pid
+        species_dex_id = 1
+        nature = "Hardy"
+        is_shiny = False
+        ivs = (0, 0, 0, 0, 0, 0)
+        hp_current = None
+
+    session = _init_wild_battle_session(pop, enc, _Active())
+    assert session["kind"] == "wild"
+    assert session["encounter_id"] == enc.id
+    assert "opp_state" in session
+    assert "opp_states" not in session
+
+
+def test_wild_battle_action_bar_has_bag_button(db_path, monkeypatch):
+    """A wild battle's action bar exposes a Bag button alongside Run."""
+    from AppKit import NSButton
+    from tokenmon import encounter as enc_mod
+    from tokenmon.popover.panes import battle as battle_mod
+    from tokenmon.popover.panes.battle import BattleController
+
+    pid = _seed_pokemon_with_moves(db_path)
+    enc = enc_mod.maybe_spawn(force=True, path=db_path)
+    player, opp = _make_states()
+
+    pop = _FakePopover()
+    pop._battle_session = _build_wild_session(
+        player, opp, player_pokemon_id=pid, encounter_id=enc.id,
+    )
+
+    # Stub trainer lookup to return None — wild path.
+    monkeypatch.setattr(battle_mod, "get_pending_trainer", lambda: None)
+    monkeypatch.setattr(
+        battle_mod, "get_pending_encounter",
+        lambda: enc,
+    )
+    # Active mon for build_view's box.get_active_pokemon call.
+    from tokenmon.storage import get_pokemon_by_id
+    active_row = get_pokemon_by_id(pid, path=db_path)
+    monkeypatch.setattr(battle_mod.box, "get_active_pokemon", lambda *_a, **_k: active_row)
+
+    monkeypatch.setattr(battle_mod, "_player_battle_stats", lambda _a: player)
+    monkeypatch.setattr(battle_mod, "_wild_battle_stats", lambda _e: opp)
+
+    ctrl = BattleController(pop)
+    view = ctrl.build_view()
+
+    # Walk the view tree and collect button titles.
+    titles: list[str] = []
+
+    def _collect(v):
+        for sub in v.subviews():
+            if isinstance(sub, NSButton):
+                t = str(sub.title())
+                if t:
+                    titles.append(t)
+            _collect(sub)
+
+    _collect(view)
+    assert any("Bag" in t for t in titles), titles
+    # And no trainer-style "forfeit — counts as a loss" Run text.
+    assert all("forfeit" not in t for t in titles), titles
+
+
+def test_wild_battle_run_does_not_resolve_loss(db_path, monkeypatch):
+    """Wild Run → encounter.run_away + back to Pokemon, no loss/blackout."""
+    from tokenmon import encounter as enc_mod
+    from tokenmon.popover.panes import battle as battle_mod
+    from tokenmon.popover.panes.battle import BattleController
+    from tokenmon.popover.widgets import PANE_POKEMON
+
+    pid = _seed_pokemon_with_moves(db_path)
+    enc = enc_mod.maybe_spawn(force=True, path=db_path)
+    player, opp = _make_states()
+    pop = _FakePopover()
+    pop._battle_session = _build_wild_session(
+        player, opp, player_pokemon_id=pid, encounter_id=enc.id,
+    )
+
+    called = {"ran": False}
+    monkeypatch.setattr(
+        battle_mod.encounter, "run_away",
+        lambda eid, **kw: called.__setitem__("ran", True),
+    )
+
+    ctrl = BattleController(pop)
+    ctrl._wild_run_away()
+    assert called["ran"] is True
+    assert PANE_POKEMON in pop._show_pane_calls
+    # Battle session is cleared so the next sidebar click doesn't resume.
+    assert pop._battle_session is None
+
+
+def test_throw_ball_in_battle_persists_hp_pre_throw(db_path, monkeypatch):
+    """Before delegating to _begin_catch_animation, _throw_ball_in_battle
+    must persist the in-memory opp HP into encounters.hp_current so the
+    catch math reads the right value."""
+    from tokenmon import encounter as enc_mod, storage
+    from tokenmon.popover.panes import battle as battle_mod
+    from tokenmon.popover.panes.battle import BattleController
+
+    pid = _seed_pokemon_with_moves(db_path)
+    enc = enc_mod.maybe_spawn(force=True, path=db_path)
+    player, opp = _make_states()
+    # Damaged opp.
+    from dataclasses import replace as dc_replace
+    opp = dc_replace(opp, hp_current=4)
+
+    pop = _FakePopover()
+    pop._battle_session = _build_wild_session(
+        player, opp, player_pokemon_id=pid, encounter_id=enc.id,
+    )
+
+    catch_calls: list[dict] = []
+
+    def _spy_begin(**kw):
+        catch_calls.append(kw)
+
+    pop._begin_catch_animation = _spy_begin
+
+    monkeypatch.setattr(
+        battle_mod.encounter, "use_item",
+        lambda eid, key: {"caught": False, "shakes": 0, "hint": None},
+    )
+
+    ctrl = BattleController(pop)
+    ctrl._throw_ball_in_battle("pokeball")
+
+    # Persisted HP matches the in-memory opp_state.
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT hp_current FROM encounters WHERE id = ?", (enc.id,),
+    ).fetchone()
+    conn.close()
+    assert row[0] == 4
+
+    # Catch animation fired.
+    assert len(catch_calls) == 1
+    assert catch_calls[0]["item_key"] == "pokeball"
+
+
+def test_throw_ball_caught_ends_battle_session(db_path, monkeypatch):
+    """A successful catch clears _battle_session before the reveal hand-off."""
+    from tokenmon import encounter as enc_mod
+    from tokenmon.popover.panes import battle as battle_mod
+    from tokenmon.popover.panes.battle import BattleController
+
+    pid = _seed_pokemon_with_moves(db_path)
+    enc = enc_mod.maybe_spawn(force=True, path=db_path)
+    player, opp = _make_states()
+
+    pop = _FakePopover()
+    pop._battle_session = _build_wild_session(
+        player, opp, player_pokemon_id=pid, encounter_id=enc.id,
+    )
+    pop._begin_catch_animation = lambda **kw: None
+
+    monkeypatch.setattr(
+        battle_mod.encounter, "use_item",
+        lambda eid, key: {"caught": True, "shakes": 3, "hint": None,
+                          "pokemon_id": 99},
+    )
+
+    ctrl = BattleController(pop)
+    ctrl._throw_ball_in_battle("pokeball")
+
+    # Battle session cleared on catch.
+    assert pop._battle_session is None
+
+
+def test_throw_ball_failed_returns_to_battle(db_path, monkeypatch):
+    """A failed catch keeps the battle session intact so the runner
+    returns to the same fight."""
+    from tokenmon import encounter as enc_mod
+    from tokenmon.popover.panes import battle as battle_mod
+    from tokenmon.popover.panes.battle import BattleController
+
+    pid = _seed_pokemon_with_moves(db_path)
+    enc = enc_mod.maybe_spawn(force=True, path=db_path)
+    player, opp = _make_states()
+    pop = _FakePopover()
+    pop._battle_session = _build_wild_session(
+        player, opp, player_pokemon_id=pid, encounter_id=enc.id,
+    )
+    pop._begin_catch_animation = lambda **kw: None
+
+    monkeypatch.setattr(
+        battle_mod.encounter, "use_item",
+        lambda eid, key: {"caught": False, "shakes": 1, "hint": "Looks fast!"},
+    )
+
+    ctrl = BattleController(pop)
+    ctrl._throw_ball_in_battle("pokeball")
+
+    # Session intact (caller will re-mount battle on catch-anim.end).
+    assert pop._battle_session is not None
+    assert pop._battle_session["kind"] == "wild"
+
+
+def test_wild_battle_opp_ko_routes_to_reward_with_xp_only(db_path, monkeypatch):
+    """When the wild mon faints, transition to PANE_BATTLE_REWARD; no
+    money, no items in the eventual award."""
+    from tokenmon.battle.rewards import compute_wild_kos_reward
+    from tokenmon import encounter as enc_mod
+    from tokenmon.popover.panes import battle as battle_mod
+    from tokenmon.popover.panes.battle import BattleController
+    from tokenmon.popover.widgets import PANE_BATTLE_REWARD
+
+    pid = _seed_pokemon_with_moves(db_path)
+    enc = enc_mod.maybe_spawn(force=True, path=db_path)
+    player, opp = _make_states()
+    # Set opp to 1 HP so any nonzero damage KOs.
+    from dataclasses import replace as dc_replace
+    opp = dc_replace(opp, hp_current=1)
+    pop = _FakePopover()
+    pop._battle_session = _build_wild_session(
+        player, opp, player_pokemon_id=pid, encounter_id=enc.id,
+    )
+
+    # Stub fold_events to return an opp_fainted=True turn result.
+    from tokenmon.battle.models import TurnResult
+
+    def _spy_fold(_events, p, o):
+        return TurnResult(
+            log=["foe fainted"], player_state=p, opp_state=o,
+            player_fainted=False, opp_fainted=True,
+        )
+
+    monkeypatch.setattr(battle_mod, "fold_events", _spy_fold)
+    monkeypatch.setattr(
+        battle_mod, "plan_turn", lambda *a, **kw: [],
+    )
+
+    # XP reward is computed from level — non-zero.
+    assert compute_wild_kos_reward(opp.level) > 0
+
+    ctrl = BattleController(pop)
+    ctrl._do_player_move(player.moves[0], 0)
+    assert PANE_BATTLE_REWARD in pop._show_pane_calls
+    # The session carries kind='wild' so the reward pane branches XP-only.
+    assert pop._battle_session["kind"] == "wild"
+
+
+def test_wild_battle_player_ko_routes_to_blackout(db_path, monkeypatch):
+    """Player faint in a wild battle still routes to reward pane (blackout)."""
+    from tokenmon import encounter as enc_mod
+    from tokenmon.popover.panes import battle as battle_mod
+    from tokenmon.popover.panes.battle import BattleController
+    from tokenmon.popover.widgets import PANE_BATTLE_REWARD
+
+    pid = _seed_pokemon_with_moves(db_path)
+    enc = enc_mod.maybe_spawn(force=True, path=db_path)
+    player, opp = _make_states()
+    from dataclasses import replace as dc_replace
+    player = dc_replace(player, hp_current=1)
+    pop = _FakePopover()
+    pop._battle_session = _build_wild_session(
+        player, opp, player_pokemon_id=pid, encounter_id=enc.id,
+    )
+
+    from tokenmon.battle.models import TurnResult
+
+    def _spy_fold(_events, p, o):
+        return TurnResult(
+            log=["you fainted"], player_state=p, opp_state=o,
+            player_fainted=True, opp_fainted=False,
+        )
+
+    monkeypatch.setattr(battle_mod, "fold_events", _spy_fold)
+    monkeypatch.setattr(battle_mod, "plan_turn", lambda *a, **kw: [])
+
+    ctrl = BattleController(pop)
+    ctrl._do_player_move(player.moves[0], 0)
+    assert PANE_BATTLE_REWARD in pop._show_pane_calls

@@ -32,7 +32,10 @@ from AppKit import (
 )
 from Foundation import NSMakeRect, NSObject, NSTimer
 
-from tokenmon import box, learnsets_remote, moves_remote, pokemon
+from tokenmon import (
+    box, encounter, items as items_registry, items_remote,
+    learnsets_remote, moves_remote, pokemon,
+)
 from tokenmon.battle.engine import (
     AttackEvent,
     FaintEvent,
@@ -42,6 +45,7 @@ from tokenmon.battle.engine import (
     resolve_turn,
 )
 from tokenmon.battle.models import BattleStats, Move
+from tokenmon.battle.team_gen import generate_wild_mon
 from tokenmon.popover.panes.battle_fx import make_type_fx
 from tokenmon.popover._handlers import make_handler
 from tokenmon.popover.panes._move_tooltip import format_move_tooltip
@@ -49,14 +53,17 @@ from tokenmon.popover.panes.base import PaneController
 from tokenmon.popover.widgets import (
     CONTENT_WIDTH,
     PANE_BATTLE_REWARD,
+    PANE_ENCOUNTER,
     PANE_POKEMON,
     POPOVER_HEIGHT,
     _label,
 )
 from tokenmon.storage import (
     decrement_pp,
+    get_pending_encounter,
     get_pending_trainer,
     list_trainer_pokemon,
+    set_encounter_hp,
 )
 
 log = logging.getLogger("tokenmon.popover.panes.battle")
@@ -277,6 +284,7 @@ def _init_battle_session(popover, trainer, active) -> dict:
     opp_states = [_opp_battle_stats(r) for r in team_rows]
     player_state = _player_battle_stats(active)
     session = {
+        "kind": "trainer",
         "trainer_id": trainer.id,
         "trainer_name": f"{trainer.title} {trainer.name}",
         "trainer_difficulty": trainer.difficulty,
@@ -291,6 +299,70 @@ def _init_battle_session(popover, trainer, active) -> dict:
     }
     popover._battle_session = session
     return session
+
+
+def _wild_battle_stats(enc) -> BattleStats:
+    """Build BattleStats for a wild Pokémon from the persisted Encounter."""
+    from tokenmon.pokemon.stats import final_stats
+
+    mon = generate_wild_mon(
+        encounter=enc, learnset_lookup=learnsets_remote.get_learnset,
+    )
+    hp_max, atk, defn, spa, spd, spe = final_stats(
+        mon.species_dex_id, mon.ivs, mon.level, mon.nature,
+    )
+    types = pokemon.types_of(mon.species_dex_id)
+    moves: list[Move] = []
+    for key in mon.move_keys:
+        md = moves_remote.get_move_data(key) or _FALLBACK_MOVE
+        moves.append(md)
+    if not moves:
+        moves = [_FALLBACK_MOVE]
+    name = pokemon.name_of(mon.species_dex_id)
+    starting_hp = enc.hp_current if enc.hp_current is not None else hp_max
+    return BattleStats(
+        species_dex_id=mon.species_dex_id, level=mon.level, types=types,
+        hp_max=hp_max, hp_current=max(0, min(hp_max, int(starting_hp))),
+        attack=atk, defense=defn, sp_attack=spa, sp_defense=spd,
+        speed=spe, moves=tuple(moves),
+        move_pps=tuple(m.pp for m in moves),
+        name=f"Wild {name}",
+    )
+
+
+def _init_wild_battle_session(popover, enc, active) -> dict:
+    """Build a one-mon wild battle session."""
+    if getattr(popover, "_battle_session", None) is not None:
+        existing = popover._battle_session
+        if existing.get("encounter_id") == enc.id:
+            return existing
+    opp = _wild_battle_stats(enc)
+    player_state = _player_battle_stats(active)
+    session = {
+        "kind": "wild",
+        "encounter_id": enc.id,
+        "player_pokemon_id": active.id,
+        "player_state": player_state,
+        "opp_state": opp,
+        "log": [f"A wild {pokemon.name_of(opp.species_dex_id)} appeared!"],
+        "rng": random.Random(),
+    }
+    popover._battle_session = session
+    return session
+
+
+def _active_opp(session: dict) -> BattleStats:
+    """Single point of branching for wild vs trainer opp lookup."""
+    if session.get("kind") == "wild":
+        return session["opp_state"]
+    return session["opp_states"][session["active_opp_idx"]]
+
+
+def _set_active_opp(session: dict, new_state: BattleStats) -> None:
+    if session.get("kind") == "wild":
+        session["opp_state"] = new_state
+    else:
+        session["opp_states"][session["active_opp_idx"]] = new_state
 
 
 class _BattleStepRunner(NSObject):
@@ -397,6 +469,10 @@ class BattleController(PaneController):
         self._battle_view = None
         self._move_buttons: list = []
         self._log_labels: list = []
+        # Wild-only: while True, the action bar shows the bag list instead
+        # of the Bag/Run row. Cleared on bag-back, on throw, and on every
+        # finalize_turn so the player isn't stranded mid-bag.
+        self._wild_bag_open: bool = False
 
     def build_view(self) -> NSView:
         # If the user re-opened the popover (or navigated away and back)
@@ -419,7 +495,12 @@ class BattleController(PaneController):
         except Exception:
             log.exception("get_pending_trainer failed")
             trainer = None
-        if trainer is None:
+        try:
+            wild = get_pending_encounter() if trainer is None else None
+        except Exception:
+            log.exception("get_pending_encounter failed")
+            wild = None
+        if trainer is None and wild is None:
             view.addSubview_(_label(
                 NSMakeRect(20, POPOVER_HEIGHT // 2, CONTENT_WIDTH - 40, 22),
                 "No active battle.",
@@ -442,7 +523,10 @@ class BattleController(PaneController):
             return view
 
         try:
-            session = _init_battle_session(self.popover, trainer, active)
+            if trainer is not None:
+                session = _init_battle_session(self.popover, trainer, active)
+            else:
+                session = _init_wild_battle_session(self.popover, wild, active)
         except Exception:
             log.exception("battle session init failed")
             view.addSubview_(_label(
@@ -456,7 +540,7 @@ class BattleController(PaneController):
         return self._render_battle_view(view, session)
 
     def _render_battle_view(self, view: NSView, session: dict) -> NSView:
-        opp = session["opp_states"][session["active_opp_idx"]]
+        opp = _active_opp(session)
         player = session["player_state"]
 
         # Re-anchor render-time refs (cleared by __init__; cleared again
@@ -651,15 +735,66 @@ class BattleController(PaneController):
                 align=NSTextAlignmentCenter,
             ))
 
-        # Run button
-        run_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect(20, 12, CONTENT_WIDTH - 40, 26)
+        # Bottom action bar — wild battles get [Bag][Run], trainer fights
+        # only get the trainer-style "Run = forfeit/lose" button.
+        if session.get("kind") == "wild":
+            self._render_wild_action_bar(view, session)
+        else:
+            run_btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(20, 12, CONTENT_WIDTH - 40, 26)
+            )
+            run_btn.setTitle_("Run (forfeit — counts as a loss)")
+            run_btn.setBezelStyle_(1)
+
+            def _run(_s):
+                self._end_battle(session, status="lost")
+
+            run_handler = make_handler(_run)
+            self._handlers.append(run_handler)
+            run_btn.setTarget_(run_handler)
+            run_btn.setAction_(b"fire:")
+            view.addSubview_(run_btn)
+
+        return view
+
+    # ---- wild-battle action bar + bag mode ---------------------------
+
+    def _render_wild_action_bar(self, view: NSView, session: dict) -> None:
+        """Bag + Run buttons (or, when bag-mode is on, the inventory list +
+        Back/Run row). State lives on ``self._wild_bag_open``."""
+        if getattr(self, "_wild_bag_open", False):
+            self._render_wild_bag(view, session)
+            return
+        margin = 16
+        gap = 12
+        btn_y = 12
+        btn_w = (CONTENT_WIDTH - 2 * margin - gap) // 2
+        btn_h = 26
+
+        bag_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin, btn_y, btn_w, btn_h)
         )
-        run_btn.setTitle_("Run (forfeit — counts as a loss)")
+        bag_btn.setTitle_("🎒 Bag")
+        bag_btn.setBezelStyle_(1)
+
+        def _open_bag(_s):
+            self._wild_bag_open = True
+            self.popover._show_pane(self.popover._current_pane)
+
+        bag_handler = make_handler(_open_bag)
+        self._handlers.append(bag_handler)
+        bag_btn.setTarget_(bag_handler)
+        bag_btn.setAction_(b"fire:")
+        view.addSubview_(bag_btn)
+
+        run_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin + btn_w + gap, btn_y, btn_w, btn_h)
+        )
+        run_btn.setTitle_("Run")
         run_btn.setBezelStyle_(1)
 
         def _run(_s):
-            self._end_battle(session, status="lost")
+            self._wild_run_away()
 
         run_handler = make_handler(_run)
         self._handlers.append(run_handler)
@@ -667,7 +802,162 @@ class BattleController(PaneController):
         run_btn.setAction_(b"fire:")
         view.addSubview_(run_btn)
 
-        return view
+    def _render_wild_bag(self, view: NSView, session: dict) -> None:
+        """Inventory list with click-to-throw rows + Back/Run row.
+        Re-uses the row layout from the legacy encounter bag-open view."""
+        from tokenmon.storage import query_item_counts
+
+        # Header
+        header_y = 200
+        view.addSubview_(_label(
+            NSMakeRect(16, header_y, CONTENT_WIDTH - 32, 18),
+            "Bag",
+            font=NSFont.boldSystemFontOfSize_(13),
+            color=NSColor.secondaryLabelColor(),
+        ))
+
+        try:
+            counts = query_item_counts()
+        except Exception:
+            log.exception("query_item_counts failed in battle bag")
+            counts = {}
+
+        row_h = 26
+        rows_top = header_y - 4
+        ball_keys = tuple(
+            k for k, it in items_registry.ITEMS.items() if "throw" in it.actions
+        )
+        for i, key in enumerate(ball_keys):
+            item = items_registry.ITEMS[key]
+            count = int(counts.get(key, 0) or 0)
+            enabled = count > 0
+            y = rows_top - (i + 1) * row_h
+            if y < (12 + 26 + 8):
+                break
+            btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(16, y, CONTENT_WIDTH - 32, row_h - 2)
+            )
+            chevron = "  ›" if enabled else ""
+            sprite = items_remote.get_item_image(item)
+            if sprite is not None:
+                from Foundation import NSMakeSize
+                from AppKit import NSImageLeft
+                sprite.setSize_(NSMakeSize(20, 20))
+                btn.setImage_(sprite)
+                btn.setImagePosition_(NSImageLeft)
+                btn.setTitle_(f"  {item.display_name}     × {count}{chevron}")
+            else:
+                btn.setTitle_(
+                    f"{item.emoji}  {item.display_name}     × {count}{chevron}"
+                )
+            btn.setBezelStyle_(1)
+            btn.setEnabled_(enabled)
+            if enabled:
+                handler = make_handler(
+                    lambda _s, k=key: self._throw_ball_in_battle(k),
+                )
+                self._handlers.append(handler)
+                btn.setTarget_(handler)
+                btn.setAction_(b"fire:")
+            view.addSubview_(btn)
+
+        # Bottom row: Back + Run.
+        margin = 16
+        gap = 12
+        btn_y = 12
+        btn_w = (CONTENT_WIDTH - 2 * margin - gap) // 2
+        btn_h = 26
+
+        back_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin, btn_y, btn_w, btn_h)
+        )
+        back_btn.setTitle_("← Back")
+        back_btn.setBezelStyle_(1)
+
+        def _back(_s):
+            self._wild_bag_open = False
+            self.popover._show_pane(self.popover._current_pane)
+
+        back_handler = make_handler(_back)
+        self._handlers.append(back_handler)
+        back_btn.setTarget_(back_handler)
+        back_btn.setAction_(b"fire:")
+        view.addSubview_(back_btn)
+
+        run_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin + btn_w + gap, btn_y, btn_w, btn_h)
+        )
+        run_btn.setTitle_("Run")
+        run_btn.setBezelStyle_(1)
+
+        def _run(_s):
+            self._wild_run_away()
+
+        run_handler = make_handler(_run)
+        self._handlers.append(run_handler)
+        run_btn.setTarget_(run_handler)
+        run_btn.setAction_(b"fire:")
+        view.addSubview_(run_btn)
+
+    def _wild_run_away(self) -> None:
+        session = self.popover._battle_session
+        if session is None:
+            return
+        if session.get("kind") != "wild":
+            return
+        try:
+            encounter.run_away(session["encounter_id"])
+        except Exception:
+            log.exception("wild run_away failed")
+        self.popover._battle_session = None
+        try:
+            self.popover._show_pane(PANE_POKEMON)
+        except Exception:
+            log.exception("transition to PANE_POKEMON after run failed")
+
+    def _throw_ball_in_battle(self, item_key: str) -> None:
+        """Mid-fight ball throw. Persists current opp HP first (so the
+        Phase-3 catch math reads it), then delegates to use_item +
+        _begin_catch_animation. Defense in depth: a stray call from a
+        trainer-kind session is a no-op.
+
+        Note: ball-throw is its own action — the engine isn't called this
+        turn, so the player can't be KO'd on a throw turn.
+        """
+        session = self.popover._battle_session
+        if session is None or session.get("kind") != "wild":
+            return
+        opp = session["opp_state"]
+        try:
+            set_encounter_hp(session["encounter_id"], int(opp.hp_current))
+        except Exception:
+            log.exception("set_encounter_hp failed pre-throw")
+        try:
+            result = encounter.use_item(session["encounter_id"], item_key)
+        except Exception:
+            log.exception("encounter.use_item(throw) failed in battle")
+            return
+
+        # Bag-mode flag clears so a re-render after the catch animation
+        # lands on the action bar, not the inventory.
+        self._wild_bag_open = False
+
+        # On catch, the encounter is resolved → drop the session before
+        # the reveal hand-off so a stray sidebar click can't resume.
+        if result.get("caught"):
+            self.popover._battle_session = None
+
+        try:
+            self.popover._begin_catch_animation(
+                item_key=item_key,
+                encounter_id=session["encounter_id"],
+                species_dex_id=int(opp.species_dex_id),
+                caught=bool(result.get("caught")),
+                shakes=int(result.get("shakes", 0)),
+                hint=result.get("hint"),
+            )
+        except Exception:
+            log.exception("begin_catch_animation failed in battle")
 
     def _make_move_handler(self, move: Move, slot: int):
         def _click(_s, move=move, slot=slot):
@@ -686,7 +976,7 @@ class BattleController(PaneController):
             session["log"].append(f"No PP left for {player_move.name}!")
             self._rerender()
             return
-        opp = session["opp_states"][session["active_opp_idx"]]
+        opp = _active_opp(session)
         opp_move = session["rng"].choice(opp.moves)
 
         events = plan_turn(
@@ -1037,7 +1327,7 @@ class BattleController(PaneController):
         if session is None:
             return
         if side == "opp":
-            opp = session["opp_states"][session["active_opp_idx"]]
+            opp = _active_opp(session)
             lbl = self._opp_hp_label
             if lbl is not None:
                 try:
@@ -1074,19 +1364,28 @@ class BattleController(PaneController):
         # PP was already spent in _do_player_move; preserve those values
         # by replacing the PP tuple on the fold's player_state below.
         current_player = session["player_state"]
-        result = fold_events(
-            events, current_player,
-            session["opp_states"][session["active_opp_idx"]],
-        )
+        result = fold_events(events, current_player, _active_opp(session))
         new_player = result.player_state
         if new_player is not None:
             new_player = replace(new_player, move_pps=current_player.move_pps)
         session["player_state"] = new_player
-        session["opp_states"][session["active_opp_idx"]] = result.opp_state
+        if result.opp_state is not None:
+            _set_active_opp(session, result.opp_state)
         if append_log:
             session["log"].extend(result.log)
 
+        kind = session.get("kind", "trainer")
+
         if result.opp_fainted:
+            if kind == "wild":
+                # Wild KO → mark encounter ran (logically: mon flees / KO'd,
+                # no catch), route to reward (XP only).
+                try:
+                    encounter.run_away(session["encounter_id"])
+                except Exception:
+                    log.exception("wild encounter run_away on KO failed")
+                self._end_battle(session, status="won")
+                return
             session["defeated_count"] += 1
             try:
                 from tokenmon.storage import mark_trainer_pokemon_fainted
@@ -1109,6 +1408,16 @@ class BattleController(PaneController):
         if result.player_fainted:
             self._end_battle(session, status="lost")
             return
+
+        # Persist wild HP between turns/popover-opens.
+        if kind == "wild":
+            try:
+                set_encounter_hp(
+                    session["encounter_id"],
+                    int(_active_opp(session).hp_current),
+                )
+            except Exception:
+                log.exception("post-turn set_encounter_hp failed")
 
         self._rerender()
 

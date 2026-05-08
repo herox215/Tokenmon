@@ -300,6 +300,7 @@ class CatchAnimationController(PaneController):
 
     def end(self, payload: dict) -> None:
         """Final step — drop animation refs and route to the outcome pane."""
+        from tokenmon.popover.widgets import PANE_BATTLE
         pop = self.popover
         pop._catch_anim_handler = None
         self._silhouette = None
@@ -314,5 +315,8 @@ class CatchAnimationController(PaneController):
             # Hand off to the encounter pane's reveal flow.
             pop._begin_catch_reveal()
         else:
-            pop._encounter_bag_open = True
-            pop._show_pane(PANE_ENCOUNTER)
+            # Phase 5: in-fight throws return to the battle pane so the
+            # wild battle resumes; standalone catches no longer exist
+            # (preview pane sends every Fight click through the battle
+            # pane), so this is the only path now.
+            pop._show_pane(PANE_BATTLE)

@@ -127,3 +127,34 @@ def test_award_rewards_ran_does_not_charge_or_pay(db_path):
     assert storage.get_money(db_path) == 200
     t = storage.get_trainer(tid, path=db_path)
     assert t.resolved == "ran"
+
+
+# ---- Phase 5: wild battle rewards (XP only, no money penalty on blackout)
+
+
+def test_wild_ko_awards_xp_only_no_money(db_path):
+    """A wild KO awards XP via the synthetic <battle> request row, no money."""
+    from tokenmon.popover.panes.battle_reward import _award_wild_rewards
+
+    pid = _seed_player_pokemon(db_path)
+    starting = storage.get_money(db_path)
+    money_delta, xp_total = _award_wild_rewards(
+        status="won", opponent_level=10, player_pokemon_id=pid, path=db_path,
+    )
+    assert money_delta == 0
+    assert xp_total > 0
+    assert storage.get_money(db_path) == starting
+
+
+def test_wild_blackout_no_loss_penalty(db_path):
+    """A wild blackout doesn't charge the player — wild mons don't take money."""
+    from tokenmon.popover.panes.battle_reward import _award_wild_rewards
+
+    pid = _seed_player_pokemon(db_path)
+    storage.set_money(500, path=db_path)
+    money_delta, xp_total = _award_wild_rewards(
+        status="lost", opponent_level=10, player_pokemon_id=pid, path=db_path,
+    )
+    assert money_delta == 0
+    assert xp_total == 0
+    assert storage.get_money(db_path) == 500

@@ -35,7 +35,7 @@ import objc
 
 from tokenmon import items as items_registry, pokemon
 from tokenmon.battle.models import TrainerMon
-from tokenmon.battle.rewards import compute_rewards
+from tokenmon.battle.rewards import compute_rewards, compute_wild_kos_reward
 from tokenmon.battle.team_gen import DIFFICULTY_PROFILES
 from tokenmon.popover._handlers import make_handler
 from tokenmon.popover.panes.base import PaneController
@@ -220,6 +220,37 @@ def _award_rewards(
     return money_credit, xp_credit, items_credit
 
 
+def _award_wild_rewards(
+    *,
+    status: str,
+    opponent_level: int,
+    player_pokemon_id: int,
+    path=DB_PATH,
+) -> tuple[int, int]:
+    """Wild-side payout: XP only on KO, nothing on blackout/run.
+
+    Wild Pokémon don't take your money (canon: only trainers do), so the
+    blackout branch has no penalty. XP credit goes through the same
+    synthetic ``<battle>`` request row pattern trainer rewards use.
+
+    Returns ``(money_delta, xp_total)``; money_delta is always 0 — kept
+    in the signature for shape parity with ``_award_rewards``.
+    """
+    if status == "won":
+        xp_credit = compute_wild_kos_reward(int(opponent_level))
+    else:
+        xp_credit = 0
+    if xp_credit > 0:
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with _connect(path) as conn:
+            conn.execute(
+                "INSERT INTO requests (ts_utc, model, output_tokens, "
+                "trained_pokemon_id) VALUES (?, '<battle>', ?, ?)",
+                (ts, int(xp_credit), int(player_pokemon_id)),
+            )
+    return 0, xp_credit
+
+
 class BattleRewardController(PaneController):
     """Post-battle summary. Awards rewards on first build_view, then
     Continue → reset to Pokemon-pane."""
@@ -238,6 +269,9 @@ class BattleRewardController(PaneController):
                 align=NSTextAlignmentCenter,
             ))
             return view
+
+        if session.get("kind") == "wild":
+            return self._build_wild_view(view, session)
 
         status = session.get("resolved_status", "lost")
         trainer_id = session["trainer_id"]
@@ -548,4 +582,146 @@ class BattleRewardController(PaneController):
         cont.setAction_(b"fire:")
         view.addSubview_(cont)
 
+        return view
+
+    # ---- wild reward branch -------------------------------------------
+
+    def _build_wild_view(self, view: NSView, session: dict) -> NSView:
+        """Wild-battle reward summary: XP-only on KO, blackout copy on
+        loss, no money in either case. Awards on first build via
+        ``_award_wild_rewards``; the resolved-encounter check gates
+        re-renders so a popover reopen doesn't double-credit."""
+        status = session.get("resolved_status", "lost")
+        opp = session.get("opp_state")
+        player_id = session["player_pokemon_id"]
+        opponent_level = int(opp.level) if opp is not None else 1
+
+        # Gate: only credit on first build. We use a dedicated flag on
+        # the session because there's no DB resolved field for wilds in
+        # the same way (encounters.resolved is set by run_away on KO).
+        already_credited = bool(session.get("_reward_awarded"))
+        try:
+            old_xp = query_xp_for_pokemon(player_id)
+        except Exception:
+            log.exception("pre-reward XP lookup failed")
+            old_xp = 0
+        if not already_credited:
+            try:
+                _award_wild_rewards(
+                    status=status,
+                    opponent_level=opponent_level,
+                    player_pokemon_id=player_id,
+                )
+                session["_reward_awarded"] = True
+            except Exception:
+                log.exception("wild reward award failed")
+        try:
+            new_xp = query_xp_for_pokemon(player_id)
+        except Exception:
+            log.exception("post-reward XP lookup failed")
+            new_xp = old_xp
+
+        # Persist post-battle player HP + reset PP, mirroring trainer flow.
+        if not already_credited:
+            try:
+                final_player = session.get("player_state")
+                if final_player is not None:
+                    set_pokemon_hp(
+                        player_id,
+                        int(getattr(final_player, "hp_current", 0)),
+                    )
+            except Exception:
+                log.exception("wild post-battle HP persist failed")
+            try:
+                from tokenmon import moves_remote
+
+                def _pp_lookup(key: str):
+                    md = moves_remote.get_move_data(key)
+                    return md.pp if md is not None else None
+
+                reset_pp_for_pokemon(player_id, pp_lookup=_pp_lookup)
+            except Exception:
+                log.exception("wild PP reset failed")
+
+        is_loss = status == "lost"
+        if status == "won":
+            headline = "🏆 Foe defeated!"
+            color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                0.36, 0.78, 0.20, 1.0,
+            )
+        elif is_loss:
+            headline = "💔 You blacked out!"
+            color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                0.95, 0.30, 0.30, 1.0,
+            )
+        else:
+            headline = "Battle ended"
+            color = NSColor.secondaryLabelColor()
+
+        y_cursor = POPOVER_HEIGHT - 12
+        y_cursor -= 28
+        view.addSubview_(_label(
+            NSMakeRect(20, y_cursor, CONTENT_WIDTH - 40, 28),
+            headline,
+            font=NSFont.boldSystemFontOfSize_(20),
+            color=color,
+            align=NSTextAlignmentCenter,
+        ))
+        y_cursor -= 10
+
+        try:
+            from tokenmon.storage import get_pokemon_by_id
+            mon_row = get_pokemon_by_id(player_id)
+        except Exception:
+            log.exception("active Pokémon lookup failed")
+            mon_row = None
+        if mon_row is not None:
+            try:
+                growth = pokemon.growth_rate_of(mon_row.species_dex_id)
+                cur_level, _, _ = pokemon.level_from_xp(new_xp, growth)
+                mon_name = pokemon.display_name(
+                    mon_row.nickname, mon_row.species_dex_id,
+                )
+                y_cursor -= 18
+                view.addSubview_(_label(
+                    NSMakeRect(20, y_cursor, CONTENT_WIDTH - 40, 18),
+                    f"{mon_name}  —  Lv {cur_level}",
+                    font=NSFont.boldSystemFontOfSize_(13),
+                    align=NSTextAlignmentCenter,
+                ))
+            except Exception:
+                log.exception("wild pane name render failed")
+
+        if is_loss:
+            stats_lines = ["Lost the fight, but the Pokémon center healed you up."]
+        else:
+            xp_total = new_xp - old_xp
+            stats_lines = [f"XP: +{xp_total}"]
+        for line in stats_lines:
+            y_cursor -= 22
+            view.addSubview_(_label(
+                NSMakeRect(40, y_cursor, CONTENT_WIDTH - 80, 18),
+                line,
+                font=NSFont.systemFontOfSize_(12),
+                align=NSTextAlignmentCenter,
+            ))
+
+        cont = NSButton.alloc().initWithFrame_(
+            NSMakeRect((CONTENT_WIDTH - 160) // 2, 60, 160, 32)
+        )
+        cont.setTitle_("Continue")
+        cont.setBezelStyle_(1)
+
+        def _continue(_s):
+            try:
+                self.popover._battle_session = None
+                self.popover._show_pane(PANE_POKEMON)
+            except Exception:
+                log.exception("wild continue failed")
+
+        h = make_handler(_continue)
+        self._handlers.append(h)
+        cont.setTarget_(h)
+        cont.setAction_(b"fire:")
+        view.addSubview_(cont)
         return view
