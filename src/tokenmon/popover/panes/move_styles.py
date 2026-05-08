@@ -77,3 +77,18 @@ def darken(rgb: tuple[float, float, float], amount: float = 0.18) -> tuple[float
     factor = max(0.0, 1.0 - amount)
     r, g, b = rgb
     return (r * factor, g * factor, b * factor)
+
+
+def lighten(rgb: tuple[float, float, float], amount: float = 0.18) -> tuple[float, float, float]:
+    """Return ``rgb`` shifted toward white by ``amount`` (0..1).
+
+    Used as the top stop of the move-button gradient so each button has
+    a subtle sheen instead of looking like a flat fill.
+    """
+    amount = max(0.0, min(1.0, amount))
+    r, g, b = rgb
+    return (
+        r + (1.0 - r) * amount,
+        g + (1.0 - g) * amount,
+        b + (1.0 - b) * amount,
+    )

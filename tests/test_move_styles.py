@@ -11,6 +11,7 @@ from tokenmon.battle.types import TYPES
 from tokenmon.popover.panes.move_styles import (
     TYPE_COLORS,
     darken,
+    lighten,
     text_color_for_type,
     type_color,
 )
@@ -69,3 +70,20 @@ def test_darken_moves_toward_black():
 def test_darken_zero_is_identity():
     base = (0.4, 0.5, 0.6)
     assert darken(base, 0.0) == base
+
+
+def test_lighten_moves_toward_white():
+    base = (0.4, 0.5, 0.6)
+    out = lighten(base, 0.5)
+    assert all(o > b for o, b in zip(out, base))
+    assert all(o <= 1.0 for o in out)
+
+
+def test_lighten_zero_is_identity():
+    base = (0.4, 0.5, 0.6)
+    assert lighten(base, 0.0) == base
+
+
+def test_lighten_full_clamps_to_white():
+    out = lighten((0.2, 0.3, 0.4), 1.0)
+    assert out == (1.0, 1.0, 1.0)

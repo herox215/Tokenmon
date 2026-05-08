@@ -22,6 +22,8 @@ from AppKit import (
     NSFont,
     NSFontAttributeName,
     NSForegroundColorAttributeName,
+    NSGradient,
+    NSGraphicsContext,
     NSMutableParagraphStyle,
     NSParagraphStyleAttributeName,
     NSTextAlignmentCenter,
@@ -32,6 +34,7 @@ from Foundation import NSMakeRect, NSMakePoint, NSAttributedString
 from tokenmon.battle.models import Move
 from tokenmon.popover.panes.move_styles import (
     darken,
+    lighten,
     text_color_for_type,
     type_color,
 )
@@ -204,11 +207,40 @@ class _MoveButtonView(NSView):
             # Pressed look — push toward darker variant of same hue.
             bg = darken(bg, 0.18)
 
-        # 1) Filled rounded rect.
-        _set_rgb(bg, bg_alpha)
-        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+        # 1) Vertical gradient fill clipped to the rounded rect. Top
+        # stop is a lighter variant of the type colour for a subtle
+        # sheen, bottom stop is a slightly darker variant so the button
+        # reads as 3D rather than flat. Pressed state inverts the
+        # gradient direction so it visibly "presses in".
+        path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
             bounds, _CORNER_RADIUS, _CORNER_RADIUS,
-        ).fill()
+        )
+        top_rgb = lighten(bg, 0.22)
+        bot_rgb = darken(bg, 0.12)
+        top_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            top_rgb[0], top_rgb[1], top_rgb[2], bg_alpha,
+        )
+        bot_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            bot_rgb[0], bot_rgb[1], bot_rgb[2], bg_alpha,
+        )
+        if self._enabled and self._pressed:
+            gradient = NSGradient.alloc().initWithStartingColor_endingColor_(
+                top_color, bot_color,
+            )
+            angle = 90.0   # bottom→top: pressed-in feel
+        else:
+            gradient = NSGradient.alloc().initWithStartingColor_endingColor_(
+                bot_color, top_color,
+            )
+            angle = 90.0   # rests with light at top
+        # Clip to the rounded path so the gradient honours the corners.
+        ctx = NSGraphicsContext.currentContext()
+        ctx.saveGraphicsState()
+        try:
+            path.addClip()
+            gradient.drawInRect_angle_(bounds, angle)
+        finally:
+            ctx.restoreGraphicsState()
 
         # 2) Subtle darker border for definition against the popover.
         _set_rgb(darken(type_color(self._move.type), 0.25), bg_alpha)
