@@ -155,3 +155,60 @@ def test_init_db_creates_db_file(tmp_path):
     assert not target.exists()
     storage.init_db(target)
     assert target.exists()
+
+
+def test_encounter_battle_columns_added(_isolate_db):
+    """``hp_current`` + ``move_keys_json`` land on the encounters table."""
+    storage.init_db(_isolate_db)
+    # Repeat to verify idempotency.
+    storage.init_db(_isolate_db)
+    with _connect(_isolate_db) as conn:
+        cols = _table_cols(conn, "encounters")
+    assert "hp_current" in cols
+    assert "move_keys_json" in cols
+
+
+def test_legacy_encounter_row_has_null_hp(_isolate_db):
+    """A row inserted before the migration ran (i.e. without setting
+    hp_current) must read back as NULL — that's the "full HP" sentinel."""
+    import sqlite3
+    db_path = _isolate_db
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE encounters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            spawned_utc TEXT NOT NULL,
+            species_dex_id INTEGER NOT NULL,
+            nature TEXT NOT NULL,
+            characteristic TEXT NOT NULL,
+            level INTEGER NOT NULL,
+            catch_rate INTEGER NOT NULL,
+            pokeballs_used INTEGER NOT NULL DEFAULT 0,
+            greatballs_used INTEGER NOT NULL DEFAULT 0,
+            ultraballs_used INTEGER NOT NULL DEFAULT 0,
+            masterballs_used INTEGER NOT NULL DEFAULT 0,
+            resolved TEXT,
+            resolved_utc TEXT,
+            pokemon_id INTEGER,
+            last_hint TEXT
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO encounters (spawned_utc, species_dex_id, nature, "
+        "characteristic, level, catch_rate) VALUES "
+        "(?, 1, 'Hardy', 'X', 5, 100)",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    conn.commit()
+    conn.close()
+
+    storage.init_db(db_path)
+
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT hp_current, move_keys_json FROM encounters"
+        ).fetchone()
+    assert row[0] is None
+    assert row[1] is None

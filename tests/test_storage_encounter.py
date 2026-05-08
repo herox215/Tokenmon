@@ -104,3 +104,57 @@ def test_mark_encounter_ran_sets_resolved(db_path):
     conn.close()
     assert row[0] == "ran"
     assert row[1] is not None
+
+
+def test_set_encounter_hp_round_trip(db_path):
+    eid = _new_enc(db_path)
+    storage.set_encounter_hp(eid, 7, path=db_path)
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT hp_current FROM encounters WHERE id = ?", (eid,),
+    ).fetchone()
+    conn.close()
+    assert row[0] == 7
+
+    storage.set_encounter_hp(eid, 0, path=db_path)
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT hp_current FROM encounters WHERE id = ?", (eid,),
+    ).fetchone()
+    conn.close()
+    assert row[0] == 0
+
+
+def test_encounter_battle_columns_default_null(db_path):
+    """A fresh insert via insert_encounter has NULL hp/move_keys."""
+    eid = _new_enc(db_path)
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT hp_current, move_keys_json FROM encounters WHERE id = ?", (eid,),
+    ).fetchone()
+    conn.close()
+    assert row[0] is None
+    assert row[1] is None
+
+
+def test_insert_encounter_persists_move_keys(db_path):
+    eid = storage.insert_encounter(
+        species_dex_id=25,
+        nature="Hardy",
+        characteristic="X",
+        level=5,
+        catch_rate=100,
+        move_keys=("tackle", "growl"),
+        path=db_path,
+    )
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT move_keys_json FROM encounters WHERE id = ?", (eid,),
+    ).fetchone()
+    conn.close()
+    assert row[0] is not None
+    import json
+    assert json.loads(row[0]) == ["tackle", "growl"]

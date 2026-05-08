@@ -23,6 +23,7 @@ __all__ = [
     "add_to_pending",
     "query_pending_drops",
     "claim_pending_drops",
+    "set_encounter_hp",
 ]
 
 
@@ -46,6 +47,8 @@ class Encounter:
     gender: str | None = None
     is_shiny: bool = False
     ivs: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0)
+    hp_current: int | None = None
+    move_keys: tuple[str, ...] = ()
 
 
 def _parse_utc(ts: str | None) -> datetime | None:
@@ -58,6 +61,15 @@ def _parse_utc(ts: str | None) -> datetime | None:
 
 
 def _row_to_encounter(row: tuple) -> Encounter:
+    move_keys: tuple[str, ...] = ()
+    if len(row) > 24 and row[24]:
+        import json
+        try:
+            data = json.loads(row[24])
+            if isinstance(data, list):
+                move_keys = tuple(str(m) for m in data)
+        except (ValueError, TypeError):
+            move_keys = ()
     return Encounter(
         id=int(row[0]),
         spawned_utc=_parse_utc(row[1]),  # type: ignore[arg-type]
@@ -80,6 +92,8 @@ def _row_to_encounter(row: tuple) -> Encounter:
             int(row[17] or 0), int(row[18] or 0), int(row[19] or 0),
             int(row[20] or 0), int(row[21] or 0), int(row[22] or 0),
         ) if len(row) > 22 else (0, 0, 0, 0, 0, 0),
+        hp_current=int(row[23]) if len(row) > 23 and row[23] is not None else None,
+        move_keys=move_keys,
     )
 
 
@@ -88,7 +102,8 @@ _ENCOUNTER_COLS = (
     "catch_rate, pokeballs_used, greatballs_used, ultraballs_used, "
     "masterballs_used, resolved, resolved_utc, pokemon_id, last_hint, "
     "gender, is_shiny, "
-    "iv_hp, iv_attack, iv_defense, iv_sp_attack, iv_sp_defense, iv_speed"
+    "iv_hp, iv_attack, iv_defense, iv_sp_attack, iv_sp_defense, iv_speed, "
+    "hp_current, move_keys_json"
 )
 
 
@@ -102,6 +117,7 @@ def insert_encounter(
     gender: str | None = None,
     is_shiny: bool = False,
     ivs: tuple[int, int, int, int, int, int] | None = None,
+    move_keys: tuple[str, ...] | None = None,
     path: Path | None = None,
 ) -> int:
     if path is None:
@@ -110,6 +126,10 @@ def insert_encounter(
         from tokenmon.pokemon.stats import roll_ivs  # lazy: avoid import cycle
         ivs = roll_ivs()
     spawned = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    move_keys_json: str | None = None
+    if move_keys is not None:
+        import json
+        move_keys_json = json.dumps(list(move_keys))
     with _connect(path) as conn:
         cur = conn.execute(
             """
@@ -117,17 +137,32 @@ def insert_encounter(
                 spawned_utc, species_dex_id, nature, characteristic,
                 level, catch_rate, gender, is_shiny,
                 iv_hp, iv_attack, iv_defense,
-                iv_sp_attack, iv_sp_defense, iv_speed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                iv_sp_attack, iv_sp_defense, iv_speed,
+                move_keys_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 spawned, species_dex_id, nature, characteristic,
                 level, catch_rate, gender, 1 if is_shiny else 0,
                 int(ivs[0]), int(ivs[1]), int(ivs[2]),
                 int(ivs[3]), int(ivs[4]), int(ivs[5]),
+                move_keys_json,
             ),
         )
         return int(cur.lastrowid)
+
+
+def set_encounter_hp(
+    encounter_id: int, hp_current: int, *, path: Path | None = None,
+) -> None:
+    """Persist the wild mon's current HP between turns / popover-opens."""
+    if path is None:
+        path = DB_PATH
+    with _connect(path) as conn:
+        conn.execute(
+            "UPDATE encounters SET hp_current = ? WHERE id = ?",
+            (int(hp_current), encounter_id),
+        )
 
 
 def get_pending_encounter(path: Path | None = None) -> Encounter | None:

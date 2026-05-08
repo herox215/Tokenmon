@@ -64,6 +64,7 @@ from .encounter import (
     add_to_pending,
     query_pending_drops,
     claim_pending_drops,
+    set_encounter_hp,
 )
 
 # Player singleton (money, future per-account stats)
@@ -137,6 +138,7 @@ __all__ = [
     "list_distinct_encounter_species",
     "add_to_inventory", "decrement_inventory",
     "add_to_pending", "query_pending_drops", "claim_pending_drops",
+    "set_encounter_hp",
     # pokedex
     "PokedexEntry", "query_pokedex", "query_pokemon_xp",
     "mark_seen", "mark_caught", "query_pokedex_seen",

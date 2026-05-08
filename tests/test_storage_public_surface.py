@@ -55,6 +55,7 @@ PUBLIC_NAMES = [
     "add_to_pending",
     "query_pending_drops",
     "claim_pending_drops",
+    "set_encounter_hp",
 ]
 
 

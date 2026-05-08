@@ -361,6 +361,18 @@ def _ensure_hp_current_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE pokemon ADD COLUMN hp_current INTEGER")
 
 
+def _ensure_encounter_battle_columns(conn: sqlite3.Connection) -> None:
+    """Wild battles need persistent HP and a baked moveset on the
+    encounter row. NULL hp_current = "full HP" (matches pokemon.hp_current).
+    move_keys_json is a JSON list of move keys, populated at spawn time so
+    re-opening the popover mid-fight shows the same moves."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(encounters)")}
+    if "hp_current" not in cols:
+        conn.execute("ALTER TABLE encounters ADD COLUMN hp_current INTEGER")
+    if "move_keys_json" not in cols:
+        conn.execute("ALTER TABLE encounters ADD COLUMN move_keys_json TEXT")
+
+
 def _ensure_iv_columns(conn: sqlite3.Connection) -> None:
     """Add the six IV columns to pokemon + encounters and backfill any rows
     that pre-date the column with a deterministic id-seeded roll. Idempotent.
@@ -496,6 +508,7 @@ def init_db(path: Path | None = None) -> None:
         _ensure_pokemon_source_column(conn)
         _ensure_iv_columns(conn)
         _ensure_hp_current_column(conn)
+        _ensure_encounter_battle_columns(conn)
         _migrate_encounter_balls_to_items(conn)
         _backfill_pokedex_seen(conn)
         _backfill_inventory(conn)
