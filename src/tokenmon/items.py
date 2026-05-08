@@ -168,6 +168,23 @@ BALL_CATCH_MODIFIERS: dict[str, float] = {
     "masterball": 255.0,
 }
 
+
+def hp_modifier(hp_current: int, hp_max: int) -> float:
+    """Gen-1 style HP factor for catch probability:
+    ``(3 * hp_max - 2 * hp_current) / (3 * hp_max)`` clamped to [1/3, 1].
+
+    Lower HP = better catch chance, capped at the canonical 1/3 floor and
+    1.0 ceiling. Bogus inputs (zero/negative max) return 1.0 — the caller
+    falls back to "full HP" semantics."""
+    if hp_max <= 0:
+        return 1.0
+    raw = (3 * hp_max - 2 * hp_current) / (3 * hp_max)
+    if raw < 1.0 / 3.0:
+        return 1.0 / 3.0
+    if raw > 1.0:
+        return 1.0
+    return raw
+
 # Bag pockets — order = tab order in the Items pane. Each entry is
 # ``(pocket_key, label)``; the label is shown on the segmented control.
 POCKETS: tuple[tuple[str, str], ...] = (

@@ -17,6 +17,7 @@ from pathlib import Path
 import threading
 
 from tokenmon import box, config, learnsets_remote, pokemon, weather
+from tokenmon import items as _items
 from tokenmon.items import (
     BALL_CATCH_MODIFIERS,
     is_throwable,
@@ -254,20 +255,32 @@ def _kick_battle_asset_prefetch(
 # --- Catch math ------------------------------------------------------------
 
 
-def catch_probability(catch_rate: int, item_key: str) -> float:
+def catch_probability(
+    catch_rate: int,
+    item_key: str,
+    *,
+    hp_current: int | None = None,
+    hp_max: int | None = None,
+) -> float:
     """Returns 0..1 probability for a single throw of ``item_key`` against a
     Pokemon with the given ``catch_rate``.
 
     Master Ball is hard-coded to 1.0; non-throwable or unknown items return
-    0.0. Otherwise: ``clamp((catch_rate / 255) * BALL_CATCH_MODIFIERS[key] *
-    CATCH_PROBABILITY_BASELINE, 0.0, 1.0)``.
+    0.0. Otherwise: ``(catch_rate / 255) * BALL_CATCH_MODIFIERS[key] *
+    HP_modifier * CATCH_PROBABILITY_BASELINE``, clamped to [0.0, 1.0].
+
+    HP modifier applies only when both ``hp_current`` and ``hp_max`` are
+    provided; legacy callers (no HP) get the original formula.
     """
     if not is_throwable(item_key):
         return 0.0
     if item_key == "masterball":
         return 1.0
     modifier = BALL_CATCH_MODIFIERS.get(item_key, 1.0)
-    p = (catch_rate / 255.0) * modifier * CATCH_PROBABILITY_BASELINE
+    hp_mod = 1.0
+    if hp_current is not None and hp_max is not None:
+        hp_mod = _items.hp_modifier(int(hp_current), int(hp_max))
+    p = (catch_rate / 255.0) * modifier * hp_mod * CATCH_PROBABILITY_BASELINE
     if p < 0.0:
         return 0.0
     if p > 1.0:
@@ -373,7 +386,19 @@ def _resolve_throw(
     # Spend the item regardless of outcome.
     increment_item_used(pending.id, item_key, path=path)
 
-    p = catch_probability(pending.catch_rate, item_key)
+    # HP-aware catch math: only thread HP into the formula when the row
+    # actually carries a battle-recorded HP (post-Phase-1 schema). NULL =
+    # legacy / pre-battle row → behave as before (no HP modifier).
+    if pending.hp_current is not None:
+        hp_max = pokemon.final_stats(
+            pending.species_dex_id, pending.ivs, pending.level, pending.nature,
+        )[0]
+        p = catch_probability(
+            pending.catch_rate, item_key,
+            hp_current=pending.hp_current, hp_max=hp_max,
+        )
+    else:
+        p = catch_probability(pending.catch_rate, item_key)
     # Per-shake survival probability. p == 0 short-circuits to s == 0 (zero
     # shakes, immediate break-out); p == 1 short-circuits to s == 1 (always
     # caught) — both edge cases are exact under ``** 0.25``.

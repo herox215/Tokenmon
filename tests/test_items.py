@@ -82,3 +82,28 @@ def test_items_in_pocket_evolution():
 
 def test_items_in_pocket_unknown_pocket_returns_empty():
     assert items.items_in_pocket("not-a-pocket") == []
+
+
+# ---- HP modifier (Phase 3) ----------------------------------------------
+
+
+def test_hp_modifier_full():
+    """At full HP the canonical Gen-1/3+ HP factor is exactly 1/3 — the
+    "worst case" multiplier. Lower HP shifts toward the 1.0 ceiling."""
+    assert items.hp_modifier(40, 40) == pytest.approx(1.0 / 3.0)
+
+
+def test_hp_modifier_at_one_hp():
+    """Almost-zero HP saturates near 1.0. With hp_current=1, hp_max=40 the
+    formula gives (3*40 - 2*1)/(3*40) ≈ 0.983."""
+    val = items.hp_modifier(1, 40)
+    assert 0.97 <= val <= 1.0
+
+
+def test_hp_modifier_clamped():
+    """Bogus inputs (zero/negative max) fall back to 1.0 (no effect).
+    hp_current > hp_max clamps to the 1/3 floor."""
+    assert items.hp_modifier(0, 0) == 1.0
+    assert items.hp_modifier(-5, 40) == pytest.approx(1.0)
+    # hp_current > hp_max → raw is below 1/3, clamped up to 1/3.
+    assert items.hp_modifier(80, 40) == pytest.approx(1.0 / 3.0)

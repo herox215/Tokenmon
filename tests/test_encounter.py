@@ -365,3 +365,49 @@ def test_maybe_spawn_persists_move_keys(db_path, monkeypatch):
     enc = encounter.maybe_spawn(force=True, path=db_path)
     assert enc is not None
     assert enc.move_keys == ("tackle", "growl")
+
+
+# ---- Phase 3: HP-aware catch math ---------------------------------------
+
+
+def test_catch_probability_full_hp_unchanged():
+    """When both HP args are None (legacy path), behave exactly as before
+    Phase 3. This is the back-compat contract the existing _resolve_throw
+    tests pin."""
+    base = encounter.catch_probability(255, "pokeball")
+    none_hp = encounter.catch_probability(255, "pokeball", hp_current=None, hp_max=None)
+    assert abs(base - none_hp) < 1e-9
+
+
+def test_catch_probability_one_hp_max_modifier():
+    """At low HP, the canon Gen HP factor boosts catch probability over the
+    full-HP case."""
+    p_full = encounter.catch_probability(100, "pokeball", hp_current=40, hp_max=40)
+    p_low = encounter.catch_probability(100, "pokeball", hp_current=1, hp_max=40)
+    assert p_low > p_full
+
+
+def test_catch_probability_masterball_ignores_hp():
+    """Master Ball still 1.0 regardless of HP."""
+    assert encounter.catch_probability(
+        50, "masterball", hp_current=40, hp_max=40,
+    ) == 1.0
+
+
+def test_resolve_throw_uses_current_hp_modifier(db_path, stub_items, monkeypatch):
+    """_resolve_throw threads the encounter's hp_current into the catch math."""
+    eid = _seed_pending(db_path, catch_rate=100)
+    storage.set_encounter_hp(eid, 1, path=db_path)
+
+    captured: dict = {}
+    real_cp = encounter.catch_probability
+
+    def spy_cp(rate, key, **kw):
+        captured.update(kw)
+        return real_cp(rate, key, **kw)
+
+    monkeypatch.setattr(encounter, "catch_probability", spy_cp)
+    monkeypatch.setattr(encounter._RNG, "random", lambda: 0.999)
+    encounter._resolve_throw(eid, "pokeball", path=db_path)
+    assert captured.get("hp_current") == 1
+    assert captured.get("hp_max") is not None
