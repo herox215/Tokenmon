@@ -58,7 +58,6 @@ from tokenmon.popover.widgets import (
     PANE_ITEMS,
     PANE_POKEMON,
     PANE_TOKENDEX,
-    PANE_TRAINER_PREVIEW,
     PANE_USAGE,
     POPOVER_HEIGHT,
     POPOVER_WIDTH,
@@ -214,29 +213,16 @@ class TokenmonPopover(NSObject):
 
     def _resolve_locked_click(self, idx: int) -> int | None:
         """Return the pane id to navigate to for a sidebar click while locked,
-        or None if the click should be ignored. Usage is always allowed; the
-        active encounter/trainer slot is allowed (the trainer slot routes
-        straight to PANE_BATTLE when a battle is in progress, so peeking at
-        Usage and coming back doesn't reset the session)."""
+        or None if the click should be ignored. Usage is always allowed.
+        The unified encounter slot routes to PANE_BATTLE when a session is
+        live (so peeking at Usage and coming back doesn't reset the fight)
+        and to PANE_ENCOUNTER preview otherwise."""
         if idx == PANE_USAGE:
             return PANE_USAGE
         if idx == PANE_ENCOUNTER:
-            try:
-                if get_pending_encounter() is not None:
-                    return PANE_ENCOUNTER
-            except Exception:
-                log.exception("get_pending_encounter failed")
-            return None
-        if idx == PANE_TRAINER_PREVIEW:
-            try:
-                if get_pending_trainer() is None:
-                    return None
-            except Exception:
-                log.exception("get_pending_trainer failed")
-                return None
             if getattr(self, "_battle_session", None) is not None:
                 return PANE_BATTLE
-            return PANE_TRAINER_PREVIEW
+            return PANE_ENCOUNTER
         return None
 
     # ---- sidebar ----
@@ -270,8 +256,8 @@ class TokenmonPopover(NSObject):
 
         items: list[tuple[int, str]] = []
         if pending_trainer is not None:
-            items.append((PANE_TRAINER_PREVIEW, "⚔️"))
-        if pending_enc is not None:
+            items.append((PANE_ENCOUNTER, "⚔️"))
+        elif pending_enc is not None:
             items.append((PANE_ENCOUNTER, "⚡"))
         items += [
             (PANE_POKEMON, "🥚"),
@@ -405,18 +391,16 @@ class TokenmonPopover(NSObject):
         from tokenmon.popover.panes.battle import BattleController
         from tokenmon.popover.panes.battle_reward import BattleRewardController
         from tokenmon.popover.panes.box import BoxController
-        from tokenmon.popover.panes.encounter import EncounterController
+        from tokenmon.popover.panes.encounter_preview import (
+            EncounterPreviewController,
+        )
         from tokenmon.popover.panes.items import ItemsController
         from tokenmon.popover.panes.pokemon import PokemonController
         from tokenmon.popover.panes.tokendex import TokendexController
-        from tokenmon.popover.panes.trainer_preview import (
-            TrainerPreviewController,
-        )
         from tokenmon.popover.panes.usage import UsageController
 
         registry = {
-            PANE_ENCOUNTER: EncounterController,
-            PANE_TRAINER_PREVIEW: TrainerPreviewController,
+            PANE_ENCOUNTER: EncounterPreviewController,
             PANE_BATTLE: BattleController,
             PANE_BATTLE_REWARD: BattleRewardController,
             PANE_POKEMON: PokemonController,
@@ -582,9 +566,9 @@ class TokenmonPopover(NSObject):
         except Exception:
             log.exception("get_pending_encounter failed")
             pending_enc = None
-        if pending_trainer is not None and self._current_pane in base_panes:
-            self._current_pane = PANE_TRAINER_PREVIEW
-        elif pending_enc is not None and self._current_pane in base_panes:
+        if (pending_trainer is not None or pending_enc is not None) and (
+            self._current_pane in base_panes
+        ):
             self._current_pane = PANE_ENCOUNTER
         self._refresh_sidebar_pokemon_icon()
         self._show_pane(self._current_pane)

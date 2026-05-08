@@ -33,13 +33,11 @@ POPOVER_HEIGHT = 500
 SIDEBAR_WIDTH = 60
 CONTENT_WIDTH = POPOVER_WIDTH - SIDEBAR_WIDTH
 
-# Pane id constants — sentinel value for the conditional encounter slot
-# can never collide with the 0..4 indices used for the four base panes.
+# Pane id constants — sentinel values for the conditional encounter slot.
+# PANE_ENCOUNTER is the unified sidebar slot id AND the preview-pane id;
+# trainer and wild fights share it. Battle + reward sub-panes are reached
+# imperatively from the preview, so they don't need their own sidebar slots.
 PANE_ENCOUNTER = -1
-# Trainer-battle slot: shows the preview when a trainer is pending.
-# Battle + reward sub-panes are reached imperatively from preview, so
-# they don't need their own sidebar slots.
-PANE_TRAINER_PREVIEW = -2
 PANE_BATTLE = -3
 PANE_BATTLE_REWARD = -4
 PANE_POKEMON = 0

@@ -247,9 +247,9 @@ class UsageController(PaneController):
         def _spawn_trainer(_s):
             try:
                 from tokenmon import trainer as trainer_mod
-                from tokenmon.popover.widgets import PANE_TRAINER_PREVIEW
+                from tokenmon.popover.widgets import PANE_ENCOUNTER
                 trainer_mod.maybe_spawn(force=True)
-                self.popover._show_pane(PANE_TRAINER_PREVIEW)
+                self.popover._show_pane(PANE_ENCOUNTER)
             except Exception:
                 log.exception("trainer force-spawn failed")
 

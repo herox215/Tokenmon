@@ -127,20 +127,33 @@ class _ItemRowHandler(NSObject):
 
 
 class EncounterController(PaneController):
-    """Renders the encounter pane in one of three modes:
+    """Reveal-only controller: shown imperatively after a successful catch
+    via begin_catch_reveal. The pre-fight preview lives in
+    EncounterPreviewController; the bag-open inventory now lives on the
+    battle pane (Phase 5).
 
-    1. *Default*: silhouette + Bag/Run buttons (when ``_pending_reveal_pokemon``
-       is None and ``_encounter_bag_open`` is False).
-    2. *Bag-open*: silhouette + inventory list + Back/Run buttons.
-    3. *Reveal*: real sprite + caught banner + type badges (when
-       ``_pending_reveal_pokemon`` is set).
+    build_view paints the reveal when a payload is present, otherwise an
+    empty fallback so a stray sidebar click mid-reveal lands somewhere
+    sensible.
     """
 
     def build_view(self) -> NSView:
         pop = self.popover
         if pop._pending_reveal_pokemon is not None:
             return self._build_reveal(pop._pending_reveal_pokemon)
-        return self._build_main()
+        # No reveal payload — render an empty placeholder. This path is
+        # rarely hit; the unified preview owns the real "what's pending"
+        # screen via EncounterPreviewController.
+        view = NSView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT)
+        )
+        view.addSubview_(_label(
+            NSMakeRect(16, POPOVER_HEIGHT // 2 - 10, CONTENT_WIDTH - 32, 20),
+            "",
+            color=NSColor.secondaryLabelColor(),
+            align=NSTextAlignmentCenter,
+        ))
+        return view
 
     # ---- main view (default + bag-open) -------------------------------
 
