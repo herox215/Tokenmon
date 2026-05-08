@@ -49,6 +49,7 @@ from tokenmon.battle.team_gen import generate_wild_mon
 from tokenmon.popover.panes.battle_fx import make_type_fx
 from tokenmon.popover._handlers import make_handler
 from tokenmon.popover.panes._move_tooltip import format_move_tooltip
+from tokenmon.popover.panes.move_button import _MoveButtonView
 from tokenmon.popover.panes.base import PaneController
 from tokenmon.popover.widgets import (
     CONTENT_WIDTH,
@@ -697,23 +698,22 @@ class BattleController(PaneController):
             row = i // 2
             x = 20 + col * (btn_w + 20)
             y = 102 - row * (btn_h + 8)
-            btn = NSButton.alloc().initWithFrame_(
-                NSMakeRect(x, y, btn_w, btn_h)
-            )
             cur_pp = move_pps[i] if i < len(move_pps) else mv.pp
-            label = f"{mv.name} ({mv.type})  PP {cur_pp}/{mv.pp}"
-            btn.setTitle_(label)
-            btn.setBezelStyle_(1)
+            handler = self._make_move_handler(mv, i)
+            self._handlers.append(handler)
+            btn = _MoveButtonView.alloc().initWithFrame_move_currentPP_target_action_(
+                NSMakeRect(x, y, btn_w, btn_h),
+                mv,
+                cur_pp,
+                handler,
+                b"fire:",
+            )
             try:
                 btn.setToolTip_(format_move_tooltip(mv, cur_pp))
             except Exception:
                 log.exception("setToolTip failed for move %s", mv.key)
             if cur_pp <= 0:
                 btn.setEnabled_(False)
-            handler = self._make_move_handler(mv, i)
-            self._handlers.append(handler)
-            btn.setTarget_(handler)
-            btn.setAction_(b"fire:")
             view.addSubview_(btn)
             self._move_buttons.append(btn)
 
