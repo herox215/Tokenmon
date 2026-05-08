@@ -303,6 +303,7 @@ def _resolve_throw(
                 is_shiny=pending.is_shiny,
                 gender=pending.gender,
                 ivs=pending.ivs,
+                level=pending.level,
                 path=path,
             )
         except AttributeError:  # pragma: no cover — staging fallback

@@ -110,9 +110,10 @@ CREATE TABLE IF NOT EXISTS player_stats (
 );
 INSERT OR IGNORE INTO player_stats (id, money) VALUES (1, 0);
 
--- Per-Pokémon move slots (0..3). Filled at catch time and updated by
--- the move-learn dialog when a Pokémon levels up to a new learnset entry.
--- ``current_pp`` decays during a battle and resets to max post-battle.
+-- Per-Pokémon move slots (0..3). Filled at catch time, updated by the
+-- level-up auto-learn handler, and rewritten by the Box-detail
+-- attack-swap UI. ``current_pp`` decays during a battle and resets to
+-- max post-battle.
 CREATE TABLE IF NOT EXISTS pokemon_moves (
     pokemon_id INTEGER NOT NULL,
     slot       INTEGER NOT NULL CHECK (slot >= 0 AND slot < 4),
@@ -122,17 +123,18 @@ CREATE TABLE IF NOT EXISTS pokemon_moves (
 );
 CREATE INDEX IF NOT EXISTS idx_pokemon_moves_pid ON pokemon_moves(pokemon_id);
 
--- Move-learn queue: one row per pending learn opportunity.
--- Resolved by the user via the inline dialog in the active-Pokémon /
--- box-detail panes (Learn → set move slot, Skip → just drop the row).
-CREATE TABLE IF NOT EXISTS pending_move_learns (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+-- Per-Pokémon "unlocked moves" pool: every move the Pokémon has ever
+-- known (initial seed + every level-up auto-learn + every level-up
+-- overflow). The Box-detail attack-swap UI lists these. ``pokemon_moves``
+-- is the (currently equipped) subset.
+CREATE TABLE IF NOT EXISTS pokemon_unlocked_moves (
     pokemon_id        INTEGER NOT NULL,
     move_key          TEXT    NOT NULL,
     learned_at_level  INTEGER NOT NULL,
-    queued_utc        TEXT    NOT NULL
+    unlocked_utc      TEXT    NOT NULL,
+    PRIMARY KEY (pokemon_id, move_key)
 );
-CREATE INDEX IF NOT EXISTS idx_pending_move_learns_pid ON pending_move_learns(pokemon_id);
+CREATE INDEX IF NOT EXISTS idx_pokemon_unlocked_moves_pid ON pokemon_unlocked_moves(pokemon_id);
 
 -- Trainers: spawned via ``trainer.maybe_spawn``, resolved by the battle
 -- pane to 'won' / 'lost' / 'ran'. Pre-battle the player only sees the
@@ -440,6 +442,47 @@ def _backfill_inventory(conn: sqlite3.Connection) -> None:
     )
 
 
+def _backfill_unlocked_moves(conn: sqlite3.Connection) -> None:
+    """Seed ``pokemon_unlocked_moves`` from existing equipped moves +
+    drop the legacy ``pending_move_learns`` queue.
+
+    Pre-existing Pokémon already have rows in ``pokemon_moves`` (their
+    currently equipped slots). Mirror those into the new pool so the
+    Box-detail swap UI has at least the equipped set to choose from.
+
+    Any rows still sitting in the old ``pending_move_learns`` queue are
+    promoted to unlocked too — they're moves the user already accrued
+    via level-up but hadn't resolved through the (now-removed) modal.
+
+    Idempotent: ``INSERT … ON CONFLICT DO NOTHING`` makes repeat calls
+    cheap, and the legacy DROP is no-op once the table is gone.
+    """
+    ts = "1970-01-01T00:00:00+00:00"
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO pokemon_unlocked_moves
+            (pokemon_id, move_key, learned_at_level, unlocked_utc)
+        SELECT pokemon_id, move_key, 1, ?
+        FROM pokemon_moves
+        """,
+        (ts,),
+    )
+    has_pending = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='pending_move_learns'"
+    ).fetchone()
+    if has_pending is not None:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO pokemon_unlocked_moves
+                (pokemon_id, move_key, learned_at_level, unlocked_utc)
+            SELECT pokemon_id, move_key, learned_at_level, queued_utc
+            FROM pending_move_learns
+            """,
+        )
+        conn.execute("DROP TABLE pending_move_learns")
+
+
 def init_db(path: Path | None = None) -> None:
     """Apply schema + every idempotent migration. Safe to call repeatedly."""
     if path is None:
@@ -456,3 +499,4 @@ def init_db(path: Path | None = None) -> None:
         _migrate_encounter_balls_to_items(conn)
         _backfill_pokedex_seen(conn)
         _backfill_inventory(conn)
+        _backfill_unlocked_moves(conn)

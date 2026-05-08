@@ -44,7 +44,7 @@ def _isolate_db(tmp_path, monkeypatch):
     # renames / additions.
     for sub in (
         "encounter", "pokedex", "pokemon", "usage",
-        "player", "moves", "pending_moves", "trainers",
+        "player", "moves", "unlocked_moves", "trainers",
     ):
         try:
             mod = __import__(
@@ -55,6 +55,23 @@ def _isolate_db(tmp_path, monkeypatch):
         except ImportError:
             continue
     yield db_path
+
+
+@pytest.fixture(autouse=True)
+def _isolate_catch_seed(monkeypatch):
+    """Stub ``box.seed_initial_moves`` so tests don't hit PokeAPI as a
+    side-effect of inserting a Pokémon. Tests that want to verify the
+    seeding behavior can undo this stub explicitly.
+    """
+    try:
+        from tokenmon import box as _box
+    except ImportError:
+        return
+    monkeypatch.setattr(
+        _box, "seed_initial_moves",
+        lambda *a, **kw: None, raising=False,
+    )
+    yield
 
 
 @pytest.fixture(autouse=True)

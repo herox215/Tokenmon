@@ -90,22 +90,49 @@ class TrainerPreviewController(PaneController):
         except Exception:
             log.exception("preview-pane prefetch kick failed")
 
-        # Header — trainer-class themed emoji. PokeAPI doesn't ship
-        # trainer-class sprites (Nintendo IP), so we lean on emoji that
-        # match the role: 🐛 Bug Catcher, 🥋 Black Belt, 🎣 Fisherman, etc.
+        # Header — bundled PixelLab sprite when available, themed emoji
+        # otherwise. Sprites live at ``data/trainer_sprites/<slug>.png``;
+        # see ``trainers_remote.ensure_trainer_sprite``.
+        sprite_path = None
         try:
             from tokenmon import trainers_remote
-            avatar = trainers_remote.emoji_for(trainer.title)
+            sprite_path = trainers_remote.ensure_trainer_sprite(trainer.title)
         except Exception:
-            log.exception("trainer emoji lookup failed")
-            avatar = "👤"
+            log.exception("trainer sprite lookup failed")
 
-        view.addSubview_(_label(
-            NSMakeRect(20, POPOVER_HEIGHT - 90, CONTENT_WIDTH - 40, 60),
-            avatar,
-            font=NSFont.systemFontOfSize_(48),
-            align=NSTextAlignmentCenter,
-        ))
+        avatar_y = POPOVER_HEIGHT - 110
+        if sprite_path is not None:
+            sprite_size = 96
+            iv = NSImageView.alloc().initWithFrame_(NSMakeRect(
+                (CONTENT_WIDTH - sprite_size) // 2, avatar_y,
+                sprite_size, sprite_size,
+            ))
+            iv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+            iv.setWantsLayer_(True)
+            layer = iv.layer()
+            if layer is not None:
+                # Crisp upscale for the small canvas pixel art.
+                layer.setMagnificationFilter_("nearest")
+                layer.setMinificationFilter_("nearest")
+            img = NSImage.alloc().initWithContentsOfFile_(str(sprite_path))
+            if img is not None:
+                iv.setImage_(img)
+                view.addSubview_(iv)
+            else:
+                # Image load failed; fall through to emoji branch.
+                sprite_path = None
+        if sprite_path is None:
+            try:
+                from tokenmon import trainers_remote
+                avatar = trainers_remote.emoji_for(trainer.title)
+            except Exception:
+                avatar = "👤"
+            view.addSubview_(_label(
+                NSMakeRect(20, POPOVER_HEIGHT - 90, CONTENT_WIDTH - 40, 60),
+                avatar,
+                font=NSFont.systemFontOfSize_(48),
+                align=NSTextAlignmentCenter,
+            ))
         view.addSubview_(_label(
             NSMakeRect(20, POPOVER_HEIGHT - 120, CONTENT_WIDTH - 40, 22),
             f"{trainer.title} {trainer.name}",

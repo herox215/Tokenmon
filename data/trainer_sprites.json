@@ -1,0 +1,25 @@
+{
+  "_comment": "PixelLab character IDs per trainer title. Generated chibi side-view sprites at 64px canvas (rendered ~92x92 incl. animation padding). Used by trainers_remote.ensure_trainer_sprite to fetch + cache the rendered PNG locally.",
+  "characters": {
+    "Bug Catcher": "cc137e0c-b4b3-438b-9ce2-b8df6d7e9672",
+    "Lass": "a6516de9-1358-4187-ac4a-08dc2f383cca",
+    "Youngster": "de761459-ff85-4b4a-852b-81ab3367e0e5",
+    "Hiker": "c461f3a0-f390-474e-af6c-9f822c455f8a",
+    "Fisherman": "2af838cf-b6c3-4da2-ab2f-ab13eff202d6",
+    "Picnicker": "f7b09388-4f45-497d-a7fb-800eb15526ea",
+    "Camper": "9dafdc9b-2c6e-4bd4-a881-e235e9356ca8",
+    "Bird Keeper": "2362e7af-d472-4517-a3fc-068b75f5c68b",
+    "Sailor": "371bbe8f-97cb-4198-91d5-9fde2ae41890",
+    "Engineer": "bbd18ec3-224b-4152-ab64-397f6786d994",
+    "Beauty": "ace478b1-1a0c-44f4-b073-6474cd324edb",
+    "Gentleman": "f91550bd-efc2-4fd4-b205-099bf25a8e51",
+    "Schoolkid": "ad1111a8-b7b9-499d-813c-a2510038c265",
+    "Black Belt": "82d26475-4322-46bc-82a3-0548bc268d29",
+    "PokéManiac": "d2a6f071-602d-4b14-a63f-7a380642c55b",
+    "Psychic": "a85eef7e-dfcf-45d2-b5b7-da4d29a25c15",
+    "Channeler": "85199b22-5c5a-4929-b2ae-d4994cf1fa0b",
+    "Tamer": "e3d6551b-2bdc-40d6-84c7-e8432160780d",
+    "Burglar": "3fcedcb2-9406-42d4-82b4-76cc3d761662",
+    "Rocker": "d7bb42b1-2f70-4c61-a86d-d3ebd431c6c9"
+  }
+}

@@ -18,11 +18,14 @@ def test_unknown_title_returns_default():
     )
 
 
-def test_ensure_trainer_sprite_returns_none():
-    """Compatibility shim — never returns a Path because PokeAPI doesn't
-    ship trainer-class sprites. Callers must fall back to emoji_for."""
-    assert trainers_remote.ensure_trainer_sprite("Bug Catcher") is None
-    assert trainers_remote.ensure_trainer_sprite("Lass") is None
+def test_ensure_trainer_sprite_returns_path_for_known_titles():
+    """Bundled PixelLab sprites live at ``data/trainer_sprites/<slug>.png``.
+    Known titles should resolve to an existing file; unknown titles fall
+    through to ``None`` so the caller renders the emoji glyph."""
+    bug = trainers_remote.ensure_trainer_sprite("Bug Catcher")
+    assert bug is not None
+    assert bug.exists() and bug.suffix == ".png"
+    assert trainers_remote.ensure_trainer_sprite("Bogus Class") is None
 
 
 def test_every_pool_title_has_an_emoji():

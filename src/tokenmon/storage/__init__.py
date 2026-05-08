@@ -83,13 +83,12 @@ from .moves import (
     set_pokemon_move,
 )
 
-# Move-learn queue
-from .pending_moves import (
-    PendingMoveLearn,
-    claim_pending_move_learn,
-    clear_pending_for_pokemon,
-    query_pending_move_learns,
-    queue_move_learn,
+# Per-Pokémon "unlocked moves" pool
+from .unlocked_moves import (
+    UnlockedMove,
+    delete_unlocked_moves,
+    get_unlocked_moves,
+    unlock_move,
 )
 
 # Trainer battles
@@ -146,9 +145,9 @@ __all__ = [
     # pokemon_moves
     "PokemonMove", "get_pokemon_moves", "set_pokemon_move",
     "decrement_pp", "reset_pp_for_pokemon", "delete_pokemon_moves",
-    # pending move-learns
-    "PendingMoveLearn", "queue_move_learn", "query_pending_move_learns",
-    "claim_pending_move_learn", "clear_pending_for_pokemon",
+    # unlocked moves
+    "UnlockedMove", "unlock_move", "get_unlocked_moves",
+    "delete_unlocked_moves",
     # trainers
     "Trainer", "TrainerPokemonRow", "insert_trainer",
     "get_pending_trainer", "get_trainer", "list_trainer_pokemon",

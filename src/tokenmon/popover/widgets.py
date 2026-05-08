@@ -42,10 +42,6 @@ PANE_ENCOUNTER = -1
 PANE_TRAINER_PREVIEW = -2
 PANE_BATTLE = -3
 PANE_BATTLE_REWARD = -4
-# Move-learn modal: takes over the sidebar (along with the Usage tab)
-# when the active Pokémon has 4 moves and a queued learn — user must
-# pick which existing move to forget before navigating elsewhere.
-PANE_MOVE_LEARN = -5
 PANE_POKEMON = 0
 PANE_TOKENDEX = 1
 PANE_BOX = 2

@@ -47,7 +47,7 @@ def set_pokemon_move(
     path: Path | None = None,
 ) -> None:
     """Upsert a move into a slot with full PP. Used by initial-moves
-    backfill at catch + by the move-learn dialog."""
+    backfill, level-up auto-learn, and the Box-detail attack-swap UI."""
     if not 0 <= slot < 4:
         raise ValueError(f"slot must be in [0..4), got {slot}")
     if path is None:

@@ -364,22 +364,7 @@ class PokemonController(PaneController):
             align=NSTextAlignmentCenter,
         ))
 
-        # Move-learn inline dialog: when this Pokémon has queued moves
-        # to learn from a recent level-up, surface the prompt here so
-        # the user can act on it without leaving the pane.
         cursor_y = xp_y - 22
-        try:
-            from tokenmon.popover.panes._move_learn_inline import (
-                build_move_learn_inline,
-            )
-            consumed_h = build_move_learn_inline(
-                view, self, pokemon_id=row.id,
-                top_y=xp_y - 30,
-            )
-        except Exception:
-            log.exception("move-learn inline build failed")
-            consumed_h = 0
-        cursor_y -= consumed_h
 
         # Move grid: shows the four learned moves with hover tooltips
         # for power/accuracy/PP. Backfills missing moves from the
@@ -428,7 +413,11 @@ class PokemonController(PaneController):
         """
         try:
             from tokenmon import learnsets_remote, moves_remote
-            from tokenmon.storage import get_pokemon_moves, set_pokemon_move
+            from tokenmon.storage import (
+                get_pokemon_moves,
+                set_pokemon_move,
+                unlock_move,
+            )
         except Exception:
             log.exception("move backfill imports failed")
             return
@@ -443,6 +432,10 @@ class PokemonController(PaneController):
                 md = moves_remote.get_move_data(key)
                 max_pp = md.pp if md is not None else 35
                 set_pokemon_move(pokemon_id, slot, key, max_pp=max_pp)
+                try:
+                    unlock_move(pokemon_id, key, max(1, level))
+                except Exception:
+                    log.exception("unlock_move failed for %s", key)
         except Exception:
             log.exception("move backfill failed for #%d", pokemon_id)
 

@@ -4,8 +4,10 @@
 if none is active) and resolves it through the species' growth-rate
 table. ``check_level_up`` runs every activity poll: when the level
 increased it fires the rumps notification + companion overlay
-animation and walks the species learnset to either auto-learn the new
-move(s) or queue them for the modal forget-which-move pane.
+animation and walks the species learnset to auto-learn into any free
+slot. Moves that don't fit (4/4 already equipped) are still recorded
+in ``pokemon_unlocked_moves`` so the user can switch to them via the
+Box-detail attack-swap UI.
 
 State (``app._last_known_level``, ``app._line_base_id``,
 ``app._pokemon_dex_id``, ``app._pokemon_sprite``, ``app._companion_mode``,
@@ -79,7 +81,7 @@ def check_level_up(app, now: float) -> None:
         # Move-learn handling: for every level the Pokémon just
         # gained, walk the species learnset and either auto-learn
         # the move (free slot available, no duplicate) or queue
-        # it for the modal forget-which-move pane (4 slots full).
+        # otherwise just record it as unlocked (4 slots full).
         if active is not None:
             try:
                 apply_level_up_moves(app, active, old_level, new_level)
@@ -94,12 +96,15 @@ def apply_level_up_moves(app, active, old_level: int, new_level: int) -> None:
     """For each level gained, learn the species' level-up moves.
 
     Auto-learn rules:
-      1. If the move is already known → skip (no duplicate).
+      1. If the move is already equipped → skip.
       2. If <4 slots filled → write to the lowest free slot at full
          PP and fire a "X learned Foo!" notification.
-      3. Otherwise → queue via ``queue_move_learn`` so the modal
-         pane can present the forget-which-move flow next time the
-         popover opens.
+      3. Otherwise → just record it as unlocked + fire a "can switch
+         to Foo" notification. The user equips it later from the
+         Box-detail attack-swap UI.
+
+    Every move encountered (seed, auto-learned, or overflow) is also
+    written to ``pokemon_unlocked_moves`` so the swap UI can list it.
 
     First-time level-ups for a Pokémon with no ``pokemon_moves``
     rows trigger a backfill from ``initial_moves`` so the lower-
@@ -108,8 +113,8 @@ def apply_level_up_moves(app, active, old_level: int, new_level: int) -> None:
     from tokenmon import learnsets_remote, moves_remote
     from tokenmon.storage import (
         get_pokemon_moves,
-        queue_move_learn,
         set_pokemon_move,
+        unlock_move,
     )
 
     # Backfill: a Pokémon caught before this feature has an empty
@@ -125,6 +130,10 @@ def apply_level_up_moves(app, active, old_level: int, new_level: int) -> None:
                 md = moves_remote.get_move_data(key)
                 max_pp = md.pp if md is not None else 35
                 set_pokemon_move(active.id, slot, key, max_pp=max_pp)
+                try:
+                    unlock_move(active.id, key, max(1, old_level))
+                except Exception:
+                    log.exception("seed unlock_move failed for %s", key)
         except Exception:
             log.exception("level-up backfill failed")
 
@@ -144,15 +153,23 @@ def apply_level_up_moves(app, active, old_level: int, new_level: int) -> None:
             log.exception("moves_at_level lookup failed for L%d", lv)
             continue
         for move_key in lv_moves:
+            try:
+                unlock_move(active.id, move_key, lv)
+            except Exception:
+                log.exception("unlock_move failed for %s", move_key)
             if move_key in existing_keys:
                 continue
             current = get_pokemon_moves(active.id)
+            md = moves_remote.get_move_data(move_key)
+            move_display = (
+                md.name if md is not None
+                else move_key.replace("-", " ").title()
+            )
             if len(current) < 4:
                 occupied = {m.slot for m in current}
                 free = next(
                     s for s in range(4) if s not in occupied
                 )
-                md = moves_remote.get_move_data(move_key)
                 max_pp = md.pp if md is not None else 35
                 try:
                     set_pokemon_move(
@@ -165,10 +182,6 @@ def apply_level_up_moves(app, active, old_level: int, new_level: int) -> None:
                     )
                     continue
                 existing_keys.add(move_key)
-                move_display = (
-                    md.name if md is not None
-                    else move_key.replace("-", " ").title()
-                )
                 try:
                     rumps.notification(
                         title="Tokenmon",
@@ -178,11 +191,17 @@ def apply_level_up_moves(app, active, old_level: int, new_level: int) -> None:
                 except Exception:
                     log.exception("auto-learn notification failed")
             else:
+                # 4/4 slots full: leave the equipped set alone, but
+                # let the user know they can swap in the new move
+                # from the Box detail.
                 try:
-                    queue_move_learn(active.id, move_key, lv)
-                except Exception:
-                    log.exception(
-                        "queue_move_learn failed for %s", move_key,
+                    rumps.notification(
+                        title="Tokenmon",
+                        subtitle="New move unlocked!",
+                        message=(
+                            f"{display} can switch to {move_display} "
+                            "(Box → details → tap a slot)."
+                        ),
                     )
-                    continue
-                existing_keys.add(move_key)
+                except Exception:
+                    log.exception("unlock notification failed")

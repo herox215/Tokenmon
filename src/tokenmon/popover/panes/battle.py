@@ -16,6 +16,7 @@ import logging
 import random
 from dataclasses import asdict, replace
 
+import objc
 from AppKit import (
     NSBezierPath,
     NSButton,
@@ -29,11 +30,19 @@ from AppKit import (
     NSTextAlignmentRight,
     NSView,
 )
-from Foundation import NSMakeRect
+from Foundation import NSMakeRect, NSObject, NSTimer
 
 from tokenmon import box, learnsets_remote, moves_remote, pokemon
-from tokenmon.battle.engine import resolve_turn
+from tokenmon.battle.engine import (
+    AttackEvent,
+    FaintEvent,
+    MissEvent,
+    fold_events,
+    plan_turn,
+    resolve_turn,
+)
 from tokenmon.battle.models import BattleStats, Move
+from tokenmon.popover.panes.battle_fx import make_type_fx
 from tokenmon.popover._handlers import make_handler
 from tokenmon.popover.panes._move_tooltip import format_move_tooltip
 from tokenmon.popover.panes.base import PaneController
@@ -58,8 +67,18 @@ _FALLBACK_MOVE = Move(
 )
 
 
+_HP_DRAIN_FPS = 30
+
+
 class _HPBar(NSView):
-    """Simple HP bar — green > 50%, orange 20-50%, red < 20%."""
+    """HP bar with an animated drain (Game-Boy-style "tick down" feel).
+
+    Color tiers — green > 50%, orange 20–50%, red < 20% — are recomputed
+    each ``drawRect_`` so the bar shifts color naturally as it drains
+    rather than snapping at the next render. The animation is a plain
+    NSTimer at ~30 fps; no Core Animation, keeps the popover
+    rendering-stack uniform.
+    """
 
     def initWithFrame_current_max_(self, frame, current, hp_max):  # noqa: N802
         import objc
@@ -68,6 +87,12 @@ class _HPBar(NSView):
             return None
         self._current = max(0, int(current))
         self._max = max(1, int(hp_max))
+        # Animation state — quiescent when _anim_timer is None.
+        self._anim_timer = None
+        self._anim_start_value = float(self._current)
+        self._anim_target_value = float(self._current)
+        self._anim_start_ts = 0.0
+        self._anim_duration = 0.0
         return self
 
     def drawRect_(self, _rect):  # noqa: N802
@@ -94,13 +119,66 @@ class _HPBar(NSView):
             fill, 4, 4,
         ).fill()
 
+    def setCurrent_(self, value):  # noqa: N802
+        """Snap to ``value`` (no animation). Used to reset state when
+        re-rendering or when a half-finished animation is preempted."""
+        self._cancel_animation()
+        self._current = max(0, min(int(self._max), int(value)))
+        self.setNeedsDisplay_(True)
+
+    def animateToValue_duration_(self, target, duration):  # noqa: N802
+        """Linearly interpolate ``_current`` to ``target`` over
+        ``duration`` seconds. Calling again mid-drain re-anchors the
+        start value to whatever's currently displayed and re-aims at
+        the new target — no abrupt jumps."""
+        from time import monotonic
+        target = max(0, min(int(self._max), int(target)))
+        if duration <= 0 or self._current == target:
+            self.setCurrent_(target)
+            return
+        # Re-anchor to current (possibly mid-drain) value.
+        self._cancel_animation()
+        self._anim_start_value = float(self._current)
+        self._anim_target_value = float(target)
+        self._anim_start_ts = monotonic()
+        self._anim_duration = float(duration)
+        self._anim_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0 / _HP_DRAIN_FPS, self, b"tickAnimation:", None, True,
+        )
+
+    def tickAnimation_(self, _timer):  # noqa: N802 — NSTimer callback
+        from time import monotonic
+        elapsed = monotonic() - self._anim_start_ts
+        t = elapsed / self._anim_duration if self._anim_duration > 0 else 1.0
+        if t >= 1.0:
+            self._current = int(self._anim_target_value)
+            self._cancel_animation()
+            self.setNeedsDisplay_(True)
+            return
+        # Linear interpolation. A small bias toward integer ticks keeps
+        # the bar from looking subtly jittery between frames.
+        value = (
+            self._anim_start_value
+            + (self._anim_target_value - self._anim_start_value) * t
+        )
+        self._current = int(round(value))
+        self.setNeedsDisplay_(True)
+
+    def _cancel_animation(self):
+        if self._anim_timer is not None:
+            try:
+                self._anim_timer.invalidate()
+            except Exception:
+                pass
+            self._anim_timer = None
+
 
 def _player_battle_stats(active) -> BattleStats:
     """Build BattleStats for the player's active Pokémon. Uses
     pokemon.stats.final_stats for HP/Atk/Def/etc. Moves come from the
     pokemon_moves table (backfilled via learnsets if empty)."""
     from tokenmon.pokemon.stats import final_stats
-    from tokenmon.storage import get_pokemon_moves, set_pokemon_move
+    from tokenmon.storage import get_pokemon_moves, set_pokemon_move, unlock_move
 
     # ``Pokemon.ivs`` is the canonical 6-tuple; older code expected
     # flat ``iv_hp/...`` fields which the dataclass doesn't expose.
@@ -128,6 +206,10 @@ def _player_battle_stats(active) -> BattleStats:
         for slot, key in enumerate(keys[:4]):
             md = moves_remote.get_move_data(key) or _FALLBACK_MOVE
             set_pokemon_move(active.id, slot, key, max_pp=md.pp)
+            try:
+                unlock_move(active.id, key, max(1, level))
+            except Exception:
+                log.exception("unlock_move failed for %s", key)
         rows = get_pokemon_moves(active.id)
 
     moves: list[Move] = []
@@ -211,11 +293,124 @@ def _init_battle_session(popover, trainer, active) -> dict:
     return session
 
 
+class _BattleStepRunner(NSObject):
+    """Walks an ordered list of ``(delay_seconds, callable)`` steps via
+    NSTimer. Mirrors the catch / pat / claim animation handlers — each
+    step fires after its delay and schedules the next one. The
+    callable runs Python code that mutates the controller (animate HP
+    bar, mount FX, append log line, etc.).
+
+    A separate ``done_cb`` runs after the final step so the controller
+    can commit final state, decrement PP, and rerender.
+    """
+
+    def initWithSteps_doneCb_(self, steps, done_cb):  # noqa: N802
+        self = objc.super(_BattleStepRunner, self).init()
+        if self is None:
+            return None
+        self._steps = list(steps)
+        self._done_cb = done_cb
+        self._idx = 0
+        self._cancelled = False
+        return self
+
+    def start(self):
+        if not self._steps:
+            self._finish()
+            return
+        self._scheduleNext()
+
+    def cancel(self):
+        """Mid-sequence abort. Pending steps don't fire, but the
+        controller's ``done_cb`` still runs so it can apply final state
+        and re-render. Used when the popover closes mid-turn."""
+        self._cancelled = True
+        # Skip remaining steps; let _finish run so state still commits.
+        self._finish()
+
+    def _scheduleNext(self):
+        if self._cancelled or self._idx >= len(self._steps):
+            return
+        delay, _ = self._steps[self._idx]
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            max(0.001, delay), self, b"fire:", None, False,
+        )
+
+    def fire_(self, _timer):  # noqa: N802 — NSTimer callback
+        if self._cancelled:
+            return
+        if self._idx >= len(self._steps):
+            return
+        _, action = self._steps[self._idx]
+        self._idx += 1
+        try:
+            if action is not None:
+                action()
+        except Exception:
+            log.exception("battle step failed")
+        if self._idx >= len(self._steps):
+            self._finish()
+            return
+        self._scheduleNext()
+
+    def _finish(self):
+        cb = self._done_cb
+        self._done_cb = None
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            log.exception("battle runner done_cb failed")
+
+
+# ----------------------------------------------------------------------
+# Per-event timing — one source of truth so designers can tune feel.
+# ----------------------------------------------------------------------
+
+# Game-Boy-ish drain pacing (chosen in the planning round).
+HP_DRAIN_SECONDS = 0.7
+ATTACK_SHAKE_SECONDS = 0.15
+TYPE_FX_SECONDS = 0.30  # Should match battle_fx.FX_DURATION; the
+                        # runner just needs to know how long to wait.
+LOG_GAP_SECONDS = 0.20
+FAINT_FADE_SECONDS = 0.40
+
+
 class BattleController(PaneController):
     """The active battle pane. Renders sprites + HP + move-picker + log
     based on the popover's battle session."""
 
+    def __init__(self, popover) -> None:
+        super().__init__(popover)
+        # View refs the step runner needs. They're populated during
+        # ``_render_battle_view`` and reset here so unit tests that
+        # exercise ``_do_player_move`` directly (without rendering) find
+        # the attributes present-but-empty and fall through to the
+        # synchronous commit path.
+        self._opp_bar = None
+        self._player_bar = None
+        self._opp_sprite_view = None
+        self._player_sprite_view = None
+        self._opp_hp_label = None
+        self._player_hp_label = None
+        self._battle_view = None
+        self._move_buttons: list = []
+        self._log_labels: list = []
+
     def build_view(self) -> NSView:
+        # If the user re-opened the popover (or navigated away and back)
+        # while a turn was animating, cancel the in-flight runner so it
+        # commits final state — otherwise we'd render against stale bars
+        # that the runner is still trying to drain via dangling refs.
+        existing = getattr(self.popover, "_battle_runner", None)
+        if existing is not None:
+            try:
+                existing.cancel()
+            except Exception:
+                log.exception("battle runner cancel failed")
+            self.popover._battle_runner = None
+
         view = NSView.alloc().initWithFrame_(
             NSMakeRect(0, 0, CONTENT_WIDTH, POPOVER_HEIGHT)
         )
@@ -264,6 +459,18 @@ class BattleController(PaneController):
         opp = session["opp_states"][session["active_opp_idx"]]
         player = session["player_state"]
 
+        # Re-anchor render-time refs (cleared by __init__; cleared again
+        # here so a manual re-render can't hold stale views).
+        self._opp_bar = None
+        self._player_bar = None
+        self._opp_sprite_view = None
+        self._player_sprite_view = None
+        self._opp_hp_label = None
+        self._player_hp_label = None
+        self._move_buttons = []
+        self._log_labels = []
+        self._battle_view = view
+
         sprite_size = 96
 
         # Opponent block (top half) — sprite top-right, name + HP top-left.
@@ -290,6 +497,7 @@ class BattleController(PaneController):
             if img is not None:
                 iv.setImage_(img)
                 view.addSubview_(iv)
+                self._opp_sprite_view = iv
 
         view.addSubview_(_label(
             NSMakeRect(16, POPOVER_HEIGHT - 40,
@@ -303,13 +511,16 @@ class BattleController(PaneController):
             opp.hp_current, opp.hp_max,
         )
         view.addSubview_(opp_bar)
-        view.addSubview_(_label(
+        self._opp_bar = opp_bar
+        opp_hp_lbl = _label(
             NSMakeRect(16, POPOVER_HEIGHT - 80,
                        CONTENT_WIDTH - sprite_size - 40, 14),
             f"{opp.hp_current}/{opp.hp_max} HP",
             font=NSFont.systemFontOfSize_(10),
             color=NSColor.secondaryLabelColor(),
-        ))
+        )
+        view.addSubview_(opp_hp_lbl)
+        self._opp_hp_label = opp_hp_lbl
 
         # Player block (middle) — back-view sprite bottom-left, name + HP
         # bottom-right (mirroring the GBA layout).
@@ -344,6 +555,7 @@ class BattleController(PaneController):
             if img is not None:
                 iv2.setImage_(img)
                 view.addSubview_(iv2)
+                self._player_sprite_view = iv2
 
         info_x = 16 + sprite_size + 16
         info_w = CONTENT_WIDTH - info_x - 16
@@ -358,25 +570,33 @@ class BattleController(PaneController):
             player.hp_current, player.hp_max,
         )
         view.addSubview_(player_bar)
-        view.addSubview_(_label(
+        self._player_bar = player_bar
+        player_hp_lbl = _label(
             NSMakeRect(info_x, player_sprite_y + sprite_size - 54, info_w, 14),
             f"{player.hp_current}/{player.hp_max} HP",
             font=NSFont.systemFontOfSize_(10),
             color=NSColor.secondaryLabelColor(),
             align=NSTextAlignmentRight,
-        ))
+        )
+        view.addSubview_(player_hp_lbl)
+        self._player_hp_label = player_hp_lbl
 
         # Battle log (last 4 lines) — sits between sprite block and moves.
+        # We always create 4 slots so the runner can update them in place
+        # without re-rendering the whole pane.
         log_lines = session["log"][-4:]
         log_y = player_sprite_y - 90
-        for i, line in enumerate(log_lines):
-            view.addSubview_(_label(
+        for i in range(4):
+            line = log_lines[i] if i < len(log_lines) else ""
+            lbl = _label(
                 NSMakeRect(20, log_y + (3 - i) * 18, CONTENT_WIDTH - 40, 16),
                 line,
                 font=NSFont.systemFontOfSize_(11),
                 color=NSColor.secondaryLabelColor(),
                 align=NSTextAlignmentLeft,
-            ))
+            )
+            view.addSubview_(lbl)
+            self._log_labels.append(lbl)
 
         # Move picker — 2x2 grid of buttons. Each button carries a
         # multi-line tooltip with type / power / accuracy / PP and (when
@@ -411,6 +631,7 @@ class BattleController(PaneController):
             btn.setTarget_(handler)
             btn.setAction_(b"fire:")
             view.addSubview_(btn)
+            self._move_buttons.append(btn)
 
         # Description hint row — sits between the 2×2 grid (bottom at
         # y≈64) and the Run button (top at y=38). Shows the first move's
@@ -457,53 +678,425 @@ class BattleController(PaneController):
         session = self.popover._battle_session
         if session is None:
             return
+        # Reject re-clicks while a turn is animating.
+        if getattr(self.popover, "_battle_runner", None) is not None:
+            return
         player_state = session["player_state"]
-        # Guard: refuse to spend a move with no PP. Logged + re-rendered
-        # so the user sees feedback (and the disabled button gets a
-        # fallback in case the click slipped through somehow).
         if slot < len(player_state.move_pps) and player_state.move_pps[slot] <= 0:
             session["log"].append(f"No PP left for {player_move.name}!")
             self._rerender()
             return
         opp = session["opp_states"][session["active_opp_idx"]]
-        # Pick opponent's move randomly from its moveset.
         opp_move = session["rng"].choice(opp.moves)
-        result = resolve_turn(
+
+        events = plan_turn(
             player_state, opp,
             player_move=player_move, opp_move=opp_move,
             rng=session["rng"],
         )
-        # Engine doesn't touch move_pps — decrement here, *after* the
-        # turn resolves, so result.player_state's PP tuple reflects the
-        # spend. (Decrementing first would let the engine's snapshot
-        # overwrite the new value via state_p = player.)
-        new_state = result.player_state
-        if new_state is not None and slot < len(new_state.move_pps):
-            new_pps = list(new_state.move_pps)
+
+        # Spend PP synchronously — both in-memory and on disk — so the
+        # runner sees the right disabled state on its first tick AND a
+        # popover close mid-turn can't lose the PP spend.
+        new_pps = list(player_state.move_pps)
+        if slot < len(new_pps):
             new_pps[slot] = max(0, new_pps[slot] - 1)
-            new_state = replace(new_state, move_pps=tuple(new_pps))
-        session["player_state"] = new_state
-        session["opp_states"][session["active_opp_idx"]] = result.opp_state
-        session["log"].extend(result.log)
-        # Persist the PP spend so it survives re-opening the popover or
-        # restarting the app. ``decrement_pp`` floors at 0, matching the
-        # in-memory clamp above.
+        session["player_state"] = replace(
+            player_state, move_pps=tuple(new_pps),
+        )
         try:
             decrement_pp(session["player_pokemon_id"], slot)
         except Exception:
             log.exception("decrement_pp failed")
 
+        pending = {"events": events}
+
+        # Path A — no rendered view (test path or pre-render call):
+        # commit final state immediately and rerender. Matches the
+        # legacy synchronous behavior so unit tests that stub the engine
+        # still pass.
+        if self._opp_bar is None or self._player_bar is None:
+            self._finalize_turn(pending, append_log=True)
+            return
+
+        # Path B — animated runner. Disable input, walk the step list,
+        # commit final state in the done callback.
+        for b in self._move_buttons:
+            try:
+                b.setEnabled_(False)
+            except Exception:
+                pass
+        steps = self._build_step_list(events, session["player_state"], opp)
+
+        def _on_done():
+            self._finalize_turn(pending, append_log=False)
+
+        runner = _BattleStepRunner.alloc().initWithSteps_doneCb_(
+            steps, _on_done,
+        )
+        self.popover._battle_runner = runner
+        runner.start()
+
+    # ---- runner: step builder + step actions --------------------------
+
+    def _build_step_list(
+        self, events, player_state: BattleStats, opp_state: BattleStats,
+    ):
+        """Translate engine events into a (delay, callable) tape the
+        runner can walk. Pure function of (events, current state) — no
+        side effects until the callables fire."""
+        steps: list[tuple[float, object]] = []
+
+        # Snapshots so each step closure has the right "before" HP.
+        # We update p_hp / o_hp as we walk so the next event's HP
+        # animation starts from the previous event's resting value.
+        p_hp = player_state.hp_current
+        o_hp = opp_state.hp_current
+
+        for ev in events:
+            if isinstance(ev, AttackEvent):
+                actor = ev.actor
+                move = ev.move
+                # 1) Log + attacker shake.
+                attacker_name = (
+                    player_state.name if actor == "player"
+                    else opp_state.name
+                )
+                steps.append((
+                    0.0,
+                    self._mk_log_and_shake(
+                        f"{attacker_name} used {move.name}!", actor, move,
+                    ),
+                ))
+                # 2) Type FX overlay on defender + start HP drain.
+                if ev.effectiveness == 0.0:
+                    # No damage at all — just the "had no effect." line
+                    # after a brief beat.
+                    if ev.effectiveness_label:
+                        steps.append((
+                            ATTACK_SHAKE_SECONDS + 0.05,
+                            self._mk_append_log(ev.effectiveness_label),
+                        ))
+                    steps.append((LOG_GAP_SECONDS, None))
+                    continue
+
+                # Capture per-event values so the closure binds them.
+                target_hp = ev.defender_hp_after
+                defender_side = "opp" if actor == "player" else "player"
+                steps.append((
+                    ATTACK_SHAKE_SECONDS,
+                    self._mk_mount_fx_and_drain(
+                        defender_side, move.type, target_hp,
+                    ),
+                ))
+                # 3) After the drain finishes, append crit / effective
+                # labels and update the numeric HP label.
+                trailing_lines = []
+                if ev.crit:
+                    trailing_lines.append("A critical hit!")
+                if ev.effectiveness_label:
+                    trailing_lines.append(ev.effectiveness_label)
+                steps.append((
+                    HP_DRAIN_SECONDS,
+                    self._mk_after_drain(
+                        defender_side, target_hp, trailing_lines,
+                    ),
+                ))
+                steps.append((LOG_GAP_SECONDS, None))
+
+                if defender_side == "opp":
+                    o_hp = target_hp
+                else:
+                    p_hp = target_hp
+
+            elif isinstance(ev, MissEvent):
+                actor = ev.actor
+                attacker_name = (
+                    player_state.name if actor == "player"
+                    else opp_state.name
+                )
+                steps.append((
+                    0.0,
+                    self._mk_log_and_shake(
+                        f"{attacker_name} used {ev.move.name}!",
+                        actor, ev.move,
+                    ),
+                ))
+                steps.append((
+                    ATTACK_SHAKE_SECONDS + 0.05,
+                    self._mk_append_log(f"{attacker_name}'s attack missed!"),
+                ))
+                steps.append((LOG_GAP_SECONDS, None))
+
+            elif isinstance(ev, FaintEvent):
+                steps.append((0.10, self._mk_fade_sprite(ev.side)))
+                steps.append((
+                    FAINT_FADE_SECONDS,
+                    self._mk_append_log(f"{ev.name} fainted!"),
+                ))
+                steps.append((LOG_GAP_SECONDS, None))
+
+        return steps
+
+    # Step factories — each returns a no-arg callable the runner fires.
+
+    def _mk_log_and_shake(self, line: str, actor: str, move: Move):
+        def _step():
+            self._append_log(line)
+            self._animate_attacker(actor, move)
+        return _step
+
+    def _mk_append_log(self, line: str):
+        def _step():
+            self._append_log(line)
+        return _step
+
+    def _mk_mount_fx_and_drain(
+        self, defender_side: str, move_type: str, target_hp: int,
+    ):
+        def _step():
+            self._mount_type_fx(defender_side, move_type)
+            bar = (
+                self._opp_bar if defender_side == "opp"
+                else self._player_bar
+            )
+            if bar is not None:
+                try:
+                    bar.animateToValue_duration_(
+                        target_hp, HP_DRAIN_SECONDS,
+                    )
+                except Exception:
+                    log.exception("HP drain failed")
+        return _step
+
+    def _mk_after_drain(
+        self, defender_side: str, target_hp: int, trailing_lines: list,
+    ):
+        def _step():
+            for line in trailing_lines:
+                self._append_log(line)
+            self._update_hp_label(defender_side, target_hp)
+        return _step
+
+    def _mk_fade_sprite(self, side: str):
+        def _step():
+            iv = (
+                self._opp_sprite_view if side == "opp"
+                else self._player_sprite_view
+            )
+            if iv is None:
+                return
+            try:
+                iv.setAlphaValue_(0.25)
+            except Exception:
+                pass
+        return _step
+
+    # ---- runner: helpers used by the step callables -------------------
+
+    def _append_log(self, line: str) -> None:
+        """Push a line onto session log + repaint the 4 visible slots."""
+        session = self.popover._battle_session
+        if session is None:
+            return
+        session["log"].append(line)
+        recent = session["log"][-4:]
+        for i, lbl in enumerate(self._log_labels):
+            text = recent[i] if i < len(recent) else ""
+            try:
+                lbl.setStringValue_(text)
+            except Exception:
+                pass
+
+    def _animate_attacker(self, actor: str, move: Move) -> None:
+        """Physical moves lunge toward the defender (Game-Boy contact);
+        special / status moves do a brief horizontal shake (no contact).
+
+        The lunge peaks at ATTACK_SHAKE_SECONDS — the same instant the
+        runner mounts the type FX overlay and starts the HP drain — so
+        the visuals line up: attacker arrives at the defender exactly
+        when the defender takes the hit.
+        """
+        iv = (
+            self._player_sprite_view if actor == "player"
+            else self._opp_sprite_view
+        )
+        if iv is None:
+            return
+        try:
+            origin = iv.frame().origin
+            origin_xy = (float(origin.x), float(origin.y))
+        except Exception:
+            log.exception("animate_attacker frame lookup failed")
+            return
+
+        if move.category == "physical":
+            # Lunge ~28 px diagonally toward the defender's quadrant.
+            # Player sits bottom-left, defender top-right → +dx +dy.
+            # Opp sits top-right, defender bottom-left → -dx -dy.
+            sign = 1 if actor == "player" else -1
+            dx = 28.0 * sign
+            dy = 28.0 * sign
+            self._tween_origin(
+                iv, origin_xy,
+                target=(origin_xy[0] + dx, origin_xy[1] + dy),
+                out_secs=ATTACK_SHAKE_SECONDS,
+                back_secs=ATTACK_SHAKE_SECONDS,
+            )
+        else:
+            # Special / status — small horizontal nudge, snap back.
+            try:
+                iv.setFrameOrigin_((origin_xy[0] + 6, origin_xy[1]))
+            except Exception:
+                pass
+            self._schedule_origin_restore(iv, origin_xy, ATTACK_SHAKE_SECONDS)
+
+    def _tween_origin(
+        self, iv, start, target, *, out_secs, back_secs,
+    ) -> None:
+        """30 fps tween: start → target over ``out_secs``, target → start
+        over ``back_secs``. Uses a single repeating NSTimer; a frame
+        counter decides whether we're in the outbound or return half.
+        """
+        out_frames = max(1, int(out_secs * 30))
+        back_frames = max(1, int(back_secs * 30))
+        total = out_frames + back_frames
+        state = {"frame": 0}
+
+        def _tick(_s):
+            f = state["frame"] + 1
+            state["frame"] = f
+            if f <= out_frames:
+                t = f / out_frames
+                x = start[0] + (target[0] - start[0]) * t
+                y = start[1] + (target[1] - start[1]) * t
+            elif f < total:
+                t = (f - out_frames) / back_frames
+                x = target[0] + (start[0] - target[0]) * t
+                y = target[1] + (start[1] - target[1]) * t
+            else:
+                x, y = start
+            try:
+                iv.setFrameOrigin_((x, y))
+            except Exception:
+                pass
+            if f >= total:
+                timer = state.get("timer")
+                if timer is not None:
+                    try:
+                        timer.invalidate()
+                    except Exception:
+                        pass
+
+        handler = make_handler(_tick)
+        # Anchor the handler so the NSTimer's strong-target retention
+        # alone doesn't have to hold it across the runloop.
+        self._handlers.append(handler)
+        timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0 / 30.0, handler, b"fire:", None, True,
+        )
+        state["timer"] = timer
+
+    def _schedule_origin_restore(
+        self, iv, origin, after_secs: float,
+    ) -> None:
+        def _restore(_s):
+            try:
+                iv.setFrameOrigin_(origin)
+            except Exception:
+                pass
+        handler = make_handler(_restore)
+        self._handlers.append(handler)
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            after_secs, handler, b"fire:", None, False,
+        )
+
+    def _mount_type_fx(self, defender_side: str, move_type: str) -> None:
+        iv = (
+            self._opp_sprite_view if defender_side == "opp"
+            else self._player_sprite_view
+        )
+        host = self._battle_view
+        if iv is None or host is None:
+            return
+        try:
+            f = iv.frame()
+            fx_frame = NSMakeRect(
+                f.origin.x - 16, f.origin.y - 16,
+                f.size.width + 32, f.size.height + 32,
+            )
+            fx_view = make_type_fx(
+                fx_frame, move_type, seed=int(f.origin.x + f.origin.y),
+            )
+            host.addSubview_(fx_view)
+        except Exception:
+            log.exception("mount FX failed")
+
+    def _update_hp_label(self, side: str, value: int) -> None:
+        session = self.popover._battle_session
+        if session is None:
+            return
+        if side == "opp":
+            opp = session["opp_states"][session["active_opp_idx"]]
+            lbl = self._opp_hp_label
+            if lbl is not None:
+                try:
+                    lbl.setStringValue_(f"{max(0, int(value))}/{opp.hp_max} HP")
+                except Exception:
+                    pass
+        else:
+            player = session["player_state"]
+            lbl = self._player_hp_label
+            if lbl is not None:
+                try:
+                    lbl.setStringValue_(
+                        f"{max(0, int(value))}/{player.hp_max} HP"
+                    )
+                except Exception:
+                    pass
+
+    # ---- runner: finalize ---------------------------------------------
+
+    def _finalize_turn(self, pending: dict, *, append_log: bool) -> None:
+        """Commit final state, run faint/end-battle logic, full rerender.
+        Always runs (even on cancellation) so HP doesn't drift.
+
+        ``append_log`` controls whether the fold's log lines are pushed
+        to the session log. The runner appends lines as each event
+        fires, so it passes ``False`` to avoid double-logging; the
+        synchronous (no-render) path passes ``True``."""
+        session = self.popover._battle_session
+        self.popover._battle_runner = None
+        if session is None:
+            return
+
+        events = pending["events"]
+        # PP was already spent in _do_player_move; preserve those values
+        # by replacing the PP tuple on the fold's player_state below.
+        current_player = session["player_state"]
+        result = fold_events(
+            events, current_player,
+            session["opp_states"][session["active_opp_idx"]],
+        )
+        new_player = result.player_state
+        if new_player is not None:
+            new_player = replace(new_player, move_pps=current_player.move_pps)
+        session["player_state"] = new_player
+        session["opp_states"][session["active_opp_idx"]] = result.opp_state
+        if append_log:
+            session["log"].extend(result.log)
+
         if result.opp_fainted:
             session["defeated_count"] += 1
-            # Mark fainted in DB so list_trainer_pokemon reflects it.
             try:
                 from tokenmon.storage import mark_trainer_pokemon_fainted
                 mark_trainer_pokemon_fainted(
-                    session["opp_trainer_pokemon_ids"][session["active_opp_idx"]]
+                    session["opp_trainer_pokemon_ids"][
+                        session["active_opp_idx"]
+                    ],
                 )
             except Exception:
                 log.exception("mark fainted failed")
-            # Next opp or win.
             session["active_opp_idx"] += 1
             if session["active_opp_idx"] >= len(session["opp_states"]):
                 self._end_battle(session, status="won")
@@ -517,7 +1110,6 @@ class BattleController(PaneController):
             self._end_battle(session, status="lost")
             return
 
-        # Re-render the pane to reflect new HP / log / active opp.
         self._rerender()
 
     def _rerender(self):

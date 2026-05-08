@@ -39,6 +39,50 @@ def _today_local() -> date:
     return datetime.now(TZ).date()
 
 
+def seed_initial_moves(
+    pokemon_id: int,
+    species_dex_id: int,
+    level: int,
+    *,
+    path: Path = DB_PATH,
+) -> None:
+    """Seed up to 4 starter moves for a freshly inserted Pokémon.
+
+    Writes to ``pokemon_moves`` (so the slot grid renders something the
+    moment the user opens the box detail) and ``pokemon_unlocked_moves``
+    (so the swap UI lists them in the unlocked pool).
+
+    No-op on lookup failure — the lazy backfill paths in pokemon.py /
+    battle.py / levelup.py still cover the offline case.
+    """
+    try:
+        from tokenmon import learnsets_remote, moves_remote
+        from tokenmon.storage import (
+            get_pokemon_moves,
+            set_pokemon_move,
+            unlock_move,
+        )
+    except Exception:  # pragma: no cover — import failure is fatal elsewhere
+        return
+
+    try:
+        if get_pokemon_moves(pokemon_id, path=path):
+            return  # Already seeded — caller is racing with backfill.
+        keys = learnsets_remote.initial_moves(
+            species_dex_id, max(1, level),
+        )
+        for slot, key in enumerate(keys[:4]):
+            md = moves_remote.get_move_data(key)
+            max_pp = md.pp if md is not None else 35
+            set_pokemon_move(pokemon_id, slot, key, max_pp=max_pp, path=path)
+            try:
+                unlock_move(pokemon_id, key, max(1, level), path=path)
+            except Exception:  # pragma: no cover — non-fatal
+                pass
+    except Exception:  # pragma: no cover — non-fatal seed
+        pass
+
+
 def ensure_today_pokemon(path: Path = DB_PATH) -> Pokemon:
     """Return today's Pokemon, creating it on first call of the day.
 
@@ -69,6 +113,7 @@ def ensure_today_pokemon(path: Path = DB_PATH) -> Pokemon:
         _pokedex_mark_caught(species, path=path)
     except Exception:  # pragma: no cover — non-fatal
         pass
+    seed_initial_moves(new_id, species, level=1, path=path)
     row = get_pokemon_by_id(new_id, path=path)
     if row is None:  # pragma: no cover — insert just succeeded
         raise RuntimeError(f"failed to read back pokemon id={new_id}")
@@ -127,6 +172,7 @@ def add_caught_pokemon(
     is_shiny: bool = False,
     gender: str | None = None,
     ivs: tuple[int, int, int, int, int, int] | None = None,
+    level: int = 1,
     path: Path = DB_PATH,
 ) -> int:
     """Insert a Pokemon row for a wild encounter that the user just caught.
@@ -139,6 +185,9 @@ def add_caught_pokemon(
     ``ivs`` should be the encounter's IVs so the caught Pokemon's stats
     match what the encounter UI showed before the throw. Falls through to a
     fresh roll inside ``insert_pokemon`` when omitted.
+
+    ``level`` is the encounter's level — used to seed the appropriate
+    starter moves. Defaults to 1 for callers without level info.
     """
     new_id = insert_pokemon(
         caught_date=caught_date or _today_local(),
@@ -159,6 +208,7 @@ def add_caught_pokemon(
         _pokedex_mark_caught(species_dex_id, path=path)
     except Exception:  # pragma: no cover — non-fatal
         pass
+    seed_initial_moves(new_id, species_dex_id, level=level, path=path)
     return new_id
 
 
