@@ -161,7 +161,6 @@ class TokenmonPopover(NSObject):
         self._stats_mode: str = "stats"
         self._items_pocket: str = "balls"
         self._editing_nickname: bool = False
-        self._encounter_bag_open: bool = False
         self._pending_reveal_pokemon: dict | None = None
 
         # Animation handlers — kept here so manual pane navigation can
@@ -342,8 +341,6 @@ class TokenmonPopover(NSObject):
         # Inter-pane state intent — each pane decides whether the survivor
         # state from a previous render is still meaningful.
         self._animated_image_views = []
-        if idx != PANE_ENCOUNTER:
-            self._encounter_bag_open = False
         if idx != PANE_BOX or self._box_selected_id is None:
             self._editing_nickname = False
             self._box_swap_slot = None
