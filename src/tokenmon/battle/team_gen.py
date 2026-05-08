@@ -118,6 +118,35 @@ def _pick_moves(
     return tuple(chosen)
 
 
+def generate_wild_mon(
+    *,
+    encounter,
+    learnset_lookup: Callable[[int], list[tuple[int, str]]],
+) -> TrainerMon:
+    """Build a one-mon "team" from a stored ``Encounter``. Used by the
+    battle pane to translate a wild spawn into the same TrainerMon shape
+    the engine consumes for trainer fights.
+
+    Determinism: seeds the move-pick RNG off the encounter id so re-builds
+    are stable. Species/level/IVs/nature are taken straight from the row.
+    Move keys come from the row when baked at spawn; falls back to the
+    learnset lookup when an older row has empty move_keys.
+    """
+    if encounter.move_keys:
+        move_keys = tuple(encounter.move_keys)
+    else:
+        rng = random.Random(int(encounter.id))
+        learnset = learnset_lookup(encounter.species_dex_id) or []
+        move_keys = _pick_moves(rng, learnset, int(encounter.level))
+    return TrainerMon(
+        species_dex_id=int(encounter.species_dex_id),
+        level=int(encounter.level),
+        nature=encounter.nature,
+        ivs=tuple(encounter.ivs),  # type: ignore[arg-type]
+        move_keys=move_keys,
+    )
+
+
 def generate_trainer_team(
     *,
     seed: int,

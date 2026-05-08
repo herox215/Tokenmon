@@ -31,6 +31,12 @@ XP_PER_LEVEL = 12
 BASE_LOSS_PENALTY = 50
 
 
+def compute_wild_kos_reward(opponent_level: int) -> int:
+    """XP awarded for KO'ing a wild Pokémon. No money, no items —
+    matches the canon: trainers pay you, wilds don't."""
+    return max(1, int(XP_PER_LEVEL * max(1, int(opponent_level))))
+
+
 def compute_rewards(
     team: list[TrainerMon],
     difficulty: Difficulty,

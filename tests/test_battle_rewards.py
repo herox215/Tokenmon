@@ -78,3 +78,17 @@ def test_loss_penalty_default_zero_on_dataclass():
     from tokenmon.battle.models import Rewards
     r = Rewards(money=10, xp_per_defeat=5, item_drops={})
     assert r.loss_penalty == 0
+
+
+def test_compute_wild_kos_reward_xp_only():
+    """Wild KOs grant XP only — no money, no items."""
+    from tokenmon.battle.rewards import compute_wild_kos_reward
+    xp = compute_wild_kos_reward(opponent_level=10)
+    assert xp > 0
+
+
+def test_compute_wild_kos_reward_scales_with_level():
+    from tokenmon.battle.rewards import compute_wild_kos_reward
+    low = compute_wild_kos_reward(opponent_level=5)
+    high = compute_wild_kos_reward(opponent_level=50)
+    assert high > low

@@ -315,3 +315,53 @@ def test_maybe_spawn_falls_back_when_weather_unavailable(db_path, monkeypatch):
     monkeypatch.setattr(encounter.pokemon, "random_species", fake_random_species)
     encounter.maybe_spawn(force=True, path=db_path)
     assert captured["weights"] is None
+
+
+# ---- Phase 2: level scales with player + trainer mutex + move-bake -------
+
+
+def test_maybe_spawn_level_within_player_pm5(db_path, monkeypatch):
+    """Wild encounter level rolls within ±5 of the player's active level."""
+    monkeypatch.setattr(encounter, "_player_active_level", lambda *_a, **_k: 30)
+    enc = encounter.maybe_spawn(force=True, path=db_path)
+    assert enc is not None
+    assert 25 <= enc.level <= 35
+
+
+def test_maybe_spawn_clamps_level_to_one(db_path, monkeypatch):
+    monkeypatch.setattr(encounter, "_player_active_level", lambda *_a, **_k: 1)
+    enc = encounter.maybe_spawn(force=True, path=db_path)
+    assert enc is not None
+    assert enc.level >= 1
+
+
+def test_maybe_spawn_skipped_when_trainer_pending(db_path, monkeypatch):
+    """If a trainer is already pending, no wild encounter spawns."""
+    from tokenmon.storage import insert_trainer
+    insert_trainer(
+        name="Joey", title="Youngster", difficulty="easy", seed=1,
+        team=[{
+            "species_dex_id": 16, "level": 5, "nature": "Hardy",
+            "ivs": (0, 0, 0, 0, 0, 0), "move_keys": ("tackle",),
+        }],
+        path=db_path,
+    )
+    monkeypatch.setattr(encounter._RNG, "random", lambda: 0.0)
+    monkeypatch.setattr(encounter, "_last_spawn_seconds_ago",
+                        lambda *_a, **_k: float("inf"))
+    enc = encounter.maybe_spawn(output_tokens=2000, path=db_path)
+    assert enc is None
+    # And force=True must also respect the trainer guard.
+    enc2 = encounter.maybe_spawn(force=True, path=db_path)
+    assert enc2 is None
+
+
+def test_maybe_spawn_persists_move_keys(db_path, monkeypatch):
+    """Spawn bakes a moveset into encounters.move_keys_json."""
+    monkeypatch.setattr(
+        encounter.learnsets_remote, "initial_moves",
+        lambda dex, lv: ["tackle", "growl"],
+    )
+    enc = encounter.maybe_spawn(force=True, path=db_path)
+    assert enc is not None
+    assert enc.move_keys == ("tackle", "growl")

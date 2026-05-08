@@ -14,7 +14,9 @@ import random
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tokenmon import box, config, pokemon, weather
+import threading
+
+from tokenmon import box, config, learnsets_remote, pokemon, weather
 from tokenmon.items import (
     BALL_CATCH_MODIFIERS,
     is_throwable,
@@ -24,6 +26,7 @@ from tokenmon.storage import (
     DB_PATH,
     Encounter,
     get_pending_encounter,
+    get_pending_trainer,
     increment_item_used,
     insert_encounter,
     mark_caught as _pokedex_mark_caught,
@@ -31,6 +34,7 @@ from tokenmon.storage import (
     mark_encounter_ran,
     mark_seen as _pokedex_mark_seen,
     query_item_counts,
+    query_xp_for_pokemon,
     update_encounter_hint,
 )
 
@@ -49,9 +53,36 @@ SPAWN_COOLDOWN_SECONDS = 5 * 60         # 5 min between spawn attempts
 SPAWN_MIN_OUTPUT = 50                   # don't even roll for tiny calls
 
 CATCH_PROBABILITY_BASELINE = 0.7        # softener — 70% per ball at max catch_rate
-LEVEL_MIN, LEVEL_MAX = 1, 1  # wild Pokemon are always Lv 1; XP comes from training
+
+# Wild mon level rolls within ``±LEVEL_BAND`` of the player's active level —
+# mirrors the trainer-side delta range so wild fights are appropriately scaled.
+LEVEL_BAND = 5
+LEVEL_FLOOR = 1
+LEVEL_CEIL = 100
 
 _RNG = random.SystemRandom()
+
+
+def _player_active_level(path: Path = DB_PATH) -> int:
+    """Player's active mon level — lazy box import to avoid the
+    encounter ↔ box cycle. Mirrors trainer._player_active_level."""
+    try:
+        active = box.get_active_pokemon(path)
+        if active is None:
+            return 5
+        xp = query_xp_for_pokemon(active.id, path=path)
+        growth = pokemon.growth_rate_of(active.species_dex_id)
+        level, _, _ = pokemon.level_from_xp(xp, growth)
+        return level
+    except Exception:
+        log.exception("active level lookup failed")
+        return 5
+
+
+def _roll_wild_level(player_level: int) -> int:
+    lo = max(LEVEL_FLOOR, player_level - LEVEL_BAND)
+    hi = min(LEVEL_CEIL, player_level + LEVEL_BAND)
+    return _RNG.randint(lo, hi)
 
 
 # --- Spawning --------------------------------------------------------------
@@ -110,6 +141,10 @@ def maybe_spawn(
     """
     if get_pending_encounter(path=path) is not None:
         return None
+    # Symmetric mutex with trainer.maybe_spawn: never crowd the user with
+    # both a wild mon and a trainer queued at once.
+    if get_pending_trainer(path) is not None:
+        return None
     if not force:
         if _last_spawn_seconds_ago(path) < SPAWN_COOLDOWN_SECONDS:
             return None
@@ -129,10 +164,17 @@ def maybe_spawn(
     nature = pokemon.random_nature()
     ivs = pokemon.roll_ivs()
     characteristic = pokemon.characteristic_for_ivs(ivs)
-    level = _RNG.randint(LEVEL_MIN, LEVEL_MAX)
+    player_level = _player_active_level(path)
+    level = _roll_wild_level(player_level)
     catch_rate = pokemon.catch_rate_of(species_dex_id)
     gender = pokemon.roll_gender(species_dex_id)
     is_shiny = pokemon.roll_shiny()
+
+    try:
+        move_keys = tuple(learnsets_remote.initial_moves(species_dex_id, level))
+    except Exception:
+        log.exception("initial_moves failed; falling back to tackle")
+        move_keys = ("tackle",)
 
     enc_id = insert_encounter(
         species_dex_id=species_dex_id,
@@ -143,6 +185,7 @@ def maybe_spawn(
         gender=gender,
         is_shiny=is_shiny,
         ivs=ivs,
+        move_keys=move_keys,
         path=path,
     )
     # Persistent Pokedex entry: 'seen' on every spawn, even if the user
@@ -151,11 +194,61 @@ def maybe_spawn(
         _pokedex_mark_seen(species_dex_id, path=path)
     except Exception:
         log.exception("pokedex mark_seen failed")
+    # Battle init fetches PokeAPI move + sprite data synchronously; warm
+    # the caches now so the popover doesn't freeze when the user clicks Fight.
+    _kick_battle_asset_prefetch(species_dex_id, move_keys, is_shiny, path=path)
     # Re-read so we return a fully-populated Encounter (with timestamps etc).
     pending = get_pending_encounter(path=path)
     if pending is None or pending.id != enc_id:  # pragma: no cover — defensive
         log.warning("maybe_spawn: race? inserted id=%s, pending=%s", enc_id, pending)
     return pending
+
+
+def _prefetch_battle_assets(
+    species_dex_id: int,
+    move_keys: tuple[str, ...],
+    is_shiny: bool,
+    *,
+    path: Path = DB_PATH,
+) -> None:
+    try:
+        from tokenmon import moves_remote
+        for key in move_keys:
+            try:
+                moves_remote.get_move_data(key)
+            except Exception:
+                log.exception("wild move prefetch failed for %s", key)
+        try:
+            pokemon.ensure_sprite(species_dex_id)
+        except Exception:
+            log.exception("front sprite prefetch failed for %d", species_dex_id)
+        # Player back-sprite for the rendered battle scene.
+        try:
+            active = box.get_active_pokemon(path)
+            if active is not None:
+                pokemon.ensure_sprite(
+                    active.species_dex_id,
+                    shiny=bool(active.is_shiny), back=True,
+                )
+        except Exception:
+            log.exception("back sprite prefetch failed")
+    except Exception:
+        log.exception("wild asset prefetch hit unexpected error")
+
+
+def _kick_battle_asset_prefetch(
+    species_dex_id: int,
+    move_keys: tuple[str, ...],
+    is_shiny: bool,
+    *,
+    path: Path = DB_PATH,
+) -> None:
+    threading.Thread(
+        target=_prefetch_battle_assets,
+        args=(species_dex_id, move_keys, is_shiny),
+        kwargs={"path": path},
+        daemon=True,
+    ).start()
 
 
 # --- Catch math ------------------------------------------------------------
