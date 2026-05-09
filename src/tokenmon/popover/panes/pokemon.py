@@ -12,6 +12,7 @@ import logging
 import objc
 from AppKit import (
     NSBezierPath,
+    NSButton,
     NSColor,
     NSFont,
     NSImage,
@@ -24,6 +25,7 @@ from AppKit import (
 from Foundation import NSMakeRect
 
 from tokenmon import box, pokemon
+from tokenmon.popover._handlers import make_handler
 from tokenmon.popover.animation import (
     PAT_HEART_THRESHOLD,
     PAT_HOP_PX,
@@ -33,6 +35,8 @@ from tokenmon.popover.animation import (
 from tokenmon.popover.panes.base import PaneController
 from tokenmon.popover.widgets import (
     CONTENT_WIDTH,
+    PANE_BOX,
+    PANE_POKEMON,
     POPOVER_HEIGHT,
     TYPE_BADGE_HEIGHT,
     _PatClickCatcher,
@@ -177,6 +181,16 @@ class PokemonController(PaneController):
             color=NSColor.secondaryLabelColor(),
             align=NSTextAlignmentCenter,
         ))
+        detail_handler = make_handler(lambda _s, pid=row.id: self._open_box_detail(pid))
+        self._handlers.append(detail_handler)
+        detail_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(CONTENT_WIDTH - 86, POPOVER_HEIGHT - 34, 72, 24)
+        )
+        detail_btn.setTitle_("Details")
+        detail_btn.setBezelStyle_(1)
+        detail_btn.setTarget_(detail_handler)
+        detail_btn.setAction_(b"fire:")
+        view.addSubview_(detail_btn)
 
         sprite_size = 144
         sprite_x = (CONTENT_WIDTH - sprite_size) // 2
@@ -400,6 +414,13 @@ class PokemonController(PaneController):
         ))
 
         return view
+
+    def _open_box_detail(self, pokemon_id: int) -> None:
+        self.popover._box_selected_id = int(pokemon_id)
+        self.popover._box_return_pane = PANE_POKEMON
+        self.popover._box_swap_slot = None
+        self.popover._editing_nickname = False
+        self.popover._show_pane(PANE_BOX)
 
     def _backfill_initial_moves(
         self, pokemon_id: int, species_dex_id: int, level: int,

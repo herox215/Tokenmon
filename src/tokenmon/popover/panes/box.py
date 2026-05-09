@@ -287,8 +287,12 @@ class BoxController(PaneController):
 
         # ← Back button (top-left).
         def _back(_s):
+            return_pane = getattr(self.popover, "_box_return_pane", None)
+            self.popover._box_return_pane = None
             self.popover._box_selected_id = None
-            self.popover._show_pane(PANE_BOX)
+            self.popover._show_pane(
+                return_pane if return_pane is not None else PANE_BOX,
+            )
         back_handler = make_handler(_back)
         self._handlers.append(back_handler)
         back = NSButton.alloc().initWithFrame_(

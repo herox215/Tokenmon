@@ -17,6 +17,14 @@ class _FakePopover:
     def __init__(self):
         self._app = _FakeApp()
         self._animated_image_views: list = []
+        self._box_selected_id = None
+        self._box_return_pane = None
+        self._box_swap_slot = 2
+        self._editing_nickname = True
+        self._show_pane_calls: list[int] = []
+
+    def _show_pane(self, idx: int) -> None:
+        self._show_pane_calls.append(idx)
 
 
 def test_pokemon_controller_no_active_renders_fallback(db_path, monkeypatch):
@@ -80,3 +88,19 @@ def test_pat_step_done_calls_end_pat(db_path, monkeypatch):
     ctrl.pat_step("done")
     assert ctrl._pat_active is False
     assert ctrl._pat_handler is None
+
+
+def test_open_box_detail_selects_active_pokemon_and_opens_box():
+    from tokenmon.popover.panes.pokemon import PokemonController
+    from tokenmon.popover.widgets import PANE_BOX, PANE_POKEMON
+
+    pop = _FakePopover()
+    ctrl = PokemonController(pop)
+
+    ctrl._open_box_detail(42)
+
+    assert pop._box_selected_id == 42
+    assert pop._box_return_pane == PANE_POKEMON
+    assert pop._box_swap_slot is None
+    assert pop._editing_nickname is False
+    assert pop._show_pane_calls == [PANE_BOX]

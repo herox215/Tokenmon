@@ -24,8 +24,8 @@ log = logging.getLogger("tokenmon.menubar.companion_drv")
 def proximity_tick(app) -> None:
     """Fade the companion overlay when the cursor approaches so it
     doesn't sit in front of whatever the user is trying to click.
-    The window stays click-through permanently — companion is
-    purely visual."""
+    Companion mode still accepts a double-click on the sprite to open
+    the mock session chat."""
     if not app._companion_mode or not app._overlay.visible:
         if app._overlay._proximity_alpha < 1.0:
             app._overlay.set_proximity_alpha(1.0)

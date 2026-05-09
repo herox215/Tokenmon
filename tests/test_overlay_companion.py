@@ -7,6 +7,8 @@ patching.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 pytestmark = pytest.mark.skipif(
@@ -46,15 +48,140 @@ class _FakeScreen:
 
 
 class _FakeWin:
+    def __init__(self):
+        self.ignores_mouse_events = None
+
     def screen(self):
         return _FakeScreen()
     def setFrame_display_animate_(self, *_args):
         pass
+    def setIgnoresMouseEvents_(self, value):
+        self.ignores_mouse_events = bool(value)
     def contentView(self):
         return _FakeContentView()
     def frame(self):
         from Foundation import NSMakeRect
         return NSMakeRect(100.0, 200.0, 128.0, 128.0)
+
+
+def test_set_persistent_keeps_sprite_window_click_through():
+    from tokenmon.overlay import PokemonOverlay
+    o = PokemonOverlay()
+    win = _FakeWin()
+    o._window = win  # type: ignore[assignment]
+
+    o.set_persistent(True)
+    assert win.ignores_mouse_events is True
+
+    o.set_persistent(False)
+    assert win.ignores_mouse_events is True
+
+
+def test_chat_frame_is_bottom_centered_and_roughly_40_percent_width():
+    from Foundation import NSMakeRect
+    from tokenmon.overlay import CHAT_BOTTOM_MARGIN, _chat_frame_for_screen
+
+    frame = _chat_frame_for_screen(NSMakeRect(0, 0, 1920, 1080))
+
+    assert frame.size.width == 900
+    assert frame.size.height == pytest.approx(410.4)
+    assert frame.origin.x == 510
+    assert frame.origin.y == CHAT_BOTTOM_MARGIN
+
+
+def test_chat_start_frame_centers_on_sprite():
+    from Foundation import NSMakeRect
+    from tokenmon.overlay import CHAT_MORPH_SIZE, _chat_start_frame
+
+    start = _chat_start_frame(
+        NSMakeRect(100, 200, 128, 128),
+        NSMakeRect(510, 44, 900, 410),
+    )
+
+    assert start.size.width == CHAT_MORPH_SIZE
+    assert start.size.height == CHAT_MORPH_SIZE
+    assert start.origin.x == 100 + 64 - CHAT_MORPH_SIZE / 2
+    assert start.origin.y == 200 + 64 - CHAT_MORPH_SIZE / 2
+
+
+def test_chat_input_handler_trims_appends_and_clears():
+    from tokenmon.overlay import _ChatInputHandler
+
+    class _Overlay:
+        def __init__(self):
+            self.messages = []
+
+        def _append_chat_message(self, text):
+            self.messages.append(text)
+
+    class _Sender:
+        def __init__(self):
+            self.value = "  hello session  "
+
+        def stringValue(self):
+            return self.value
+
+        def setStringValue_(self, value):
+            self.value = value
+
+    overlay = _Overlay()
+    sender = _Sender()
+    handler = _ChatInputHandler.alloc().initWithOverlay_(overlay)
+
+    handler.send_(sender)
+
+    assert overlay.messages == ["hello session"]
+    assert sender.value == ""
+
+
+def test_chat_title_uses_active_pokemon_species_name(monkeypatch):
+    from tokenmon import box
+    from tokenmon.overlay import PokemonOverlay
+
+    monkeypatch.setattr(
+        box,
+        "get_active_pokemon",
+        lambda: SimpleNamespace(nickname=None, species_dex_id=1),
+    )
+
+    assert PokemonOverlay()._chat_title() == "Bulbasaur"
+
+
+def test_chat_title_prefers_active_pokemon_nickname(monkeypatch):
+    from tokenmon import box
+    from tokenmon.overlay import PokemonOverlay
+
+    monkeypatch.setattr(
+        box,
+        "get_active_pokemon",
+        lambda: SimpleNamespace(nickname="Buddy", species_dex_id=1),
+    )
+
+    assert PokemonOverlay()._chat_title() == "Buddy"
+
+
+def test_companion_double_click_toggles_chat():
+    from Foundation import NSMakeRect
+    from tokenmon.overlay import _CompanionImageView
+
+    class _Overlay:
+        def __init__(self):
+            self.calls = 0
+
+        def toggle_chat(self):
+            self.calls += 1
+
+    class _Event:
+        def clickCount(self):
+            return 2
+
+    overlay = _Overlay()
+    view = _CompanionImageView.alloc().initWithFrame_overlay_(
+        NSMakeRect(0, 0, 128, 128), overlay,
+    )
+    view.mouseDown_(_Event())
+
+    assert overlay.calls == 1
 
 
 def test_end_level_up_skips_hide_when_persistent(monkeypatch):

@@ -1,8 +1,8 @@
-"""Click-through desktop overlay showing the current Pokemon sprite.
+"""Desktop overlay showing the current Pokemon sprite.
 
 A borderless, transparent NSWindow that floats above other windows on every
-Space, ignores all mouse and keyboard events (so it can never steal focus
-or interfere with what's underneath), and just animates the GIF.
+Space. In event-only mode it ignores mouse and keyboard events; in companion
+mode the sprite accepts a double-click to open the lightweight session chat.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ from pathlib import Path
 import objc
 from AppKit import (
     NSBackingStoreBuffered,
+    NSBezierPath,
+    NSButton,
     NSColor,
     NSCompositingOperationSourceAtop,
     NSCompositingOperationSourceOver,
@@ -24,19 +26,35 @@ from AppKit import (
     NSImageInterpolationNone,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
+    NSLineBreakByWordWrapping,
+    NSPanel,
     NSRectFillUsingOperation,
     NSScreen,
     NSShadow,
+    NSWindowStyleMaskFullSizeContentView,
     NSTextAlignmentCenter,
+    NSTextAlignmentLeft,
     NSTextField,
     NSTimer,
+    NSVisualEffectBlendingModeBehindWindow,
+    NSVisualEffectMaterialHUDWindow,
+    NSVisualEffectStateActive,
+    NSVisualEffectView,
     NSView,
     NSWindow,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSWindowCollectionBehaviorIgnoresCycle,
     NSWindowCollectionBehaviorStationary,
     NSWindowCollectionBehaviorTransient,
     NSWindowStyleMaskBorderless,
+    NSWindowStyleMaskNonactivatingPanel,
+    NSWindowStyleMaskTitled,
+    NSWindowTitleHidden,
+    NSEvent,
+    NSEventMaskLeftMouseDown,
+    NSEventMaskOtherMouseDown,
+    NSEventMaskRightMouseDown,
 )
 from Foundation import NSMakeRect, NSMakeSize, NSObject
 
@@ -47,6 +65,14 @@ DEFAULT_MARGIN = 40
 DEFAULT_CORNER = "bottom-right"
 LEVEL_UP_BANNER_HEIGHT = 36
 LEVEL_UP_DISPLAY_SEC = 4.0
+CHAT_SCREEN_WIDTH_RATIO = 0.48
+CHAT_SCREEN_HEIGHT_RATIO = 0.38
+CHAT_MIN_WIDTH = 500
+CHAT_MAX_WIDTH = 900
+CHAT_MIN_HEIGHT = 300
+CHAT_MAX_HEIGHT = 440
+CHAT_BOTTOM_MARGIN = 44
+CHAT_MORPH_SIZE = 36
 
 # Evolution sequence: (delay_before_step_seconds, step_name).
 # Mirrors the Gen-3 Pokémon evolution feel: silhouette flicker that accelerates
@@ -120,6 +146,110 @@ class _LevelUpHandler(NSObject):
             log.exception("level-up teardown failed")
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return min(max(float(value), float(low)), float(high))
+
+
+def _chat_frame_for_screen(screen_frame):
+    """Bottom-centred chat frame sized to roughly 40% of the active screen."""
+    sw = float(screen_frame.size.width)
+    sh = float(screen_frame.size.height)
+    width = _clamp(sw * CHAT_SCREEN_WIDTH_RATIO, CHAT_MIN_WIDTH, CHAT_MAX_WIDTH)
+    height = _clamp(sh * CHAT_SCREEN_HEIGHT_RATIO, CHAT_MIN_HEIGHT, CHAT_MAX_HEIGHT)
+    x = float(screen_frame.origin.x) + (sw - width) / 2.0
+    y = float(screen_frame.origin.y) + CHAT_BOTTOM_MARGIN
+    return NSMakeRect(x, y, width, height)
+
+
+def _chat_start_frame(sprite_frame, final_frame):
+    """Tiny origin frame for the open animation, centred on the sprite."""
+    cx = float(sprite_frame.origin.x) + float(sprite_frame.size.width) / 2.0
+    cy = float(sprite_frame.origin.y) + float(sprite_frame.size.height) / 2.0
+    size = min(
+        CHAT_MORPH_SIZE,
+        float(final_frame.size.width),
+        float(final_frame.size.height),
+    )
+    return NSMakeRect(cx - size / 2.0, cy - size / 2.0, size, size)
+
+
+class _ChatCardView(NSView):
+    """Subtle border over the system blur backing."""
+
+    def drawRect_(self, _rect):  # noqa: N802
+        bounds = self.bounds()
+        path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            bounds, 10, 10,
+        )
+        NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.22).set()
+        path.setLineWidth_(1.0)
+        path.stroke()
+
+
+class _ChatWindow(NSPanel):
+    """Borderless chat window that can still accept keyboard focus."""
+
+    def canBecomeKeyWindow(self):  # noqa: N802
+        return True
+
+    def canBecomeMainWindow(self):  # noqa: N802
+        return True
+
+    def worksWhenModal(self):  # noqa: N802
+        return True
+
+
+class _ChatWindowDelegate(NSObject):
+    def initWithOverlay_(self, overlay):  # noqa: N802
+        self = objc.super(_ChatWindowDelegate, self).init()
+        if self is None:
+            return None
+        self._overlay = overlay
+        return self
+
+    def windowDidResignKey_(self, _notification):  # noqa: N802
+        self._overlay.hide_chat()
+
+
+class _ChatInputHandler(NSObject):
+    """NSTextField target/delegate for the mock session input."""
+
+    def initWithOverlay_(self, overlay):  # noqa: N802
+        self = objc.super(_ChatInputHandler, self).init()
+        if self is None:
+            return None
+        self._overlay = overlay
+        return self
+
+    def send_(self, sender):  # noqa: N802
+        text = sender.stringValue().strip()
+        if not text:
+            return
+        sender.setStringValue_("")
+        self._overlay._append_chat_message(text)
+
+    def control_textView_doCommandBySelector_(  # noqa: N802
+        self, _control, _text_view, command,
+    ):
+        sel = str(command) if command is not None else ""
+        if sel in ("cancelOperation:", "cancel:"):
+            self._overlay.hide_chat()
+            return True
+        return False
+
+
+class _ChatCloseHandler(NSObject):
+    def initWithOverlay_(self, overlay):  # noqa: N802
+        self = objc.super(_ChatCloseHandler, self).init()
+        if self is None:
+            return None
+        self._overlay = overlay
+        return self
+
+    def close_(self, _sender):  # noqa: N802
+        self._overlay.hide_chat()
+
+
 class _CompanionImageView(NSImageView):
     """NSImageView subclass that disables image interpolation in its
     draw path so animated pixel-art GIFs stay crisp when scaled
@@ -130,16 +260,35 @@ class _CompanionImageView(NSImageView):
     because each frame goes through NSImageView's draw pipeline,
     which would otherwise apply default bilinear interpolation.
 
-    The overlay window stays click-through (``ignoresMouseEvents=True``)
-    permanently, so this view never sees a mouseDown. Companion mode
-    is purely visual.
+    Event-only overlays stay click-through. Companion mode lets this view
+    receive a double-click so the user can open the mock session chat.
     """
+
+    def initWithFrame_overlay_(self, frame, overlay):  # noqa: N802
+        self = objc.super(_CompanionImageView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._overlay = overlay
+        return self
 
     def drawRect_(self, rect):  # noqa: N802
         ctx = NSGraphicsContext.currentContext()
         if ctx is not None:
             ctx.setImageInterpolation_(NSImageInterpolationNone)
         objc.super(_CompanionImageView, self).drawRect_(rect)
+
+    def acceptsFirstMouse_(self, _event):  # noqa: N802
+        return True
+
+    def mouseDown_(self, event):  # noqa: N802
+        overlay = getattr(self, "_overlay", None)
+        if overlay is None:
+            return
+        try:
+            if event.clickCount() >= 2:
+                overlay.toggle_chat()
+        except Exception:
+            log.exception("companion double-click failed")
 
 
 WIGGLE_FRAMES = 6         # 6 frames @ 50 ms = 300 ms total wiggle duration
@@ -506,7 +655,7 @@ def _position_for(corner: str, screen_frame, size: int, margin: int) -> tuple[fl
 
 
 class PokemonOverlay:
-    """Manages a single floating, click-through window that displays the sprite."""
+    """Manages the floating companion sprite window and its transient UI."""
 
     def __init__(self, size: int = DEFAULT_SIZE, margin: int = DEFAULT_MARGIN,
                  corner: str = DEFAULT_CORNER) -> None:
@@ -560,6 +709,15 @@ class PokemonOverlay:
         # the NSObject subclasses get garbage-collected before their
         # NSTimers fire and the windows never animate.
         self._floating_item_handlers: list[_FloatingItemHandler] = []
+        self._chat_window: NSWindow | None = None
+        self._chat_transcript: NSTextField | None = None
+        self._chat_input: NSTextField | None = None
+        self._chat_messages: list[str] = []
+        self._chat_input_handler: _ChatInputHandler | None = None
+        self._chat_close_handler: _ChatCloseHandler | None = None
+        self._chat_window_delegate: _ChatWindowDelegate | None = None
+        self._chat_outside_monitor = None
+        self._sprite_click_monitor = None
 
     def _ensure_window(self) -> None:
         if self._window is not None:
@@ -576,13 +734,14 @@ class PokemonOverlay:
         win.setLevel_(NSFloatingWindowLevel)
         win.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
             | NSWindowCollectionBehaviorStationary
             | NSWindowCollectionBehaviorIgnoresCycle
             | NSWindowCollectionBehaviorTransient
         )
         win.setReleasedWhenClosed_(False)
 
-        img_view = _CompanionImageView.alloc().initWithFrame_(rect)
+        img_view = _CompanionImageView.alloc().initWithFrame_overlay_(rect, self)
         img_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
         img_view.setAnimates_(True)
         # Crisp pixel-art scaling — sprites stay sharp when scaled to 128×128.
@@ -776,6 +935,9 @@ class PokemonOverlay:
         self._ensure_window()
         if self._window is None:
             return
+        self._window.setIgnoresMouseEvents_(True)
+        if self._persistent:
+            self._install_sprite_click_monitor()
         self._reposition()
         self._window.orderFrontRegardless()
         self._visible = True
@@ -783,6 +945,8 @@ class PokemonOverlay:
     def hide(self) -> None:
         if self._window is not None:
             self._window.orderOut_(None)
+        self._remove_sprite_click_monitor()
+        self.hide_chat()
         self._visible = False
 
     def set_persistent(self, persistent: bool) -> None:
@@ -791,6 +955,277 @@ class PokemonOverlay:
         Caller is responsible for showing/hiding the overlay when the flag
         flips — this method only stores the preference."""
         self._persistent = bool(persistent)
+        if self._window is not None:
+            self._window.setIgnoresMouseEvents_(True)
+        if self._persistent and self._visible:
+            self._install_sprite_click_monitor()
+        else:
+            self._remove_sprite_click_monitor()
+        if not self._persistent:
+            self.hide_chat()
+
+    # --- Mock companion chat ---------------------------------------------
+
+    def toggle_chat(self) -> None:
+        if self._chat_window is not None:
+            self.hide_chat()
+            return
+        self.show_chat()
+
+    def show_chat(self) -> None:
+        """Open the bottom-centred mock chat for the active companion."""
+        if not self._persistent:
+            return
+        if self._chat_window is not None:
+            self._chat_window.makeKeyAndOrderFront_(None)
+            if self._chat_input is not None:
+                self._chat_window.makeFirstResponder_(self._chat_input)
+            return
+        screen = None
+        if self._window is not None:
+            screen = self._window.screen()
+        if screen is None:
+            screen = NSScreen.mainScreen()
+        if screen is None:
+            return
+        final_frame = _chat_frame_for_screen(screen.visibleFrame())
+        if self._window is not None:
+            start_frame = _chat_start_frame(self._window.frame(), final_frame)
+        else:
+            start_frame = final_frame
+        style = (
+            NSWindowStyleMaskTitled
+            | NSWindowStyleMaskFullSizeContentView
+            | NSWindowStyleMaskNonactivatingPanel
+        )
+        win = _ChatWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            start_frame, style, NSBackingStoreBuffered, False,
+        )
+        win.setOpaque_(False)
+        win.setBackgroundColor_(NSColor.clearColor())
+        win.setHasShadow_(True)
+        win.setIgnoresMouseEvents_(False)
+        win.setMovable_(False)
+        win.setTitleVisibility_(NSWindowTitleHidden)
+        win.setTitlebarAppearsTransparent_(True)
+        win.setLevel_(NSFloatingWindowLevel)
+        win.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorIgnoresCycle
+            | NSWindowCollectionBehaviorTransient
+        )
+        win.setReleasedWhenClosed_(False)
+        win.setAlphaValue_(0.0)
+
+        w = float(final_frame.size.width)
+        h = float(final_frame.size.height)
+        root = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
+        root.setWantsLayer_(True)
+        blur = NSVisualEffectView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
+        blur.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        blur.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        blur.setState_(NSVisualEffectStateActive)
+        blur.setWantsLayer_(True)
+        layer = blur.layer()
+        if layer is not None:
+            layer.setCornerRadius_(10)
+            layer.setMasksToBounds_(True)
+        root.addSubview_(blur)
+
+        border = _ChatCardView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
+        border.setWantsLayer_(True)
+        root.addSubview_(border)
+
+        title = NSTextField.alloc().initWithFrame_(NSMakeRect(18, h - 44, w - 72, 24))
+        title.setStringValue_(self._chat_title())
+        title.setBezeled_(False)
+        title.setDrawsBackground_(False)
+        title.setEditable_(False)
+        title.setSelectable_(False)
+        title.setFont_(NSFont.boldSystemFontOfSize_(16))
+        title.setTextColor_(NSColor.labelColor())
+        root.addSubview_(title)
+
+        close = NSButton.alloc().initWithFrame_(NSMakeRect(w - 44, h - 42, 24, 24))
+        close.setTitle_("×")
+        close.setBordered_(False)
+        close.setFont_(NSFont.systemFontOfSize_(18))
+        close.setAction_(b"close:")
+        close_handler = _ChatCloseHandler.alloc().initWithOverlay_(self)
+        self._chat_close_handler = close_handler
+        close.setTarget_(close_handler)
+        root.addSubview_(close)
+
+        transcript = NSTextField.alloc().initWithFrame_(NSMakeRect(18, 62, w - 36, h - 112))
+        transcript.setBezeled_(False)
+        transcript.setDrawsBackground_(False)
+        transcript.setEditable_(False)
+        transcript.setSelectable_(True)
+        transcript.setFont_(NSFont.systemFontOfSize_(13))
+        transcript.setTextColor_(NSColor.secondaryLabelColor())
+        transcript.setAlignment_(NSTextAlignmentLeft)
+        transcript.setLineBreakMode_(NSLineBreakByWordWrapping)
+        transcript.setStringValue_("Schreib eine Nachricht. Enter legt sie hier im Mockup ab.")
+        root.addSubview_(transcript)
+
+        input_field = NSTextField.alloc().initWithFrame_(NSMakeRect(18, 18, w - 36, 30))
+        input_field.setPlaceholderString_("Nachricht an diese Session ...")
+        input_field.setFont_(NSFont.systemFontOfSize_(13))
+        input_field.setBezeled_(True)
+        input_field.setDrawsBackground_(True)
+        input_field.setEditable_(True)
+        input_field.setSelectable_(True)
+        input_field.setAction_(b"send:")
+        handler = _ChatInputHandler.alloc().initWithOverlay_(self)
+        self._chat_input_handler = handler
+        input_field.setTarget_(handler)
+        input_field.setDelegate_(handler)
+        root.addSubview_(input_field)
+
+        win.setContentView_(root)
+        self._chat_window = win
+        self._chat_transcript = transcript
+        self._chat_input = input_field
+        delegate = _ChatWindowDelegate.alloc().initWithOverlay_(self)
+        self._chat_window_delegate = delegate
+        win.setDelegate_(delegate)
+        self._install_chat_outside_monitor()
+        self._render_chat_messages()
+        win.makeKeyAndOrderFront_(None)
+        try:
+            win.makeKeyWindow()
+        except Exception:
+            pass
+        try:
+            win.setFrame_display_animate_(final_frame, True, True)
+            win.animator().setAlphaValue_(1.0)
+        except Exception:
+            win.setFrame_display_animate_(final_frame, True, False)
+            win.setAlphaValue_(1.0)
+        win.makeFirstResponder_(input_field)
+        input_field.selectText_(None)
+
+    def hide_chat(self) -> None:
+        if self._chat_window is None:
+            return
+        self._remove_chat_outside_monitor()
+        win = self._chat_window
+        try:
+            win.setDelegate_(None)
+        except Exception:
+            pass
+        try:
+            win.orderOut_(None)
+            win.close()
+        except Exception:
+            log.exception("chat teardown failed")
+        self._chat_window = None
+        self._chat_transcript = None
+        self._chat_input = None
+        self._chat_input_handler = None
+        self._chat_close_handler = None
+        self._chat_window_delegate = None
+
+    def _install_chat_outside_monitor(self) -> None:
+        self._remove_chat_outside_monitor()
+        mask = (
+            NSEventMaskLeftMouseDown
+            | NSEventMaskRightMouseDown
+            | NSEventMaskOtherMouseDown
+        )
+
+        def _handler(_event):
+            self.hide_chat()
+
+        try:
+            self._chat_outside_monitor = (
+                NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                    mask, _handler,
+                )
+            )
+        except Exception:
+            log.exception("chat outside-click monitor install failed")
+            self._chat_outside_monitor = None
+
+    def _remove_chat_outside_monitor(self) -> None:
+        if self._chat_outside_monitor is None:
+            return
+        try:
+            NSEvent.removeMonitor_(self._chat_outside_monitor)
+        except Exception:
+            log.exception("chat outside-click monitor remove failed")
+        self._chat_outside_monitor = None
+
+    def _install_sprite_click_monitor(self) -> None:
+        if self._sprite_click_monitor is not None:
+            return
+
+        def _handler(event):
+            if not self._persistent or not self._visible or self._window is None:
+                return
+            try:
+                if event.clickCount() < 2:
+                    return
+                loc = NSEvent.mouseLocation()
+                frame = self._window.frame()
+                x = float(loc.x)
+                y = float(loc.y)
+                left = float(frame.origin.x)
+                bottom = float(frame.origin.y)
+                right = left + float(frame.size.width)
+                top = bottom + float(frame.size.height)
+                if left <= x <= right and bottom <= y <= top:
+                    self.toggle_chat()
+            except Exception:
+                log.exception("sprite double-click monitor failed")
+
+        try:
+            self._sprite_click_monitor = (
+                NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                    NSEventMaskLeftMouseDown, _handler,
+                )
+            )
+        except Exception:
+            log.exception("sprite click monitor install failed")
+            self._sprite_click_monitor = None
+
+    def _remove_sprite_click_monitor(self) -> None:
+        if self._sprite_click_monitor is None:
+            return
+        try:
+            NSEvent.removeMonitor_(self._sprite_click_monitor)
+        except Exception:
+            log.exception("sprite click monitor remove failed")
+        self._sprite_click_monitor = None
+
+    def _chat_title(self) -> str:
+        try:
+            from tokenmon import box, pokemon as _pokemon
+            row = box.get_active_pokemon()
+            if row is None:
+                return "Pokémon"
+            return _pokemon.display_name(row.nickname, row.species_dex_id)
+        except Exception:
+            log.exception("chat title lookup failed")
+            return "Pokémon"
+
+    def _append_chat_message(self, text: str) -> None:
+        self._chat_messages.append(text)
+        self._chat_messages = self._chat_messages[-8:]
+        self._render_chat_messages()
+
+    def _render_chat_messages(self) -> None:
+        if self._chat_transcript is None:
+            return
+        if not self._chat_messages:
+            self._chat_transcript.setStringValue_(
+                "Schreib eine Nachricht. Enter legt sie hier im Mockup ab.",
+            )
+            return
+        lines = [f"Du: {msg}" for msg in self._chat_messages]
+        self._chat_transcript.setStringValue_("\n".join(lines))
 
     def set_mood_alpha(self, multiplier: float) -> None:
         """Apply a Phase-5 mood multiplier (e.g. night dimming) on top of

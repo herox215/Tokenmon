@@ -154,6 +154,7 @@ class TokenmonPopover(NSObject):
         # (PaneController._handlers); the fields here only carry the
         # *intent* between renders (e.g. "show box detail #7").
         self._box_selected_id: int | None = None
+        self._box_return_pane: int | None = None
         # When set, the box detail view is in "switch attack" mode for
         # this slot (0..3) — replaces the regular detail with the swap
         # picker. Cleared when the user picks a move or hits Back.

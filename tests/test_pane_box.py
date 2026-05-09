@@ -27,6 +27,7 @@ class _FakePopover:
     ):
         self._app = _FakeApp()
         self._box_selected_id = selected
+        self._box_return_pane = None
         self._editing_nickname = editing
         self._stats_mode = stats_mode
         self._box_swap_slot = swap_slot
@@ -54,6 +55,29 @@ def test_box_controller_default_stats_mode_is_stats(db_path):
     pop = _FakePopover()
     ctrl = BoxController(pop)
     assert ctrl._stats_mode == "stats"
+
+
+def test_box_detail_back_returns_to_active_pane_when_requested(db_path):
+    from datetime import date
+    from tokenmon import storage
+    from tokenmon.popover.panes.box import BoxController
+    from tokenmon.popover.widgets import PANE_POKEMON
+
+    pid = storage.insert_pokemon(
+        caught_date=date.today(), species_dex_id=1,
+        nature="Hardy", characteristic="x", path=db_path,
+    )
+    pop = _FakePopover(selected=pid)
+    pop._box_return_pane = PANE_POKEMON
+    ctrl = BoxController(pop)
+    ctrl.build_view()
+
+    back_handler = ctrl._handlers[0]
+    back_handler._cb(None)
+
+    assert pop._box_selected_id is None
+    assert pop._box_return_pane is None
+    assert pop._show_pane_calls == [PANE_POKEMON]
 
 
 def test_nickname_inline_handler_save_button_commits_and_clears_state(
