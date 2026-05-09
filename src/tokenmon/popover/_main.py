@@ -57,6 +57,7 @@ from tokenmon.popover.widgets import (
     PANE_ENCOUNTER,
     PANE_ITEMS,
     PANE_POKEMON,
+    PANE_SHOP,
     PANE_TOKENDEX,
     PANE_USAGE,
     POPOVER_HEIGHT,
@@ -117,7 +118,7 @@ class TokenmonPopover(NSObject):
         # called every time the popover opens to add/remove the encounter slot.
         self._sidebar = _SidebarView.alloc().initWithFrame_paneIds_selected_(
             NSMakeRect(0, 0, SIDEBAR_WIDTH, POPOVER_HEIGHT),
-            [PANE_POKEMON, PANE_TOKENDEX, PANE_BOX, PANE_ITEMS, PANE_USAGE],
+            [PANE_POKEMON, PANE_TOKENDEX, PANE_BOX, PANE_ITEMS, PANE_SHOP, PANE_USAGE],
             PANE_POKEMON,
         )
         self._sidebar_buttons: list[NSButton] = []
@@ -263,6 +264,7 @@ class TokenmonPopover(NSObject):
             (PANE_TOKENDEX, "📖"),
             (PANE_BOX, "📦"),
             (PANE_ITEMS, "🎒"),
+            (PANE_SHOP, "🛒"),
             (PANE_USAGE, "$"),
         ]
         self._sidebar_pane_ids = [pane_id for pane_id, _ in items]
@@ -393,6 +395,7 @@ class TokenmonPopover(NSObject):
         )
         from tokenmon.popover.panes.items import ItemsController
         from tokenmon.popover.panes.pokemon import PokemonController
+        from tokenmon.popover.panes.shop import ShopController
         from tokenmon.popover.panes.tokendex import TokendexController
         from tokenmon.popover.panes.usage import UsageController
 
@@ -404,6 +407,7 @@ class TokenmonPopover(NSObject):
             PANE_TOKENDEX: TokendexController,
             PANE_BOX: BoxController,
             PANE_ITEMS: ItemsController,
+            PANE_SHOP: ShopController,
             PANE_USAGE: UsageController,
         }
         ctrl_cls = registry.get(idx)
@@ -552,7 +556,7 @@ class TokenmonPopover(NSObject):
         if self._popover.isShown():
             self._popover.close()
             return
-        base_panes = (PANE_POKEMON, PANE_TOKENDEX, PANE_BOX, PANE_USAGE)
+        base_panes = (PANE_POKEMON, PANE_TOKENDEX, PANE_BOX, PANE_ITEMS, PANE_SHOP, PANE_USAGE)
         try:
             pending_trainer = get_pending_trainer()
         except Exception:

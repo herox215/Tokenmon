@@ -14,6 +14,8 @@ Each Item has:
 - actions: tuple of action keys this item supports — currently only 'throw'
 - pocket: bag-pocket grouping for the Items pane tabs ('balls', 'medicine',
   'evolution', 'misc'). Pure UI grouping — no DB schema impact.
+- shop_price: price in $ when sold via the Shop pane. ``None`` means the
+  item is not sold (master ball, stones).
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ class Item:
     sprite_name: str | None = None
     tok_chance: float | None = None
     pocket: str = "misc"
+    shop_price: int | None = None
 
 
 ITEMS: dict[str, Item] = {
@@ -47,8 +50,9 @@ ITEMS: dict[str, Item] = {
         threshold=1_000,
         actions=("throw",),
         sprite_name="poke-ball",
-        tok_chance=1 / 5_000,
+        tok_chance=1 / 50_000,
         pocket="balls",
+        shop_price=200,
     ),
     "greatball": Item(
         key="greatball",
@@ -58,8 +62,9 @@ ITEMS: dict[str, Item] = {
         threshold=10_000,
         actions=("throw",),
         sprite_name="great-ball",
-        tok_chance=1 / 10_000,
+        tok_chance=1 / 100_000,
         pocket="balls",
+        shop_price=600,
     ),
     "ultraball": Item(
         key="ultraball",
@@ -69,8 +74,9 @@ ITEMS: dict[str, Item] = {
         threshold=50_000,
         actions=("throw",),
         sprite_name="ultra-ball",
-        tok_chance=1 / 50_000,
+        tok_chance=1 / 500_000,
         pocket="balls",
+        shop_price=1200,
     ),
     "masterball": Item(
         key="masterball",
@@ -149,14 +155,47 @@ ITEMS: dict[str, Item] = {
         threshold=2_000,
         actions=("use",),
         sprite_name="potion",
-        tok_chance=1 / 5_000,
+        tok_chance=1 / 50_000,
         pocket="medicine",
+        shop_price=300,
+    ),
+    # PP-restore items. Spawn rate matches Potion per design — PP and HP
+    # are sibling resources so finding rates track.
+    "ether": Item(
+        key="ether",
+        emoji="💧",
+        display_name="Ether",
+        description="Restores 10 PP to one of the active Pokémon's moves.",
+        threshold=2_000,
+        actions=("use",),
+        sprite_name="ether",
+        tok_chance=1 / 50_000,
+        pocket="medicine",
+        shop_price=1200,
     ),
 }
+
+# Items sold in the Shop pane, in render order. Master Ball + stones are
+# intentionally absent — found-only / quest-only.
+SHOP_ITEMS: tuple[str, ...] = (
+    "pokeball", "greatball", "ultraball", "potion", "ether",
+)
+
+
+def shop_items() -> list[tuple[str, "Item"]]:
+    """Return ``(key, Item)`` pairs for the shop, in declaration order."""
+    return [(k, ITEMS[k]) for k in SHOP_ITEMS if k in ITEMS]
 
 # HP restored per use, keyed by item slug.
 POTION_HEAL_AMOUNTS: dict[str, int] = {
     "potion": 20,
+}
+
+# PP restored per use, keyed by item slug. Ether: 10 PP to the lowest-PP
+# move slot (Gen-3 canon — Ether picks one move; we auto-pick lowest so
+# the items pane doesn't need a slot picker UI).
+ETHER_PP_AMOUNTS: dict[str, int] = {
+    "ether": 10,
 }
 
 # Catch-rate modifier per ball when used in 'throw' action. Items not in this

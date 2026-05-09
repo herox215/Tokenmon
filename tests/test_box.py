@@ -196,10 +196,10 @@ def test_use_ether_unknown_key_returns_none(db_path):
 def test_ether_is_in_items_registry_with_drop_chance():
     """Pin Ether's registry shape so a future regression that flips
     tok_chance to None or moves it out of the medicine pocket is
-    caught immediately. The 1/5_000 chance mirrors Potion per design."""
+    caught immediately. The 1/50_000 chance mirrors Potion per design."""
     from tokenmon.items import ITEMS
 
     ether = ITEMS["ether"]
     assert ether.pocket == "medicine"
-    assert ether.tok_chance == 1 / 5_000
+    assert ether.tok_chance == 1 / 50_000
     assert "use" in ether.actions

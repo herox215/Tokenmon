@@ -17,14 +17,14 @@ def test_roll_drops_zero_tokens_returns_empty():
 
 
 def test_roll_drops_pokeball_at_threshold_almost_always_at_least_one():
-    """At 5000 output tokens, pokéball EV = 1 → deterministic floor=1."""
-    drops = items.roll_item_drops(5000)
+    """At 50k output tokens, pokéball EV = 1 → deterministic floor=1."""
+    drops = items.roll_item_drops(50_000)
     assert drops.get("pokeball", 0) >= 1
 
 
 def test_roll_drops_high_tokens_yields_many_pokeballs():
-    """50k tokens → EV 10 pokéballs deterministic minimum."""
-    drops = items.roll_item_drops(50_000)
+    """500k tokens → EV 10 pokéballs deterministic minimum."""
+    drops = items.roll_item_drops(500_000)
     assert drops.get("pokeball", 0) >= 10
 
 
@@ -42,8 +42,8 @@ def test_roll_drops_skips_items_without_tok_chance(monkeypatch):
 
 
 def test_roll_drops_expected_value_matches_tok_chance():
-    """Mean pokéballs over 200 trials at 25_000 tokens (EV=5) ≈ 5."""
-    samples = [items.roll_item_drops(25_000).get("pokeball", 0) for _ in range(200)]
+    """Mean pokéballs over 200 trials at 250_000 tokens (EV=5) ≈ 5."""
+    samples = [items.roll_item_drops(250_000).get("pokeball", 0) for _ in range(200)]
     mean = statistics.mean(samples)
     # Deterministic floor=5 per trial; the only randomness is whether the
     # fractional 0.0 part adds 1 (it never does at exact integer EV).
@@ -93,10 +93,10 @@ def test_increment_item_used_decrements_inventory(db_path):
 
 
 def test_insert_usage_adds_pokeballs_to_pending(db_path):
-    """A 25_000-token request lands ~5 pokéballs in pending_drops (not the
+    """A 250_000-token request lands ~5 pokéballs in pending_drops (not the
     live inventory — they wait there until the user claims)."""
     storage.insert_usage(
-        storage.Usage(model="x", output_tokens=25_000), path=db_path,
+        storage.Usage(model="x", output_tokens=250_000), path=db_path,
     )
     pending = storage.query_pending_drops(path=db_path)
     assert pending.get("pokeball", 0) >= 5
