@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from .status import StatusState
+
 
 # Difficulty is a closed string set so callers can switch on it.
 # Easy (1 mon, much weaker), Medium (2 mons, slightly weaker), Hard
@@ -40,6 +42,19 @@ class Move:
     pp: int                    # Max PP — current PP tracked separately
     priority: int = 0          # Filtered out (only priority=0 in v1)
     description: str = ""      # Short effect text from PokeAPI (UI tooltip)
+    # Status-effect metadata sourced from PokeAPI ``meta`` block. Per-status
+    # modules read these to decide whether a move can inflict their status.
+    #   ``ailment``        → PokeAPI ailment slug ("poison", "burn", "sleep",
+    #                        "paralysis", "freeze", "confusion", "none", …).
+    #                        ``"none"`` and missing are equivalent.
+    #   ``ailment_chance`` → 0..100; 0 means "guaranteed if ailment is set
+    #                        and the move is a status move" (Toxic, Will-O-
+    #                        Wisp, etc.) per PokeAPI's convention.
+    #   ``flinch_chance``  → 0..100; secondary flinch (Bite, Headbutt, Rock
+    #                        Slide). Independent of the ailment chance.
+    ailment: str = "none"
+    ailment_chance: int = 0
+    flinch_chance: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +79,11 @@ class BattleStats:
     moves: tuple[Move, ...]    # 1-4 moves available this battle
     move_pps: tuple[int, ...]  # current PP per slot, parallel to moves
     name: str = ""             # display label (nickname or species name)
+    # Status snapshot. Defaults to "healthy + no volatile". Frozen
+    # dataclass + frozen StatusState means turn-resolution functions
+    # produce a new BattleStats via ``replace(stats, status=new_state)``
+    # rather than mutating in place — keeps the engine pure.
+    status: StatusState = field(default_factory=StatusState)
 
 
 @dataclass(frozen=True, slots=True)

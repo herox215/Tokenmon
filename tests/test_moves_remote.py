@@ -29,7 +29,8 @@ def _reset_module_cache():
 def _fake_payload(name="tackle", type_="normal", category="physical",
                   power=40, accuracy=100, pp=35, priority=0,
                   effect_entries=None, flavor_text_entries=None,
-                  effect_chance=None) -> dict:
+                  effect_chance=None,
+                  ailment="none", ailment_chance=0, flinch_chance=0) -> dict:
     payload = {
         "name": name,
         "type": {"name": type_},
@@ -38,6 +39,11 @@ def _fake_payload(name="tackle", type_="normal", category="physical",
         "accuracy": accuracy,
         "pp": pp,
         "priority": priority,
+        "meta": {
+            "ailment": {"name": ailment},
+            "ailment_chance": ailment_chance,
+            "flinch_chance": flinch_chance,
+        },
     }
     if effect_entries is not None:
         payload["effect_entries"] = effect_entries
@@ -264,3 +270,187 @@ def test_old_cache_without_description_fields_returns_empty(
     move = moves_remote._parse_move(legacy_slice)
     assert move is not None
     assert move.description == ""
+
+
+# --- Ailment / status meta extraction ------------------------------------
+
+
+def test_status_move_extracts_guaranteed_ailment(monkeypatch, db_path):
+    """Toxic-style status moves carry ailment_chance=0 — PokeAPI's
+    convention for "guaranteed if the move is a status move"."""
+    from tokenmon import moves_remote
+    monkeypatch.setattr(
+        moves_remote.urllib.request, "urlopen",
+        lambda req, timeout: _FakeResponse(_fake_payload(
+            name="toxic", type_="poison", category="status",
+            power=None, accuracy=90, pp=10,
+            ailment="poison", ailment_chance=0,
+        )),
+    )
+    move = moves_remote.get_move_data("toxic")
+    assert move is not None
+    assert move.ailment == "poison"
+    assert move.ailment_chance == 0
+    assert move.flinch_chance == 0
+
+
+def test_secondary_effect_move_extracts_chance(monkeypatch, db_path):
+    """Damaging moves with secondary effects (Sludge Bomb, Ice Beam)
+    have a non-zero ailment_chance."""
+    from tokenmon import moves_remote
+    monkeypatch.setattr(
+        moves_remote.urllib.request, "urlopen",
+        lambda req, timeout: _FakeResponse(_fake_payload(
+            name="sludge-bomb", type_="poison", category="special",
+            power=90, accuracy=100, pp=10,
+            ailment="poison", ailment_chance=30,
+        )),
+    )
+    move = moves_remote.get_move_data("sludge-bomb")
+    assert move is not None
+    assert move.ailment == "poison"
+    assert move.ailment_chance == 30
+
+
+def test_flinch_move_extracts_flinch_chance(monkeypatch, db_path):
+    """Bite / Headbutt / Rock Slide carry flinch_chance independently of
+    ailment (ailment is "none" for these moves)."""
+    from tokenmon import moves_remote
+    monkeypatch.setattr(
+        moves_remote.urllib.request, "urlopen",
+        lambda req, timeout: _FakeResponse(_fake_payload(
+            name="bite", type_="dark", category="physical",
+            power=60, accuracy=100, pp=25,
+            ailment="none", ailment_chance=0, flinch_chance=30,
+        )),
+    )
+    move = moves_remote.get_move_data("bite")
+    assert move is not None
+    assert move.ailment == "none"
+    assert move.flinch_chance == 30
+
+
+def test_meta_fields_survive_cache_round_trip(monkeypatch, db_path):
+    """First fetch writes ailment + flinch into the cache; second fetch
+    reads them back — the cached subset must include the meta block."""
+    from tokenmon import moves_remote
+
+    payload = _fake_payload(
+        name="will-o-wisp", type_="fire", category="status",
+        power=None, accuracy=85, pp=15,
+        ailment="burn", ailment_chance=0,
+    )
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout):
+        calls["n"] += 1
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(moves_remote.urllib.request, "urlopen", fake_urlopen)
+    first = moves_remote.get_move_data("will-o-wisp")
+    moves_remote.clear_cache()
+    second = moves_remote.get_move_data("will-o-wisp")
+    assert first == second
+    assert calls["n"] == 1  # second hit served from disk cache
+    assert second.ailment == "burn"
+    assert second.ailment_chance == 0
+
+
+def test_legacy_cache_without_meta_falls_back_to_no_status():
+    """Cache rows written before this column existed have no ``meta`` —
+    parsing them must not crash, and must yield "no status side effect"
+    so old caches keep working without a manual wipe (the user's app
+    refreshes per-move on demand)."""
+    from tokenmon import moves_remote
+    legacy_slice = {
+        "name": "tackle",
+        "type": {"name": "normal"},
+        "damage_class": {"name": "physical"},
+        "power": 40,
+        "accuracy": 100,
+        "pp": 35,
+        "priority": 0,
+    }
+    move = moves_remote._parse_move(legacy_slice)
+    assert move is not None
+    assert move.ailment == "none"
+    assert move.ailment_chance == 0
+    assert move.flinch_chance == 0
+
+
+def test_legacy_cache_entry_triggers_refetch(monkeypatch, db_path):
+    """A user with a pre-status-migration cache (entries lacking ``meta``)
+    must not be stuck without status effects forever. ``get_move_data``
+    treats meta-less cache rows as a soft miss and re-fetches so the
+    fresh payload (with ailment metadata) overwrites the stale one."""
+    from tokenmon import moves_remote
+
+    # Pre-seed a stale cache entry (legacy shape, no meta block).
+    moves_remote._loaded = True
+    moves_remote._moves = {
+        "toxic": {
+            "name": "toxic",
+            "type": {"name": "poison"},
+            "damage_class": {"name": "status"},
+            "power": None, "accuracy": 90, "pp": 10, "priority": 0,
+            # No "meta" key — pre-migration shape.
+        },
+    }
+
+    fetched = {"n": 0}
+
+    def fake_urlopen(req, timeout):
+        fetched["n"] += 1
+        return _FakeResponse(_fake_payload(
+            name="toxic", type_="poison", category="status",
+            power=None, accuracy=90, pp=10,
+            ailment="poison", ailment_chance=0,
+        ))
+
+    monkeypatch.setattr(moves_remote.urllib.request, "urlopen", fake_urlopen)
+    move = moves_remote.get_move_data("toxic")
+    assert move is not None
+    assert fetched["n"] == 1, "stale cache entry must trigger a re-fetch"
+    assert move.ailment == "poison"
+    assert move.ailment_chance == 0
+
+
+def test_real_move_inflicts_status_via_engine(monkeypatch, db_path):
+    """End-to-end: a real-shaped Toxic payload, parsed via moves_remote,
+    runs through plan_turn and fires a StatusInflictedEvent. Pins the
+    full pipeline — moves_remote → ailment_to_status registry →
+    on_inflict — against future regressions where any link breaks."""
+    import random
+    from tokenmon import moves_remote
+    from tokenmon.battle.engine import StatusInflictedEvent, plan_turn
+    from tokenmon.battle.models import BattleStats
+
+    monkeypatch.setattr(
+        moves_remote.urllib.request, "urlopen",
+        lambda req, timeout: _FakeResponse(_fake_payload(
+            name="toxic", type_="poison", category="status",
+            power=None, accuracy=100, pp=10,
+            ailment="poison", ailment_chance=0,
+        )),
+    )
+    toxic = moves_remote.get_move_data("toxic")
+    assert toxic is not None
+
+    def mk(name, types):
+        return BattleStats(
+            species_dex_id=1, level=20, types=types,
+            hp_max=100, hp_current=100,
+            attack=80, defense=80, sp_attack=80, sp_defense=80, speed=80,
+            moves=(toxic,), move_pps=(10,), name=name,
+        )
+
+    events = plan_turn(
+        mk("Atk", ("normal",)),
+        mk("Def", ("grass",)),  # not poison/steel — vulnerable
+        player_move=toxic, opp_move=toxic,
+        rng=random.Random(0),
+    )
+    inflicts = [e for e in events if isinstance(e, StatusInflictedEvent)]
+    assert any("badly poisoned" in e.message for e in inflicts), (
+        f"Toxic should inflict bad-poison; got events: {events}"
+    )

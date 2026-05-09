@@ -24,6 +24,7 @@ __all__ = [
     "query_pending_drops",
     "claim_pending_drops",
     "set_encounter_hp",
+    "set_encounter_status",
 ]
 
 
@@ -49,6 +50,8 @@ class Encounter:
     ivs: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0)
     hp_current: int | None = None
     move_keys: tuple[str, ...] = ()
+    status_non_volatile: str = "healthy"
+    status_counter: int = 0
 
 
 def _parse_utc(ts: str | None) -> datetime | None:
@@ -94,6 +97,12 @@ def _row_to_encounter(row: tuple) -> Encounter:
         ) if len(row) > 22 else (0, 0, 0, 0, 0, 0),
         hp_current=int(row[23]) if len(row) > 23 and row[23] is not None else None,
         move_keys=move_keys,
+        status_non_volatile=(
+            str(row[25]) if len(row) > 25 and row[25] is not None else "healthy"
+        ),
+        status_counter=(
+            int(row[26]) if len(row) > 26 and row[26] is not None else 0
+        ),
     )
 
 
@@ -103,7 +112,7 @@ _ENCOUNTER_COLS = (
     "masterballs_used, resolved, resolved_utc, pokemon_id, last_hint, "
     "gender, is_shiny, "
     "iv_hp, iv_attack, iv_defense, iv_sp_attack, iv_sp_defense, iv_speed, "
-    "hp_current, move_keys_json"
+    "hp_current, move_keys_json, status_non_volatile, status_counter"
 )
 
 
@@ -162,6 +171,25 @@ def set_encounter_hp(
         conn.execute(
             "UPDATE encounters SET hp_current = ? WHERE id = ?",
             (int(hp_current), encounter_id),
+        )
+
+
+def set_encounter_status(
+    encounter_id: int,
+    status: str,
+    counter: int = 0,
+    *,
+    path: Path | None = None,
+) -> None:
+    """Persist the wild mon's non-volatile status between turns. See
+    ``set_pokemon_status`` for the value space."""
+    if path is None:
+        path = DB_PATH
+    with _connect(path) as conn:
+        conn.execute(
+            "UPDATE encounters SET status_non_volatile = ?, status_counter = ? "
+            "WHERE id = ?",
+            (str(status), int(counter), int(encounter_id)),
         )
 
 

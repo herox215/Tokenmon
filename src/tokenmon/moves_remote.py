@@ -113,6 +113,40 @@ def _extract_description(payload: dict) -> str:
     return ""
 
 
+def _extract_meta_fields(payload: dict) -> tuple[str, int, int]:
+    """Pull ailment + flinch metadata out of PokeAPI's ``meta`` block.
+
+    PokeAPI shape (relevant slice):
+        meta: {
+            ailment: {"name": "poison", "url": "..."},
+            ailment_chance: 30,
+            flinch_chance: 0,
+            ...
+        }
+
+    Returns ``(ailment_name, ailment_chance, flinch_chance)``. Missing /
+    malformed meta yields ``("none", 0, 0)`` — i.e. "no status side-effect".
+    """
+    meta = payload.get("meta") or {}
+    if not isinstance(meta, dict):
+        return ("none", 0, 0)
+    ailment = (meta.get("ailment") or {})
+    name = "none"
+    if isinstance(ailment, dict):
+        n = ailment.get("name")
+        if isinstance(n, str) and n:
+            name = n.lower()
+    try:
+        ailment_chance = int(meta.get("ailment_chance") or 0)
+    except (TypeError, ValueError):
+        ailment_chance = 0
+    try:
+        flinch_chance = int(meta.get("flinch_chance") or 0)
+    except (TypeError, ValueError):
+        flinch_chance = 0
+    return (name, max(0, ailment_chance), max(0, flinch_chance))
+
+
 def _parse_move(payload: dict) -> Move | None:
     """Translate the relevant slice of a PokeAPI move payload into our
     typed ``Move``. Returns None if the payload is missing required
@@ -131,6 +165,7 @@ def _parse_move(payload: dict) -> Move | None:
     if category not in ("physical", "special", "status"):
         return None
     description = _extract_description(payload)
+    ailment, ailment_chance, flinch_chance = _extract_meta_fields(payload)
     return Move(
         key=str(key),
         name=str(key).replace("-", " ").title(),
@@ -141,6 +176,9 @@ def _parse_move(payload: dict) -> Move | None:
         pp=int(pp),
         priority=int(priority or 0),
         description=description,
+        ailment=ailment,
+        ailment_chance=ailment_chance,
+        flinch_chance=flinch_chance,
     )
 
 
@@ -152,8 +190,18 @@ def get_move_data(move_key: str, *, timeout: float = FETCH_TIMEOUT_SEC) -> Move 
     """
     _load_from_disk()
     key = move_key.strip().lower()
-    if key in _moves:
-        return _parse_move(_moves[key])
+    cached = _moves.get(key)
+    if cached is not None:
+        # Treat pre-status-migration cache entries (no usable ``meta``
+        # block) as a soft miss so status-effect data backfills the next
+        # time the user fights with this move. Without this, any user
+        # who caught their cache before the status migration would
+        # silently never see Toxic / Will-O-Wisp / Sleep Powder fire.
+        meta = cached.get("meta")
+        if isinstance(meta, dict) and meta:
+            return _parse_move(cached)
+        # Drop the stale entry and fall through to the network fetch.
+        _moves.pop(key, None)
     url = MOVES_URL.format(key=key)
     try:
         req = urllib.request.Request(
@@ -184,6 +232,11 @@ def get_move_data(move_key: str, *, timeout: float = FETCH_TIMEOUT_SEC) -> Move 
         "effect_entries": payload.get("effect_entries") or [],
         "flavor_text_entries": payload.get("flavor_text_entries") or [],
         "effect_chance": payload.get("effect_chance"),
+        # Status metadata for the battle engine. See _extract_meta_fields.
+        # Older cache rows that pre-date this column simply yield the
+        # "no status" defaults via _extract_meta_fields' missing-block
+        # fallback, so partial caches keep working without manual reset.
+        "meta": payload.get("meta") or {},
     }
     try:
         _save_to_disk()

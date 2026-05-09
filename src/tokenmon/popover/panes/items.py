@@ -115,12 +115,53 @@ class _ItemsPaneRowHandler(NSObject):
                 pass
             return
 
-        # Healing items branch: potion → use_potion. Potions return
-        # ``(old_hp, new_hp, hp_max)`` on success and trigger a brief
-        # animated HP fill on the active-Pokémon pane.
-        from tokenmon.items import POTION_HEAL_AMOUNTS
+        # Healing items branch: potion → use_potion (HP), ether →
+        # use_ether (PP). Potions return ``(old_hp, new_hp, hp_max)`` on
+        # success and trigger a brief animated HP fill on the active-
+        # Pokémon pane. Ether returns ``(move_key, slot, old_pp, new_pp)``
+        # and just shows a notification — no animation since PP doesn't
+        # have a visible bar in the active-Pokémon view.
+        from tokenmon.items import ETHER_PP_AMOUNTS, POTION_HEAL_AMOUNTS
         item = items.get(self._item_key)
         item_name = item.display_name if item is not None else self._item_key
+        if self._item_key in ETHER_PP_AMOUNTS:
+            try:
+                result = box.use_ether(active.id, self._item_key)
+            except Exception:
+                log.exception("use_ether failed")
+                return
+            popover = self._ctrl.popover
+            if result is None:
+                try:
+                    rumps.notification(
+                        title="Tokenmon",
+                        subtitle=f"{item_name} had no effect",
+                        message=(
+                            f"{pokemon.display_name(active.nickname, active.species_dex_id)} "
+                            f"already has full PP on every move."
+                        ),
+                    )
+                except Exception:
+                    pass
+                popover._show_pane(PANE_ITEMS)
+                return
+            move_key, _slot, old_pp, new_pp = result
+            try:
+                from tokenmon import moves_remote
+                md = moves_remote.get_move_data(move_key)
+                move_label = md.name if md is not None else move_key
+            except Exception:
+                move_label = move_key
+            try:
+                rumps.notification(
+                    title="Tokenmon",
+                    subtitle=f"Used {item_name}!",
+                    message=f"{move_label}: +{new_pp - old_pp} PP ({new_pp} now).",
+                )
+            except Exception:
+                pass
+            popover._show_pane(PANE_ITEMS)
+            return
         if self._item_key in POTION_HEAL_AMOUNTS:
             try:
                 result = box.use_potion(active.id, self._item_key)

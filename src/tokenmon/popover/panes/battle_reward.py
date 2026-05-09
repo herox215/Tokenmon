@@ -49,12 +49,13 @@ from tokenmon.storage import (
     DB_PATH,
     add_money,
     add_to_pending,
+    clear_pokemon_status,
     get_trainer,
     list_trainer_pokemon,
     mark_trainer_resolved,
     query_xp_for_pokemon,
-    reset_pp_for_pokemon,
     set_pokemon_hp,
+    set_pokemon_status,
 )
 from tokenmon.storage._db import _connect
 
@@ -143,6 +144,23 @@ class _AnimatedXPBar(NSView):
         NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
             fill, 5, 5,
         ).fill()
+
+
+def _post_battle_status_counter(status_value: str, counter: int) -> int:
+    """Apply Gen-3 "switch-out" semantics to the persisted status counter.
+
+    The badly-poisoned ramp counter resets to 1 when a Pokémon leaves the
+    field — in canonical Pokémon that's a switch-out, in Tokenmon that's
+    the battle ending (we have no mid-battle switching). Without this
+    the next fight would resume at the same crippling 5/16, 6/16, … rate.
+
+    Other statuses keep their counters as-is — sleep turns persist
+    (you don't re-roll wake duration each battle), regular poison /
+    burn don't use the counter at all.
+    """
+    if status_value == "bad-poison":
+        return 1
+    return counter
 
 
 def _award_rewards(
@@ -336,28 +354,23 @@ class BattleRewardController(PaneController):
             try:
                 final_player = session.get("player_state")
                 if final_player is not None:
-                    set_pokemon_hp(
-                        player_id,
-                        int(getattr(final_player, "hp_current", 0)),
-                    )
+                    final_hp = int(getattr(final_player, "hp_current", 0))
+                    set_pokemon_hp(player_id, final_hp)
+                    # Faint clears non-volatile status (Gen-3 canon).
+                    # Otherwise persist whatever the engine left on the
+                    # mon so poison/burn/sleep counters carry over.
+                    if final_hp <= 0:
+                        clear_pokemon_status(player_id)
+                    else:
+                        status = getattr(final_player, "status", None)
+                        if status is not None:
+                            sv = status.non_volatile.value
+                            counter = _post_battle_status_counter(
+                                sv, int(status.nv_counter),
+                            )
+                            set_pokemon_status(player_id, sv, counter)
             except Exception:
                 log.exception("post-battle HP persist failed")
-
-            # Reset PP to max for the player's Pokémon (per plan: PP
-            # regenerates fully outside battles).
-            try:
-                from tokenmon import moves_remote
-                from tokenmon.storage import reset_pp_for_pokemon
-
-                def _pp_lookup(key: str):
-                    md = moves_remote.get_move_data(key)
-                    return md.pp if md is not None else None
-
-                reset_pp_for_pokemon(
-                    session["player_pokemon_id"], pp_lookup=_pp_lookup,
-                )
-            except Exception:
-                log.exception("PP reset failed")
 
         # Render the summary.
         is_loss = status == "lost"
@@ -626,22 +639,23 @@ class BattleRewardController(PaneController):
             try:
                 final_player = session.get("player_state")
                 if final_player is not None:
-                    set_pokemon_hp(
-                        player_id,
-                        int(getattr(final_player, "hp_current", 0)),
-                    )
+                    final_hp = int(getattr(final_player, "hp_current", 0))
+                    set_pokemon_hp(player_id, final_hp)
+                    # Faint clears non-volatile status (Gen-3 canon).
+                    # Otherwise persist whatever the engine left on the
+                    # mon so poison/burn/sleep counters carry over.
+                    if final_hp <= 0:
+                        clear_pokemon_status(player_id)
+                    else:
+                        status = getattr(final_player, "status", None)
+                        if status is not None:
+                            sv = status.non_volatile.value
+                            counter = _post_battle_status_counter(
+                                sv, int(status.nv_counter),
+                            )
+                            set_pokemon_status(player_id, sv, counter)
             except Exception:
                 log.exception("wild post-battle HP persist failed")
-            try:
-                from tokenmon import moves_remote
-
-                def _pp_lookup(key: str):
-                    md = moves_remote.get_move_data(key)
-                    return md.pp if md is not None else None
-
-                reset_pp_for_pokemon(player_id, pp_lookup=_pp_lookup)
-            except Exception:
-                log.exception("wild PP reset failed")
 
         is_loss = status == "lost"
         if status == "won":

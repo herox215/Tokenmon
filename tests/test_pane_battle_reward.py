@@ -158,3 +158,36 @@ def test_wild_blackout_no_loss_penalty(db_path):
     assert money_delta == 0
     assert xp_total == 0
     assert storage.get_money(db_path) == 500
+
+
+# ---- Toxic counter reset on battle end ---------------------------------
+
+
+def test_post_battle_status_counter_resets_bad_poison_to_one():
+    """Mirrors Gen-3 switch-out semantics: a 5/16-ramp toxic counter
+    must reset to 1/16 when the mon leaves the field (battle end).
+    Without this the next fight resumes at the punishing late-game rate."""
+    from tokenmon.popover.panes.battle_reward import _post_battle_status_counter
+
+    assert _post_battle_status_counter("bad-poison", 5) == 1
+    assert _post_battle_status_counter("bad-poison", 1) == 1
+    assert _post_battle_status_counter("bad-poison", 15) == 1
+
+
+def test_post_battle_status_counter_preserves_sleep_turns():
+    """Sleep counter survives the battle exit — re-rolling the 1-3 turn
+    duration each fight would be exploitable."""
+    from tokenmon.popover.panes.battle_reward import _post_battle_status_counter
+
+    assert _post_battle_status_counter("sleep", 3) == 3
+    assert _post_battle_status_counter("sleep", 1) == 1
+
+
+def test_post_battle_status_counter_no_effect_for_other_statuses():
+    """Regular poison / burn / paralysis / freeze don't use the counter
+    field; pass-through avoids accidentally rewriting unrelated data."""
+    from tokenmon.popover.panes.battle_reward import _post_battle_status_counter
+
+    for sv in ("healthy", "poison", "burn", "paralysis", "freeze"):
+        assert _post_battle_status_counter(sv, 0) == 0
+        assert _post_battle_status_counter(sv, 7) == 7

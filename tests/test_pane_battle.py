@@ -501,3 +501,272 @@ def test_wild_battle_player_ko_routes_to_blackout(db_path, monkeypatch):
     ctrl = BattleController(pop)
     ctrl._do_player_move(player.moves[0], 0)
     assert PANE_BATTLE_REWARD in pop._show_pane_calls
+
+
+# ---- Status persistence + badge rendering -------------------------------
+
+
+def test_status_badge_key_picks_non_volatile_over_confusion():
+    """The badge helper prefers PSN/BRN/etc over confusion when both are
+    set — only one badge slot, non-volatile wins."""
+    from tokenmon.battle.status import NonVolatileStatus, StatusState
+    from tokenmon.popover.panes.battle import _status_badge_key
+
+    player, _ = _make_states()
+    poisoned_and_confused = replace(
+        player,
+        status=StatusState(
+            non_volatile=NonVolatileStatus.POISON,
+            confusion_turns=3,
+        ),
+    )
+    assert _status_badge_key(poisoned_and_confused) == "poison"
+
+
+def test_status_badge_key_returns_confusion_when_only_volatile():
+    from tokenmon.battle.status import StatusState
+    from tokenmon.popover.panes.battle import _status_badge_key
+
+    player, _ = _make_states()
+    confused = replace(player, status=StatusState(confusion_turns=3))
+    assert _status_badge_key(confused) == "confusion"
+
+
+def test_status_badge_key_returns_none_for_healthy():
+    from tokenmon.popover.panes.battle import _status_badge_key
+
+    player, _ = _make_states()
+    assert _status_badge_key(player) is None
+
+
+def test_status_badge_key_returns_none_for_flinch_only():
+    """Flinch is single-turn — only the prevented-event log line; no
+    visible badge."""
+    from tokenmon.battle.status import StatusState
+    from tokenmon.popover.panes.battle import _status_badge_key
+
+    player, _ = _make_states()
+    flinched = replace(player, status=StatusState(flinch=True))
+    assert _status_badge_key(flinched) is None
+
+
+def test_finalize_turn_persists_player_status_to_db(db_path, monkeypatch):
+    """After a turn that left the player burned, ``_finalize_turn`` writes
+    status_non_volatile = 'burn' to the pokemon row so a popover-close
+    doesn't lose the status."""
+    from dataclasses import replace as _replace
+
+    from tokenmon import storage
+    from tokenmon.battle.models import TurnResult
+    from tokenmon.battle.status import NonVolatileStatus, StatusState
+    from tokenmon.popover.panes import battle as battle_mod
+    from tokenmon.popover.panes.battle import BattleController
+
+    pid = _seed_pokemon_with_moves(db_path)
+    player, opp = _make_states()
+    pop = _FakePopover()
+    pop._battle_session = _build_session(player, opp, player_pokemon_id=pid)
+
+    burned_player = _replace(
+        player,
+        status=StatusState(non_volatile=NonVolatileStatus.BURN),
+    )
+
+    def _stub_simulate(_p, _o, *, player_move, opp_move, rng):
+        return [], burned_player, opp
+
+    def _stub_fold(_events, _p, _o):
+        return TurnResult(
+            log=["stub"], player_state=burned_player, opp_state=opp,
+            player_fainted=False, opp_fainted=False,
+        )
+
+    monkeypatch.setattr(battle_mod, "simulate_turn", _stub_simulate)
+    monkeypatch.setattr(battle_mod, "fold_events", _stub_fold)
+    monkeypatch.setattr(BattleController, "_rerender", lambda self: None)
+
+    ctrl = BattleController(pop)
+    ctrl._do_player_move(player.moves[0], 0)
+
+    row = storage.get_pokemon_by_id(pid, path=db_path)
+    assert row is not None
+    assert row.status_non_volatile == "burn"
+
+
+def test_finalize_turn_persists_wild_status_to_encounter(db_path, monkeypatch):
+    """A wild encounter that ends a turn poisoned should have
+    status_non_volatile = 'poison' on the encounters row."""
+    from dataclasses import replace as _replace
+
+    from tokenmon import encounter as enc_mod
+    from tokenmon.battle.models import TurnResult
+    from tokenmon.battle.status import NonVolatileStatus, StatusState
+    from tokenmon.popover.panes import battle as battle_mod
+    from tokenmon.popover.panes.battle import BattleController
+    from tokenmon.storage._db import _connect
+
+    pid = _seed_pokemon_with_moves(db_path)
+    enc = enc_mod.maybe_spawn(force=True, path=db_path)
+    assert enc is not None
+    player, opp = _make_states()
+    pop = _FakePopover()
+    pop._battle_session = _build_wild_session(
+        player, opp, player_pokemon_id=pid, encounter_id=enc.id,
+    )
+
+    poisoned_opp = _replace(
+        opp,
+        status=StatusState(non_volatile=NonVolatileStatus.POISON),
+    )
+
+    def _stub_simulate(_p, _o, *, player_move, opp_move, rng):
+        return [], player, poisoned_opp
+
+    def _stub_fold(_events, _p, _o):
+        return TurnResult(
+            log=["stub"], player_state=player, opp_state=poisoned_opp,
+            player_fainted=False, opp_fainted=False,
+        )
+
+    monkeypatch.setattr(battle_mod, "simulate_turn", _stub_simulate)
+    monkeypatch.setattr(battle_mod, "fold_events", _stub_fold)
+    monkeypatch.setattr(BattleController, "_rerender", lambda self: None)
+
+    ctrl = BattleController(pop)
+    ctrl._do_player_move(player.moves[0], 0)
+
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT status_non_volatile FROM encounters WHERE id = ?",
+            (enc.id,),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "poison"
+
+
+def test_bag_open_flag_survives_controller_rebuild(db_path, monkeypatch):
+    """Clicking the Bag button must persist the bag-open state across the
+    ``_show_pane`` re-render — otherwise the user clicks Bag and the pane
+    snaps right back to the Bag/Run row because the new controller's
+    in-memory flag started False.
+
+    Concretely: ``_open_bag`` should set the flag on the popover, not on
+    the controller instance, so the rebuilt controller's
+    ``_render_wild_action_bar`` reads True.
+    """
+    from tokenmon import encounter as enc_mod
+    from tokenmon.popover.panes.battle import BattleController
+
+    pid = _seed_pokemon_with_moves(db_path)
+    enc = enc_mod.maybe_spawn(force=True, path=db_path)
+    player, opp = _make_states()
+    pop = _FakePopover()
+    pop._battle_session = _build_wild_session(
+        player, opp, player_pokemon_id=pid, encounter_id=enc.id,
+    )
+
+    ctrl = BattleController(pop)
+    ctrl._set_wild_bag_open(True)
+    # A brand-new controller (mirroring what _show_pane builds on rerender)
+    # must observe the bag-open state via the popover, not its own __init__.
+    rebuilt = BattleController(pop)
+    assert rebuilt._is_wild_bag_open() is True
+
+    # And the back-button path clears it.
+    rebuilt._set_wild_bag_open(False)
+    assert BattleController(pop)._is_wild_bag_open() is False
+
+
+def test_init_wild_battle_session_clears_stale_bag_flag(db_path, monkeypatch):
+    """A new wild encounter must reset the bag-open flag so a leftover
+    True from the previous fight doesn't drop the player on an empty bag."""
+    from tokenmon import encounter as enc_mod
+    from tokenmon.popover.panes import battle as battle_mod
+    from tokenmon.popover.panes.battle import _init_wild_battle_session
+
+    pid = _seed_pokemon_with_moves(db_path)
+    enc = enc_mod.maybe_spawn(force=True, path=db_path)
+    player, opp = _make_states()
+    monkeypatch.setattr(battle_mod, "_player_battle_stats", lambda _a: player)
+    monkeypatch.setattr(battle_mod, "_wild_battle_stats", lambda _e: opp)
+
+    pop = _FakePopover()
+    pop._battle_wild_bag_open = True  # leftover from a previous battle
+
+    class _Active:
+        id = pid
+        species_dex_id = 1
+        nature = "Hardy"
+        is_shiny = False
+        ivs = (0, 0, 0, 0, 0, 0)
+        hp_current = None
+        status_non_volatile = "healthy"
+        status_counter = 0
+
+    _init_wild_battle_session(pop, enc, _Active())
+    assert pop._battle_wild_bag_open is False
+
+
+def test_status_inflicted_in_real_engine_makes_it_to_session(db_path, monkeypatch):
+    """Regression: an inflict event from the real engine must update
+    ``session['opp_state'].status`` so the status badge renders + the
+    DB persists. The previous bug had ``fold_events`` ignoring status
+    changes, which dropped the status before the session/DB saw it.
+    """
+    from tokenmon import encounter as enc_mod
+    from tokenmon.battle.models import Move
+    from tokenmon.battle.status import NonVolatileStatus
+    from tokenmon.popover.panes.battle import BattleController
+
+    pid = _seed_pokemon_with_moves(db_path)
+    enc = enc_mod.maybe_spawn(force=True, path=db_path)
+
+    # Build a guaranteed-poison move (status, ailment_chance=0). This is
+    # how Toxic / Poison Powder are encoded post-PokeAPI parse.
+    poison_move = Move(
+        key="poison-powder", name="Poison Powder",
+        type="grass", category="status",
+        power=None, accuracy=100, pp=10,
+        ailment="poison", ailment_chance=0,
+    )
+    player_state, opp_state = _make_states()
+    # Replace the player's move 0 with the guaranteed-poison move so
+    # _do_player_move(slot=0) actually casts it. Defender is normal-type
+    # (not poison/steel) so can_inflict accepts.
+    player_state = replace(
+        player_state, moves=(poison_move,) + player_state.moves[1:],
+    )
+
+    pop = _FakePopover()
+    pop._battle_session = _build_wild_session(
+        player_state, opp_state,
+        player_pokemon_id=pid, encounter_id=enc.id,
+    )
+    monkeypatch.setattr(BattleController, "_rerender", lambda self: None)
+
+    ctrl = BattleController(pop)
+    ctrl._do_player_move(poison_move, 0)
+
+    # The opp should now carry POISON in the live session and on disk.
+    assert pop._battle_session["opp_state"].status.non_volatile == NonVolatileStatus.POISON
+    from tokenmon.storage._db import _connect
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT status_non_volatile FROM encounters WHERE id = ?",
+            (enc.id,),
+        ).fetchone()
+    assert row[0] == "poison"
+
+
+def test_status_state_from_db_translates_strings():
+    from tokenmon.battle.status import NonVolatileStatus
+    from tokenmon.popover.panes.battle import _status_state_from_db
+
+    assert _status_state_from_db("healthy", 0).non_volatile == NonVolatileStatus.HEALTHY
+    assert _status_state_from_db("burn", 0).non_volatile == NonVolatileStatus.BURN
+    assert _status_state_from_db("bad-poison", 3).non_volatile == NonVolatileStatus.BAD_POISON
+    assert _status_state_from_db("bad-poison", 3).nv_counter == 3
+    # Unknown / corrupted strings fall back to healthy.
+    assert _status_state_from_db("garbage", 0).non_volatile == NonVolatileStatus.HEALTHY
+    # NULL counter coerces to 0.
+    assert _status_state_from_db("burn", None).nv_counter == 0

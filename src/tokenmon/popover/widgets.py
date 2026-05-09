@@ -243,6 +243,66 @@ class _TypeBadge(NSView):
         astr.drawAtPoint_((x, y))
 
 
+# --- Status badges --------------------------------------------------------
+
+STATUS_BADGE_HEIGHT = 14
+STATUS_BADGE_WIDTH = 32
+
+# Map of (status_key) → (short_label, (r, g, b)). Keys match the string
+# values of ``NonVolatileStatus`` and the volatile flag we render
+# (confusion). Flinch is single-turn and renders only via the log line —
+# no badge. The colors mirror the canonical Pokémon-game palette.
+STATUS_BADGE_STYLES: dict[str, tuple[str, tuple[float, float, float]]] = {
+    "poison":     ("PSN", (0.62, 0.27, 0.62)),
+    "bad-poison": ("TOX", (0.45, 0.10, 0.55)),
+    "burn":       ("BRN", (0.92, 0.42, 0.27)),
+    "paralysis":  ("PAR", (0.94, 0.78, 0.20)),
+    "sleep":      ("SLP", (0.55, 0.55, 0.65)),
+    "freeze":     ("FRZ", (0.45, 0.78, 0.95)),
+    "confusion":  ("CNF", (0.95, 0.62, 0.40)),
+}
+
+
+class _StatusBadge(NSView):
+    """Small rounded pill rendered in the canonical color of a status
+    condition with a 3-letter abbreviation in white. Drawn manually like
+    ``_TypeBadge`` so the rounded fill + centred text composite without
+    a layer-delegate.
+
+    Pass the status string ("poison", "burn", "bad-poison", "paralysis",
+    "sleep", "freeze", "confusion") at init time. Unknown / "healthy"
+    strings render an empty (transparent) view so callers can keep the
+    same badge slot regardless of state.
+    """
+
+    def initWithFrame_status_(self, frame, status_key):  # noqa: N802
+        self = objc.super(_StatusBadge, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._status = (status_key or "").lower()
+        return self
+
+    def drawRect_(self, _rect):  # noqa: N802
+        style = STATUS_BADGE_STYLES.get(self._status)
+        if style is None:
+            return  # healthy / unknown → invisible
+
+        text, (r, g, b) = style
+        bounds = self.bounds()
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0).set()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bounds, 3, 3).fill()
+
+        attrs = {
+            NSFontAttributeName: NSFont.boldSystemFontOfSize_(9),
+            NSForegroundColorAttributeName: NSColor.whiteColor(),
+        }
+        astr = NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+        size = astr.size()
+        x = (bounds.size.width - size.width) / 2
+        y = (bounds.size.height - size.height) / 2
+        astr.drawAtPoint_((x, y))
+
+
 # --- Layout backdrops -----------------------------------------------------
 
 

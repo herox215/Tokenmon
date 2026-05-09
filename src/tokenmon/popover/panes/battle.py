@@ -42,9 +42,11 @@ from tokenmon.battle.engine import (
     MissEvent,
     fold_events,
     plan_turn,
+    simulate_turn,
     resolve_turn,
 )
 from tokenmon.battle.models import BattleStats, Move
+from tokenmon.battle.status import NonVolatileStatus, StatusState
 from tokenmon.battle.team_gen import generate_wild_mon
 from tokenmon.popover.panes.battle_fx import make_type_fx
 from tokenmon.popover._handlers import make_handler
@@ -57,6 +59,9 @@ from tokenmon.popover.widgets import (
     PANE_ENCOUNTER,
     PANE_POKEMON,
     POPOVER_HEIGHT,
+    STATUS_BADGE_HEIGHT,
+    STATUS_BADGE_WIDTH,
+    _StatusBadge,
     _label,
 )
 from tokenmon.storage import (
@@ -65,6 +70,8 @@ from tokenmon.storage import (
     get_pending_trainer,
     list_trainer_pokemon,
     set_encounter_hp,
+    set_encounter_status,
+    set_pokemon_status,
 )
 
 log = logging.getLogger("tokenmon.popover.panes.battle")
@@ -73,6 +80,36 @@ _FALLBACK_MOVE = Move(
     key="tackle", name="Tackle", type="normal", category="physical",
     power=40, accuracy=100, pp=35,
 )
+
+
+def _status_state_from_db(status_str: str | None, counter: int | None) -> StatusState:
+    """Translate the persisted (status_non_volatile, status_counter) pair
+    into a battle-engine ``StatusState``. Unknown / NULL values map to
+    HEALTHY so older rows from before the status migration land safely.
+    Volatile fields stay at defaults — they don't persist."""
+    raw = (status_str or "healthy").lower()
+    try:
+        nv = NonVolatileStatus(raw)
+    except ValueError:
+        nv = NonVolatileStatus.HEALTHY
+    return StatusState(non_volatile=nv, nv_counter=int(counter or 0))
+
+
+def _status_badge_key(stats: BattleStats) -> str | None:
+    """Pick the most relevant badge label for a Pokémon's current state.
+
+    Non-volatile statuses always win over confusion (Gen-3 canon: only
+    one badge slot). Confusion is shown only when no non-volatile is
+    active. Flinch is single-turn and doesn't get a badge — it surfaces
+    via the log line. Returns None for healthy / unbadged states so
+    callers can skip drawing.
+    """
+    nv = stats.status.non_volatile.value
+    if nv != "healthy":
+        return nv
+    if stats.status.confusion_turns > 0:
+        return "confusion"
+    return None
 
 
 _HP_DRAIN_FPS = 30
@@ -238,13 +275,20 @@ def _player_battle_stats(active) -> BattleStats:
     # remaining HP from the previous fight.
     if active.hp_current is None or active.hp_current <= 0:
         starting_hp = hp_max
+        # A 0-HP auto-revive also resets status — Pokémon Center semantics.
+        status = StatusState()
     else:
         starting_hp = min(int(active.hp_current), hp_max)
+        status = _status_state_from_db(
+            getattr(active, "status_non_volatile", "healthy"),
+            getattr(active, "status_counter", 0),
+        )
     return BattleStats(
         species_dex_id=active.species_dex_id, level=level, types=types,
         hp_max=hp_max, hp_current=starting_hp,
         attack=atk, defense=defn, sp_attack=spa, sp_defense=spd,
         speed=spe, moves=tuple(moves), move_pps=tuple(pps), name=name,
+        status=status,
     )
 
 
@@ -321,6 +365,10 @@ def _wild_battle_stats(enc) -> BattleStats:
         moves = [_FALLBACK_MOVE]
     name = pokemon.name_of(mon.species_dex_id)
     starting_hp = enc.hp_current if enc.hp_current is not None else hp_max
+    status = _status_state_from_db(
+        getattr(enc, "status_non_volatile", "healthy"),
+        getattr(enc, "status_counter", 0),
+    )
     return BattleStats(
         species_dex_id=mon.species_dex_id, level=mon.level, types=types,
         hp_max=hp_max, hp_current=max(0, min(hp_max, int(starting_hp))),
@@ -328,6 +376,7 @@ def _wild_battle_stats(enc) -> BattleStats:
         speed=spe, moves=tuple(moves),
         move_pps=tuple(m.pp for m in moves),
         name=f"Wild {name}",
+        status=status,
     )
 
 
@@ -349,6 +398,9 @@ def _init_wild_battle_session(popover, enc, active) -> dict:
         "rng": random.Random(),
     }
     popover._battle_session = session
+    # Brand-new fight: make sure a leftover bag-open flag from a prior
+    # encounter doesn't strand the player on an empty bag list.
+    popover._battle_wild_bag_open = False
     return session
 
 
@@ -470,10 +522,11 @@ class BattleController(PaneController):
         self._battle_view = None
         self._move_buttons: list = []
         self._log_labels: list = []
-        # Wild-only: while True, the action bar shows the bag list instead
-        # of the Bag/Run row. Cleared on bag-back, on throw, and on every
-        # finalize_turn so the player isn't stranded mid-bag.
-        self._wild_bag_open: bool = False
+        # Wild-only bag-open flag lives on the popover (not the
+        # controller) because ``_show_pane`` rebuilds the controller on
+        # every re-render — a controller-local bool would always reset
+        # to False before render and the bag would never appear. See
+        # ``_set_wild_bag_open`` / ``_is_wild_bag_open``.
 
     def build_view(self) -> NSView:
         # If the user re-opened the popover (or navigated away and back)
@@ -584,28 +637,38 @@ class BattleController(PaneController):
                 view.addSubview_(iv)
                 self._opp_sprite_view = iv
 
+        opp_info_w = CONTENT_WIDTH - sprite_size - 40
         view.addSubview_(_label(
-            NSMakeRect(16, POPOVER_HEIGHT - 40,
-                       CONTENT_WIDTH - sprite_size - 40, 20),
+            NSMakeRect(16, POPOVER_HEIGHT - 40, opp_info_w, 20),
             f"{opp.name}    Lv {opp.level}",
             font=NSFont.boldSystemFontOfSize_(13),
         ))
         opp_bar = _HPBar.alloc().initWithFrame_current_max_(
-            NSMakeRect(16, POPOVER_HEIGHT - 60,
-                       CONTENT_WIDTH - sprite_size - 40, 12),
+            NSMakeRect(16, POPOVER_HEIGHT - 60, opp_info_w, 12),
             opp.hp_current, opp.hp_max,
         )
         view.addSubview_(opp_bar)
         self._opp_bar = opp_bar
         opp_hp_lbl = _label(
             NSMakeRect(16, POPOVER_HEIGHT - 80,
-                       CONTENT_WIDTH - sprite_size - 40, 14),
+                       opp_info_w - STATUS_BADGE_WIDTH - 6, 14),
             f"{opp.hp_current}/{opp.hp_max} HP",
             font=NSFont.systemFontOfSize_(10),
             color=NSColor.secondaryLabelColor(),
         )
         view.addSubview_(opp_hp_lbl)
         self._opp_hp_label = opp_hp_lbl
+        opp_badge_key = _status_badge_key(opp)
+        if opp_badge_key is not None:
+            badge = _StatusBadge.alloc().initWithFrame_status_(
+                NSMakeRect(
+                    16 + opp_info_w - STATUS_BADGE_WIDTH,
+                    POPOVER_HEIGHT - 80,
+                    STATUS_BADGE_WIDTH, STATUS_BADGE_HEIGHT,
+                ),
+                opp_badge_key,
+            )
+            view.addSubview_(badge)
 
         # Player block (middle) — back-view sprite bottom-left, name + HP
         # bottom-right (mirroring the GBA layout).
@@ -657,7 +720,11 @@ class BattleController(PaneController):
         view.addSubview_(player_bar)
         self._player_bar = player_bar
         player_hp_lbl = _label(
-            NSMakeRect(info_x, player_sprite_y + sprite_size - 54, info_w, 14),
+            NSMakeRect(
+                info_x + STATUS_BADGE_WIDTH + 6,
+                player_sprite_y + sprite_size - 54,
+                info_w - STATUS_BADGE_WIDTH - 6, 14,
+            ),
             f"{player.hp_current}/{player.hp_max} HP",
             font=NSFont.systemFontOfSize_(10),
             color=NSColor.secondaryLabelColor(),
@@ -665,6 +732,17 @@ class BattleController(PaneController):
         )
         view.addSubview_(player_hp_lbl)
         self._player_hp_label = player_hp_lbl
+        player_badge_key = _status_badge_key(player)
+        if player_badge_key is not None:
+            badge = _StatusBadge.alloc().initWithFrame_status_(
+                NSMakeRect(
+                    info_x,
+                    player_sprite_y + sprite_size - 54,
+                    STATUS_BADGE_WIDTH, STATUS_BADGE_HEIGHT,
+                ),
+                player_badge_key,
+            )
+            view.addSubview_(badge)
 
         # Battle log (last 4 lines) — sits between sprite block and moves.
         # We always create 4 slots so the runner can update them in place
@@ -759,10 +837,20 @@ class BattleController(PaneController):
 
     # ---- wild-battle action bar + bag mode ---------------------------
 
+    def _is_wild_bag_open(self) -> bool:
+        """Read the bag-open flag from the popover. Defaults to False so
+        a fresh battle always starts on the action bar."""
+        return bool(getattr(self.popover, "_battle_wild_bag_open", False))
+
+    def _set_wild_bag_open(self, value: bool) -> None:
+        self.popover._battle_wild_bag_open = bool(value)
+
     def _render_wild_action_bar(self, view: NSView, session: dict) -> None:
         """Bag + Run buttons (or, when bag-mode is on, the inventory list +
-        Back/Run row). State lives on ``self._wild_bag_open``."""
-        if getattr(self, "_wild_bag_open", False):
+        Back/Run row). The bag-open flag lives on the popover so it
+        survives the ``_show_pane`` controller rebuild that fires when
+        ``_open_bag`` triggers a re-render."""
+        if self._is_wild_bag_open():
             self._render_wild_bag(view, session)
             return
         margin = 16
@@ -778,7 +866,7 @@ class BattleController(PaneController):
         bag_btn.setBezelStyle_(1)
 
         def _open_bag(_s):
-            self._wild_bag_open = True
+            self._set_wild_bag_open(True)
             self.popover._show_pane(self.popover._current_pane)
 
         bag_handler = make_handler(_open_bag)
@@ -875,7 +963,7 @@ class BattleController(PaneController):
         back_btn.setBezelStyle_(1)
 
         def _back(_s):
-            self._wild_bag_open = False
+            self._set_wild_bag_open(False)
             self.popover._show_pane(self.popover._current_pane)
 
         back_handler = make_handler(_back)
@@ -940,7 +1028,7 @@ class BattleController(PaneController):
 
         # Bag-mode flag clears so a re-render after the catch animation
         # lands on the action bar, not the inventory.
-        self._wild_bag_open = False
+        self._set_wild_bag_open(False)
 
         # On catch, the encounter is resolved → drop the session before
         # the reveal hand-off so a stray sidebar click can't resume.
@@ -979,7 +1067,12 @@ class BattleController(PaneController):
         opp = _active_opp(session)
         opp_move = session["rng"].choice(opp.moves)
 
-        events = plan_turn(
+        # Use simulate_turn (not plan_turn) so we keep the engine's
+        # final BattleStats — fold_events doesn't reconstruct
+        # StatusState changes (poison/burn/sleep/etc.) from the event
+        # log. Without these final states, an inflicted status would
+        # never make it back into ``session`` or the DB.
+        events, final_player, final_opp = simulate_turn(
             player_state, opp,
             player_move=player_move, opp_move=opp_move,
             rng=session["rng"],
@@ -999,7 +1092,11 @@ class BattleController(PaneController):
         except Exception:
             log.exception("decrement_pp failed")
 
-        pending = {"events": events}
+        pending = {
+            "events": events,
+            "final_player": final_player,
+            "final_opp": final_opp,
+        }
 
         # Path A — no rendered view (test path or pre-render call):
         # commit final state immediately and rerender. Matches the
@@ -1366,11 +1463,22 @@ class BattleController(PaneController):
         current_player = session["player_state"]
         result = fold_events(events, current_player, _active_opp(session))
         new_player = result.player_state
+        new_opp = result.opp_state
+        # fold_events tracks HP and faint flags but ignores status changes
+        # — so an inflicted poison/burn/etc. would never reach the session
+        # or the DB. Overlay simulate_turn's final states (when present)
+        # so non-volatile + volatile status survive the turn boundary.
+        sim_player = pending.get("final_player")
+        sim_opp = pending.get("final_opp")
+        if new_player is not None and sim_player is not None:
+            new_player = replace(new_player, status=sim_player.status)
+        if new_opp is not None and sim_opp is not None:
+            new_opp = replace(new_opp, status=sim_opp.status)
         if new_player is not None:
             new_player = replace(new_player, move_pps=current_player.move_pps)
         session["player_state"] = new_player
-        if result.opp_state is not None:
-            _set_active_opp(session, result.opp_state)
+        if new_opp is not None:
+            _set_active_opp(session, new_opp)
         if append_log:
             session["log"].extend(result.log)
 
@@ -1409,15 +1517,34 @@ class BattleController(PaneController):
             self._end_battle(session, status="lost")
             return
 
-        # Persist wild HP between turns/popover-opens.
+        # Persist non-volatile status mid-battle so a popover close
+        # doesn't lose a poison/burn/sleep counter. Volatile statuses
+        # (confusion, flinch) are intentionally NOT persisted.
+        try:
+            cur_player = session["player_state"]
+            set_pokemon_status(
+                session["player_pokemon_id"],
+                cur_player.status.non_volatile.value,
+                int(cur_player.status.nv_counter),
+            )
+        except Exception:
+            log.exception("post-turn set_pokemon_status failed")
+
+        # Persist wild HP + status between turns/popover-opens.
         if kind == "wild":
             try:
+                cur_opp = _active_opp(session)
                 set_encounter_hp(
                     session["encounter_id"],
-                    int(_active_opp(session).hp_current),
+                    int(cur_opp.hp_current),
+                )
+                set_encounter_status(
+                    session["encounter_id"],
+                    cur_opp.status.non_volatile.value,
+                    int(cur_opp.status.nv_counter),
                 )
             except Exception:
-                log.exception("post-turn set_encounter_hp failed")
+                log.exception("post-turn wild persist failed")
 
         self._rerender()
 

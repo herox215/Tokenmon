@@ -28,6 +28,7 @@ import random
 from typing import Final
 
 from .models import BattleStats, DamageResult, Move
+from .status import attack_after_status
 from .types import effectiveness, label_for
 
 CRIT_NUMERATOR: Final = 1
@@ -64,6 +65,10 @@ def compute_damage(
     else:  # special
         atk = attacker.sp_attack
         defn = defender.sp_defense
+
+    # Status hook: burn halves physical attack output (Gen-3 rule).
+    # Future statuses (e.g. swagger-style boosts) plug in here too.
+    atk = attack_after_status(attacker, move, atk)
 
     # Avoid div-by-zero on bizarre data; floor at 1.
     if defn <= 0:

@@ -373,6 +373,33 @@ def _ensure_encounter_battle_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE encounters ADD COLUMN move_keys_json TEXT")
 
 
+def _ensure_status_columns(conn: sqlite3.Connection) -> None:
+    """Add ``status_non_volatile`` (TEXT, default 'healthy') and
+    ``status_counter`` (INTEGER, default 0) to ``pokemon`` and
+    ``encounters``.
+
+    Non-volatile statuses (poison/burn/sleep/freeze/paralysis/bad-poison)
+    persist between battles per Pokémon canon — only Pokémon-Center heals
+    or items cure them. Volatile statuses (confusion, flinch) are
+    in-memory only.
+
+    ``status_counter`` semantics depend on the status — sleep turns left,
+    toxic ramp counter, etc. See ``battle.status.StatusState``.
+    """
+    for table in ("pokemon", "encounters"):
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if "status_non_volatile" not in cols:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN "
+                "status_non_volatile TEXT NOT NULL DEFAULT 'healthy'"
+            )
+        if "status_counter" not in cols:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN "
+                "status_counter INTEGER NOT NULL DEFAULT 0"
+            )
+
+
 def _ensure_iv_columns(conn: sqlite3.Connection) -> None:
     """Add the six IV columns to pokemon + encounters and backfill any rows
     that pre-date the column with a deterministic id-seeded roll. Idempotent.
@@ -509,6 +536,7 @@ def init_db(path: Path | None = None) -> None:
         _ensure_iv_columns(conn)
         _ensure_hp_current_column(conn)
         _ensure_encounter_battle_columns(conn)
+        _ensure_status_columns(conn)
         _migrate_encounter_balls_to_items(conn)
         _backfill_pokedex_seen(conn)
         _backfill_inventory(conn)

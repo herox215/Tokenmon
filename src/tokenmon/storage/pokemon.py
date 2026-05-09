@@ -17,6 +17,8 @@ __all__ = [
     "update_pokemon_nickname",
     "bump_affection",
     "set_pokemon_hp",
+    "set_pokemon_status",
+    "clear_pokemon_status",
 ]
 
 
@@ -38,13 +40,21 @@ class Pokemon:
     # is the actual remaining HP. Battle init reads this; battle reward
     # writes the post-battle HP back here.
     hp_current: int | None = None
+    # Persisted non-volatile status. ``"healthy"`` is the default; a
+    # poisoned / burned / paralyzed / asleep / frozen / bad-poison mon
+    # carries the status between battles per Pokémon canon. Volatile
+    # statuses (confusion, flinch) are in-memory only and never land
+    # here.
+    status_non_volatile: str = "healthy"
+    # Counter meaning depends on the status — see battle.status.StatusState.
+    status_counter: int = 0
 
 
 _POKEMON_COLUMNS = (
     "id, caught_date, species_dex_id, nature, characteristic, "
     "nickname, is_shiny, affection, gender, "
     "iv_hp, iv_attack, iv_defense, iv_sp_attack, iv_sp_defense, iv_speed, "
-    "hp_current"
+    "hp_current, status_non_volatile, status_counter"
 )
 
 
@@ -66,6 +76,14 @@ def _row_to_pokemon(row: tuple) -> Pokemon:
         hp_current=(
             int(row[15]) if len(row) > 15 and row[15] is not None
             else None
+        ),
+        status_non_volatile=(
+            str(row[16]) if len(row) > 16 and row[16] is not None
+            else "healthy"
+        ),
+        status_counter=(
+            int(row[17]) if len(row) > 17 and row[17] is not None
+            else 0
         ),
     )
 
@@ -231,3 +249,34 @@ def set_pokemon_hp(
             "UPDATE pokemon SET hp_current = ? WHERE id = ?",
             (value, int(pokemon_id)),
         )
+
+
+def set_pokemon_status(
+    pokemon_id: int,
+    status: str,
+    counter: int = 0,
+    *,
+    path: Path | None = None,
+) -> None:
+    """Persist a Pokémon's non-volatile status. ``status`` is one of the
+    ``NonVolatileStatus`` string values ("healthy", "poison", "burn",
+    "paralysis", "sleep", "freeze", "bad-poison"). ``counter`` carries
+    sleep-turns / toxic-ramp / etc. Volatile statuses do not land here.
+    """
+    if path is None:
+        path = DB_PATH
+    with _connect(path) as conn:
+        conn.execute(
+            "UPDATE pokemon SET status_non_volatile = ?, status_counter = ? "
+            "WHERE id = ?",
+            (str(status), int(counter), int(pokemon_id)),
+        )
+
+
+def clear_pokemon_status(
+    pokemon_id: int, *, path: Path | None = None,
+) -> None:
+    """Reset a Pokémon to ``healthy`` with counter=0. Used by Pokémon
+    Center heals / status-cure items / battle-end cleanup for fainted
+    Pokémon (faint clears all status per Gen-3 canon)."""
+    set_pokemon_status(pokemon_id, "healthy", 0, path=path)

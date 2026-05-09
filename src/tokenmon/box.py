@@ -243,6 +243,71 @@ def use_stone(
     return evolved
 
 
+def use_ether(
+    pokemon_id: int, ether_key: str, *, path: Path = DB_PATH,
+) -> tuple[str, int, int, int] | None:
+    """Restore PP to the active Pokémon's lowest-PP move.
+
+    Returns ``(move_key, slot, old_pp, new_pp)`` on success — the items
+    pane uses these for the user-facing notification. Returns ``None``
+    when:
+
+      * ``ether_key`` isn't registered in ``ETHER_PP_AMOUNTS``,
+      * the Pokémon has no moves yet (fresh catch pre-backfill), or
+      * every slot is already at max PP (we don't burn an Ether on a
+        no-op restore — mirrors ``use_potion``'s "already full" guard).
+
+    Auto-picks the slot with the lowest current PP (relative to that
+    move's max PP) so the user doesn't need a slot-picker UI. Ties go
+    to the lowest slot index — deterministic, matches Gen-3 cursor
+    behavior of "first move in the list".
+    """
+    from tokenmon.items import ETHER_PP_AMOUNTS
+    from tokenmon import moves_remote
+    from tokenmon.storage import (
+        decrement_inventory,
+        get_pokemon_moves,
+        set_pokemon_move,
+    )
+
+    heal = ETHER_PP_AMOUNTS.get(ether_key)
+    if heal is None or heal <= 0:
+        return None
+    rows = get_pokemon_moves(pokemon_id, path=path)
+    if not rows:
+        return None
+
+    # Pick the slot most in need of PP. Comparing absolute deficit
+    # (max_pp - current_pp) gives the "biggest restore impact" slot;
+    # works even when slots have different max-PP totals.
+    best_slot = -1
+    best_deficit = 0
+    best_max = 0
+    for r in rows:
+        md = moves_remote.get_move_data(r.move_key)
+        if md is None:
+            continue
+        deficit = md.pp - r.current_pp
+        if deficit > best_deficit:
+            best_slot = r.slot
+            best_deficit = deficit
+            best_max = md.pp
+    if best_slot < 0:
+        return None  # every slot at max PP
+
+    target_row = next(r for r in rows if r.slot == best_slot)
+    new_pp = min(best_max, target_row.current_pp + heal)
+    set_pokemon_move(
+        pokemon_id, best_slot, target_row.move_key,
+        max_pp=new_pp, path=path,
+    )
+    try:
+        decrement_inventory(ether_key, 1, path=path)
+    except Exception:  # pragma: no cover — non-fatal
+        pass
+    return target_row.move_key, best_slot, target_row.current_pp, new_pp
+
+
 def use_potion(
     pokemon_id: int, potion_key: str, *, path: Path = DB_PATH,
 ) -> tuple[int, int, int] | None:

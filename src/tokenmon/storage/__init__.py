@@ -45,6 +45,8 @@ from .pokemon import (
     update_pokemon_nickname,
     bump_affection,
     set_pokemon_hp,
+    set_pokemon_status,
+    clear_pokemon_status,
 )
 
 # Encounter
@@ -65,6 +67,7 @@ from .encounter import (
     query_pending_drops,
     claim_pending_drops,
     set_encounter_hp,
+    set_encounter_status,
 )
 
 # Player singleton (money, future per-account stats)
@@ -131,6 +134,7 @@ __all__ = [
     "Pokemon", "insert_pokemon", "get_pokemon_for_date", "get_pokemon_by_id",
     "list_pokemon", "update_pokemon_species", "update_pokemon_nickname",
     "bump_affection", "set_pokemon_hp",
+    "set_pokemon_status", "clear_pokemon_status",
     # encounter
     "Encounter", "insert_encounter", "get_pending_encounter",
     "mark_encounter_caught", "mark_encounter_ran", "update_encounter_hint",
@@ -138,7 +142,7 @@ __all__ = [
     "list_distinct_encounter_species",
     "add_to_inventory", "decrement_inventory",
     "add_to_pending", "query_pending_drops", "claim_pending_drops",
-    "set_encounter_hp",
+    "set_encounter_hp", "set_encounter_status",
     # pokedex
     "PokedexEntry", "query_pokedex", "query_pokemon_xp",
     "mark_seen", "mark_caught", "query_pokedex_seen",
