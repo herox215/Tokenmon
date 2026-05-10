@@ -506,6 +506,16 @@ def main() -> None:
     global _SINGLETON_LOCK
     _SINGLETON_LOCK = _acquire_singleton_lock(restart=args.restart)
 
+    # Reap the long-lived ``claude`` PTY when the menubar quits — both via
+    # the normal ``Quit`` menu item (which exits the run loop and lets
+    # atexit fire) and via SIGTERM from ``launchctl bootout`` (handled by
+    # Python's default SIGTERM → atexit-via-PyExc_KeyboardInterrupt
+    # convention). Without this hook a stray ``claude`` survives the
+    # menubar app and shows up in ``pgrep claude``.
+    import atexit
+    from tokenmon import claude_session as _claude_session
+    atexit.register(_claude_session.shutdown)
+
     init_db()
     items_remote.prefetch_in_background(list(items.ITEMS.values()))
     TokenmonApp().run()

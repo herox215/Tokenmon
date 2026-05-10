@@ -188,6 +188,15 @@ wheels = [
 ]
 
 [[package]]
+name = "ptyprocess"
+version = "0.7.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/20/e5/16ff212c1e452235a90aeb09066144d0c5a6a8c0834397e03f5224495c4e/ptyprocess-0.7.0.tar.gz", hash = "sha256:5c5d0a3b48ceee0b48485e0c26037c0acd7d29765ca3fbb5cb3831d347423220", size = 70762, upload-time = "2020-12-28T15:15:30.155Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/22/a6/858897256d0deac81a172289110f31629fc4cee19b6f01283303e18c8db3/ptyprocess-0.7.0-py2.py3-none-any.whl", hash = "sha256:4b41f3967fce3af57cc7e94b888626c18bf37a083e3651ca8feeb66d492fef35", size = 13993, upload-time = "2020-12-28T15:15:28.35Z" },
+]
+
+[[package]]
 name = "py2app"
 version = "0.28.10"
 source = { registry = "https://pypi.org/simple" }
@@ -279,6 +288,20 @@ wheels = [
 ]
 
 [[package]]
+name = "pyobjc-framework-webkit"
+version = "12.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyobjc-core" },
+    { name = "pyobjc-framework-cocoa" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/14/10/110a50e8e6670765d25190ca7f7bfeecc47ec4a8c018cb928f4f82c56e04/pyobjc_framework_webkit-12.1.tar.gz", hash = "sha256:97a54dd05ab5266bd4f614e41add517ae62cdd5a30328eabb06792474b37d82a", size = 284531, upload-time = "2025-11-14T10:23:40.287Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7a/3d/80d36280164c69220ce99372f7736a028617c207e42cb587716009eecb88/pyobjc_framework_webkit-12.1-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:1da0c428c9d9891c93e0de51c9f272bfeb96d34356cdf3136cb4ad56ce32ec2d", size = 50096, upload-time = "2025-11-14T10:07:10.027Z" },
+    { url = "https://files.pythonhosted.org/packages/8a/7a/03c29c46866e266b0c705811c55c22625c349b0a80f5cf4776454b13dc4c/pyobjc_framework_webkit-12.1-cp313-cp313t-macosx_10_13_universal2.whl", hash = "sha256:1a29e334d5a7dd4a4f0b5647481b6ccf8a107b92e67b2b3c6b368c899f571965", size = 50572, upload-time = "2025-11-14T10:07:14.232Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "9.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -331,10 +354,12 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "httpx", extra = ["http2"] },
+    { name = "ptyprocess" },
     { name = "pyobjc-core" },
     { name = "pyobjc-framework-cocoa" },
     { name = "pyobjc-framework-quartz" },
     { name = "pyobjc-framework-vision" },
+    { name = "pyobjc-framework-webkit" },
     { name = "rumps" },
     { name = "starlette" },
     { name = "uvicorn" },
@@ -351,10 +376,12 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.1" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.27" },
+    { name = "ptyprocess", specifier = ">=0.7" },
     { name = "pyobjc-core", specifier = ">=10.3" },
     { name = "pyobjc-framework-cocoa", specifier = ">=10.3" },
     { name = "pyobjc-framework-quartz", specifier = ">=10.3" },
     { name = "pyobjc-framework-vision", specifier = ">=10.3" },
+    { name = "pyobjc-framework-webkit", specifier = ">=10.3" },
     { name = "rumps", specifier = ">=0.4.0" },
     { name = "starlette", specifier = ">=0.40" },
     { name = "uvicorn", specifier = ">=0.32" },

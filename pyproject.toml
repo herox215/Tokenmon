@@ -12,7 +12,9 @@ dependencies = [
     "pyobjc-framework-Cocoa>=10.3",
     "pyobjc-framework-Quartz>=10.3",
     "pyobjc-framework-Vision>=10.3",
+    "pyobjc-framework-WebKit>=10.3",
     "click>=8.1",
+    "ptyprocess>=0.7",
 ]
 
 [project.scripts]

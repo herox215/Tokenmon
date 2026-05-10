@@ -2,7 +2,7 @@
 
 A borderless, transparent NSWindow that floats above other windows on every
 Space. In event-only mode it ignores mouse and keyboard events; in companion
-mode the sprite accepts a double-click to open the lightweight session chat.
+mode the sprite accepts a double-click to open the companion chat panel.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import objc
 from AppKit import (
     NSBackingStoreBuffered,
     NSBezierPath,
-    NSButton,
     NSColor,
     NSCompositingOperationSourceAtop,
     NSCompositingOperationSourceOver,
@@ -26,16 +25,12 @@ from AppKit import (
     NSImageInterpolationNone,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
-    NSLineBreakByWordWrapping,
     NSPanel,
     NSRectFillUsingOperation,
     NSScreen,
-    NSScrollView,
     NSShadow,
-    NSTextView,
     NSWindowStyleMaskFullSizeContentView,
     NSTextAlignmentCenter,
-    NSTextAlignmentLeft,
     NSTextField,
     NSTimer,
     NSVisualEffectBlendingModeBehindWindow,
@@ -214,43 +209,303 @@ class _ChatWindowDelegate(NSObject):
         self._overlay.hide_chat()
 
 
-class _ChatInputHandler(NSObject):
-    """NSTextField target/delegate for the mock session input."""
+class _RecallButtonView(NSView):
+    """Custom NSView for the floating Pokéball recall button.
 
-    def initWithOverlay_(self, overlay):  # noqa: N802
-        self = objc.super(_ChatInputHandler, self).init()
+    Holds an image + caption rendered into subviews. Owns its
+    NSTrackingArea (rebuilt on ``updateTrackingAreas`` per AppKit
+    convention so resize/visibility changes re-arm tracking cleanly).
+
+    Hover scaling is done via the layer's affine transform rather than
+    by resizing the NSWindow — keeping the window frame fixed avoids
+    backing-store reallocs and shadow flicker, and the scale animation
+    is implicitly applied by Core Animation when we set the transform
+    inside an NSAnimationContext group.
+
+    Click → ``overlay._quit_chat_session()``: same destructive
+    end-of-session as the previous × button.
+    """
+
+    REST_SCALE = 0.667
+    HOVER_SCALE = 1.0
+    SCALE_DURATION_S = 0.15
+
+    def initWithOverlay_frame_(self, overlay, frame):  # noqa: N802
+        self = objc.super(_RecallButtonView, self).initWithFrame_(frame)
         if self is None:
             return None
         self._overlay = overlay
+        self._tracking_area = None
+        self._hovered = False
+        self.setWantsLayer_(True)
+        layer = self.layer()
+        if layer is not None:
+            # Anchor at center so transform-scale grows about the middle.
+            # AppKit fixes the layer position when we set anchorPoint, so
+            # we don't have to reposition the layer explicitly.
+            layer.setAnchorPoint_((0.5, 0.5))
+            from Quartz import CATransform3DMakeScale  # type: ignore
+            layer.setTransform_(
+                CATransform3DMakeScale(
+                    _RecallButtonView.REST_SCALE,
+                    _RecallButtonView.REST_SCALE,
+                    1.0,
+                )
+            )
         return self
 
-    def send_(self, sender):  # noqa: N802
-        text = sender.stringValue().strip()
-        if not text:
+    def acceptsFirstMouse_(self, _event):  # noqa: N802
+        # Receive the first click even when the parent window isn't key.
+        # Without this, clicks on a non-activating panel are eaten as
+        # focus changes instead of mouseDown events.
+        return True
+
+    def updateTrackingAreas(self):  # noqa: N802
+        # AppKit calls this on bounds/visibility changes and on initial
+        # add-to-window. Rebuilding the area here is the canonical
+        # idiom — manually recreating on resize fires too often (and
+        # misses initial setup).
+        if self._tracking_area is not None:
+            try:
+                self.removeTrackingArea_(self._tracking_area)
+            except Exception:
+                pass
+        from AppKit import NSTrackingArea  # type: ignore
+        opts = (
+            0x01  # NSTrackingMouseEnteredAndExited
+            | 0x80  # NSTrackingActiveAlways — recall window never becomes key
+            | 0x200  # NSTrackingInVisibleRect — auto-resizes with view
+        )
+        area = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+            self.bounds(), opts, self, None,
+        )
+        self.addTrackingArea_(area)
+        self._tracking_area = area
+        objc.super(_RecallButtonView, self).updateTrackingAreas()
+
+    def mouseEntered_(self, _event):  # noqa: N802
+        self._set_scale(_RecallButtonView.HOVER_SCALE)
+
+    def mouseExited_(self, _event):  # noqa: N802
+        self._set_scale(_RecallButtonView.REST_SCALE)
+
+    def mouseDown_(self, _event):  # noqa: N802
+        try:
+            self._overlay._quit_chat_session()
+        except Exception:
+            log.exception("recall-button quit failed")
+
+    def _set_scale(self, scale: float) -> None:
+        layer = self.layer()
+        if layer is None:
             return
-        sender.setStringValue_("")
-        self._overlay._append_chat_message(text)
+        try:
+            from Quartz import CATransform3DMakeScale  # type: ignore
+            NSAnimationContext.beginGrouping()
+            try:
+                NSAnimationContext.currentContext().setDuration_(
+                    _RecallButtonView.SCALE_DURATION_S
+                )
+                # Animator proxy on a CALayer applies the implicit
+                # animation duration we just set on the context.
+                layer.setTransform_(CATransform3DMakeScale(scale, scale, 1.0))
+            finally:
+                NSAnimationContext.endGrouping()
+        except Exception:
+            log.exception("recall-button scale animation failed")
 
-    def control_textView_doCommandBySelector_(  # noqa: N802
-        self, _control, _text_view, command,
-    ):
-        sel = str(command) if command is not None else ""
-        if sel in ("cancelOperation:", "cancel:"):
-            self._overlay.hide_chat()
-            return True
-        return False
 
+class _RecallButton:
+    """Floating Pokéball window beside the chat panel.
 
-class _ChatCloseHandler(NSObject):
-    def initWithOverlay_(self, overlay):  # noqa: N802
-        self = objc.super(_ChatCloseHandler, self).init()
-        if self is None:
-            return None
+    Owns its own borderless ``NSPanel`` (non-activating, so clicks don't
+    pull key focus away from the chat panel). The panel hosts a single
+    ``_RecallButtonView`` containing the Pokéball sprite + a caption.
+
+    The window stays at a fixed 96×128 — hover-grow is done by scaling
+    the contentView's layer, not by resizing the window. Position is
+    computed once at ``show_at`` time from the chat panel's frame; we
+    don't track ongoing moves because the chat panel is bottom-anchored
+    and doesn't move during its lifetime.
+    """
+
+    WINDOW_W = 96
+    WINDOW_H = 128
+    GAP_FROM_CHAT = 12  # px between chat right-edge and recall left-edge
+    SPRITE_SIZE = 64    # square; sits in the upper portion of the view
+    CAPTION_TEXT = "Komm zurück!"
+
+    def __init__(self, overlay) -> None:
         self._overlay = overlay
-        return self
+        self._window = None
+        self._view: _RecallButtonView | None = None
 
-    def close_(self, _sender):  # noqa: N802
-        self._overlay.hide_chat()
+    def show_at(self, chat_frame) -> None:
+        """Build (or reuse) the recall window and place it next to ``chat_frame``.
+
+        Call after the chat panel has been animated to its final position;
+        we read ``chat_frame`` for the right-edge anchor and the vertical
+        midline. ``chat_frame`` is expected in AppKit screen coords.
+        """
+        if self._window is None:
+            self._build_window()
+        self._reposition(chat_frame)
+        try:
+            # orderFrontRegardless rather than makeKeyAndOrderFront —
+            # we don't want to steal key focus from the chat panel.
+            self._window.orderFrontRegardless()
+        except Exception:
+            log.exception("recall window order-front failed")
+
+    def hide(self) -> None:
+        if self._window is None:
+            return
+        try:
+            self._window.orderOut_(None)
+        except Exception:
+            log.exception("recall window orderOut failed")
+
+    def tear_down(self) -> None:
+        """Fully release the window; called from ``_tear_down_chat_window``."""
+        if self._view is not None:
+            try:
+                self._view.removeFromSuperview()
+            except Exception:
+                pass
+            self._view = None
+        if self._window is not None:
+            try:
+                self._window.orderOut_(None)
+                self._window.close()
+            except Exception:
+                log.exception("recall window close failed")
+            self._window = None
+
+    def _build_window(self) -> None:
+        rect = NSMakeRect(0, 0, _RecallButton.WINDOW_W, _RecallButton.WINDOW_H)
+        # Non-activating panel — clicks don't pull key focus from the
+        # chat panel (which would trigger its windowDidResignKey →
+        # hide_chat path).
+        style = (
+            NSWindowStyleMaskBorderless
+            | NSWindowStyleMaskNonactivatingPanel
+        )
+        win = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect, style, NSBackingStoreBuffered, False,
+        )
+        win.setOpaque_(False)
+        win.setBackgroundColor_(NSColor.clearColor())
+        win.setHasShadow_(False)
+        win.setMovable_(False)
+        win.setLevel_(NSFloatingWindowLevel)
+        win.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorIgnoresCycle
+            | NSWindowCollectionBehaviorTransient
+        )
+        win.setReleasedWhenClosed_(False)
+
+        view = _RecallButtonView.alloc().initWithOverlay_frame_(
+            self._overlay,
+            NSMakeRect(0, 0, _RecallButton.WINDOW_W, _RecallButton.WINDOW_H),
+        )
+        # Sprite at top, caption at bottom.
+        sprite_size = _RecallButton.SPRITE_SIZE
+        sprite_x = (_RecallButton.WINDOW_W - sprite_size) / 2.0
+        sprite_y = _RecallButton.WINDOW_H - sprite_size - 12
+        sprite_view = NSImageView.alloc().initWithFrame_(
+            NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size)
+        )
+        sprite_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+        sprite_view.setWantsLayer_(True)
+        # Crisp pixel-art scaling — the Pokéball sprite is 32×32, we're
+        # rendering at 64 + an extra hover scale-up; bilinear would
+        # mush the edges.
+        if sprite_view.layer() is not None:
+            sprite_view.layer().setMagnificationFilter_("nearest")
+            sprite_view.layer().setMinificationFilter_("nearest")
+
+        try:
+            from tokenmon import items_remote
+            img = items_remote.get_sprite_by_name("poke-ball")
+        except Exception:
+            log.exception("recall-button sprite load failed")
+            img = None
+        if img is not None:
+            sprite_view.setImage_(img)
+        view.addSubview_(sprite_view)
+
+        # Caption — small, centred, dim-white with a soft shadow so it
+        # reads against any desktop wallpaper.
+        caption = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(0, 6, _RecallButton.WINDOW_W, 18),
+        )
+        caption.setStringValue_(_RecallButton.CAPTION_TEXT)
+        caption.setBezeled_(False)
+        caption.setDrawsBackground_(False)
+        caption.setEditable_(False)
+        caption.setSelectable_(False)
+        caption.setAlignment_(NSTextAlignmentCenter)
+        caption.setFont_(NSFont.boldSystemFontOfSize_(11))
+        caption.setTextColor_(NSColor.whiteColor())
+        # Shadow for legibility over light wallpapers.
+        try:
+            shadow = NSShadow.alloc().init()
+            shadow.setShadowColor_(NSColor.colorWithCalibratedWhite_alpha_(0, 0.6))
+            shadow.setShadowOffset_((0, -1))
+            shadow.setShadowBlurRadius_(2.0)
+            caption.setShadow_(shadow)
+        except Exception:
+            pass
+        view.addSubview_(caption)
+
+        win.setContentView_(view)
+        self._window = win
+        self._view = view
+
+    def _reposition(self, chat_frame) -> None:
+        """Place the recall window centred vertically on ``chat_frame`` and
+        12 px to its right. If that would clip the right screen edge,
+        flip to the left of the chat instead."""
+        from AppKit import NSScreen as _NSScreen  # type: ignore
+
+        cx = float(chat_frame.origin.x)
+        cy = float(chat_frame.origin.y)
+        cw = float(chat_frame.size.width)
+        ch = float(chat_frame.size.height)
+        right_x = cx + cw + _RecallButton.GAP_FROM_CHAT
+        left_x = cx - _RecallButton.GAP_FROM_CHAT - _RecallButton.WINDOW_W
+        # Vertically centre on the chat panel.
+        y = cy + (ch - _RecallButton.WINDOW_H) / 2.0
+
+        # Pick the right side by default; fall back to left if the
+        # right side overflows the chat's screen.
+        screen = None
+        try:
+            screen = self._window.screen() if self._window is not None else None
+            if screen is None:
+                screen = _NSScreen.mainScreen()
+        except Exception:
+            screen = _NSScreen.mainScreen()
+        if screen is not None:
+            vf = screen.visibleFrame()
+            screen_right = float(vf.origin.x) + float(vf.size.width)
+            if right_x + _RecallButton.WINDOW_W > screen_right:
+                x = left_x
+            else:
+                x = right_x
+        else:
+            x = right_x
+
+        try:
+            self._window.setFrame_display_(
+                NSMakeRect(x, y, _RecallButton.WINDOW_W, _RecallButton.WINDOW_H),
+                True,
+            )
+        except Exception:
+            log.exception("recall window reposition failed")
 
 
 class _CompanionImageView(NSImageView):
@@ -264,7 +519,7 @@ class _CompanionImageView(NSImageView):
     which would otherwise apply default bilinear interpolation.
 
     Event-only overlays stay click-through. Companion mode lets this view
-    receive a double-click so the user can open the mock session chat.
+    receive a double-click so the user can open the companion chat panel.
     """
 
     def initWithFrame_overlay_(self, frame, overlay):  # noqa: N802
@@ -712,36 +967,31 @@ class PokemonOverlay:
         # the NSObject subclasses get garbage-collected before their
         # NSTimers fire and the windows never animate.
         self._floating_item_handlers: list[_FloatingItemHandler] = []
+        # The chat window is a thin shell around a long-lived terminal
+        # view. Once created, both window and view persist across hide/
+        # show cycles — only the outside-click monitor and delegate are
+        # torn down on hide. The PTY-backed ``ClaudeSession`` lives in
+        # ``tokenmon.claude_session`` (module-level singleton) and
+        # outlives even this overlay.
         self._chat_window: NSWindow | None = None
-        # NSTextView (not NSTextField) so long conversations scroll
-        # instead of clipping. Lives inside _chat_transcript_scroll.
-        self._chat_transcript = None
-        self._chat_transcript_scroll = None
-        self._chat_input: NSTextField | None = None
-        # Each entry is ``(role, text)`` where ``role`` is one of:
-        #   "user"      — message the user typed
-        #   "companion" — Claude's reply rendered in the Pokémon's voice
-        #   "thinking"  — placeholder shown while a reply is in flight; gets
-        #                 popped and replaced when the worker finishes
-        #   "error"     — short failure note (claude missing, timeout, …)
-        # Bounded slice keeps the transcript readable; ~12 entries gives
-        # roughly 6 round-trips before the oldest scrolls off.
-        self._chat_messages: list[tuple[str, str]] = []
-        # Tracks whether a Claude request is currently in flight so the
-        # input field is disabled and follow-up sends are dropped (instead
-        # of stacking subprocesses for every Enter press).
-        self._chat_pending: bool = False
-        self._chat_input_handler: _ChatInputHandler | None = None
-        self._chat_close_handler: _ChatCloseHandler | None = None
+        self._terminal_view = None  # claude_session.TerminalWebView | None
+        # Strong-ref to the session that ``_terminal_view`` is wired to
+        # so we can detect a fresh-spawn (e.g. user typed ``/quit``
+        # while the panel was hidden) and rebuild the WKWebView before
+        # showing it again.
+        self._chat_session = None  # claude_session.ClaudeSession | None
+        # Floating Pokéball recall button beside the chat panel —
+        # owned by ``_RecallButton`` (helper class), built lazily on
+        # first chat-open and torn down with the chat window.
+        self._recall_button = None  # _RecallButton | None
+        # Re-entry guard: set True at the top of ``_quit_chat_session``
+        # so the chat's outside-click monitor's parallel ``hide_chat``
+        # call early-exits and the panel doesn't disappear before the
+        # ``/quit`` echo lands in the terminal.
+        self._chat_quitting = False
         self._chat_window_delegate: _ChatWindowDelegate | None = None
         self._chat_outside_monitor = None
         self._sprite_click_monitor = None
-        # Window-context snapshot for the active chat session — captured
-        # right before the chat panel is ordered front. Lazily-built
-        # resolver so importing overlay.py on a system without PyObjC
-        # (tests) doesn't pull in AppKit-only context providers.
-        self._chat_context: "ContextSnapshot | None" = None
-        self._context_resolver = None
 
     def _ensure_window(self) -> None:
         if self._window is not None:
@@ -988,73 +1238,46 @@ class PokemonOverlay:
         if not self._persistent:
             self.hide_chat()
 
-    # --- Mock companion chat ---------------------------------------------
+    # --- Companion chat --------------------------------------------------
 
     def toggle_chat(self) -> None:
-        if self._chat_window is not None:
+        win = self._chat_window
+        if win is not None and win.isVisible():
             self.hide_chat()
             return
         self.show_chat()
 
-    def _capture_active_window_context(self):
-        """Snapshot whatever window the user was looking at, *before* we
-        steal focus. Returns ``None`` on any failure — capture is
-        best-effort and must never block the chat from opening."""
-        try:
-            from tokenmon.companion.active_app import current_bundle_id
-            from tokenmon.companion.window_geom import frontmost_pid
-            from tokenmon.context import build_default_resolver
-            from tokenmon.context.providers.macos_screenshot import (
-                has_screen_recording_permission,
-                request_screen_recording_permission,
-            )
-
-            bundle_id = current_bundle_id()
-            pid = frontmost_pid()
-            if not bundle_id or pid is None:
-                return None
-            # Skip ourselves — capturing Tokenmon's own window is useless
-            # noise. The bundle id when running under uv is typically
-            # the Python launcher; either way it's not what the user
-            # wants to talk about.
-            if bundle_id.startswith(("org.python", "com.apple.python")):
-                return None
-
-            # First-time trigger of the system permission dialog.
-            # macOS only shows it once per install; afterwards the
-            # request call is a silent no-op and the user has to flip
-            # the toggle in System Settings manually.
-            if not has_screen_recording_permission():
-                request_screen_recording_permission()
-
-            if self._context_resolver is None:
-                self._context_resolver = build_default_resolver()
-            return self._context_resolver.resolve(bundle_id, pid)
-        except Exception:
-            log.exception("active-window context capture failed")
-            return None
-
     def show_chat(self) -> None:
-        """Open the bottom-centred mock chat for the active companion."""
+        """Show the terminal panel that hosts an interactive ``claude`` session.
+
+        First call builds the window + WKWebView and spawns the PTY-backed
+        session. Subsequent calls just re-order the existing window front;
+        the session and its scrollback persist across hide/show cycles.
+        """
         if not self._persistent:
             return
+
+        # Reattach path: the window already exists from a previous open.
+        # We only need to reinstall the focus-loss delegate / outside-click
+        # monitor and bring the panel back on screen — the WKWebView still
+        # holds xterm.js's full screen state, and the underlying
+        # ClaudeSession kept reading PTY output the whole time.
+        #
+        # …unless the underlying session died while the panel was
+        # hidden (most common cause: user typed ``/quit`` inside
+        # claude before closing the window). In that case the
+        # WKWebView is bound to a corpse — tear it down here so the
+        # block below can rebuild from scratch with a fresh
+        # ClaudeSession at whatever cwd the resolver picks now.
         if self._chat_window is not None:
-            self._chat_window.makeKeyAndOrderFront_(None)
-            if self._chat_input is not None:
-                self._chat_window.makeFirstResponder_(self._chat_input)
-            return
-        # Capture context BEFORE we touch any window — we need
-        # NSWorkspace.frontmostApplication() to still be the user's
-        # previous app, not the chat panel.
-        self._chat_context = self._capture_active_window_context()
-        # Drop stale messages from the previous chat session so the
-        # transcript doesn't keep extending each time we open it.
-        self._chat_messages = []
-        self._chat_pending = False
-        # New session, fresh request-id counter — any in-flight worker
-        # from a previous open is now stale and will be rejected by
-        # _handle_chat_reply's token check.
-        self._chat_request_token = 0
+            session = self._chat_session
+            if session is None or not session.is_alive():
+                log.info("chat session died while hidden — rebuilding window")
+                self._tear_down_chat_window()
+            else:
+                self._reattach_chat_window()
+                return
+
         screen = None
         if self._window is not None:
             screen = self._window.screen()
@@ -1067,6 +1290,27 @@ class PokemonOverlay:
             start_frame = _chat_start_frame(self._window.frame(), final_frame)
         else:
             start_frame = final_frame
+
+        # Spawn (or reuse) the long-lived claude session. If the CLI
+        # isn't installed we surface a graceful banner instead of opening
+        # a doomed window. Imports done before the try/except so the
+        # ``SessionUnavailable`` reference in the except clause is bound
+        # even if the import itself were to fail (it shouldn't, but be
+        # defensive — the chat panel is the user's recovery path).
+        from tokenmon import claude_session as _claude_session
+        try:
+            session = _claude_session.get_session()
+        except _claude_session.SessionUnavailable as exc:
+            log.warning("companion chat: cannot start claude session — %s", exc)
+            self._show_chat_unavailable_banner(str(exc))
+            return
+        except Exception:
+            log.exception("companion chat: claude_session.get_session() failed")
+            self._show_chat_unavailable_banner(
+                "Couldn't start the claude session — see logs.",
+            )
+            return
+
         style = (
             NSWindowStyleMaskTitled
             | NSWindowStyleMaskFullSizeContentView
@@ -1112,97 +1356,52 @@ class PokemonOverlay:
         border.setWantsLayer_(True)
         root.addSubview_(border)
 
-        title = NSTextField.alloc().initWithFrame_(NSMakeRect(18, h - 44, w - 72, 24))
-        title.setStringValue_(self._chat_title())
-        title.setBezeled_(False)
-        title.setDrawsBackground_(False)
-        title.setEditable_(False)
-        title.setSelectable_(False)
-        title.setFont_(NSFont.boldSystemFontOfSize_(16))
-        title.setTextColor_(NSColor.labelColor())
-        root.addSubview_(title)
+        # Debug label at the top: shows the cwd we spawned ``claude`` in
+        # plus the resolver stage that picked it. Single-line, dim,
+        # selectable so users can copy the path. Sits above the terminal
+        # with its own thin strip; the terminal frame is shrunk to
+        # leave room (h - 36 vs h - 24 without the label).
+        debug_frame = NSMakeRect(14, h - 22, w - 28, 14)
+        debug_label = NSTextField.alloc().initWithFrame_(debug_frame)
+        debug_label.setBezeled_(False)
+        debug_label.setDrawsBackground_(False)
+        debug_label.setEditable_(False)
+        debug_label.setSelectable_(True)
+        # Try monospace so the path lines up nicely with the terminal
+        # below; fall back to system font if Menlo is missing (won't
+        # happen on stock macOS but keep the call defensive).
+        mono = NSFont.fontWithName_size_("Menlo", 10) or NSFont.systemFontOfSize_(10)
+        debug_label.setFont_(mono)
+        debug_label.setTextColor_(NSColor.tertiaryLabelColor())
+        debug_label.setStringValue_(self._format_cwd_label(session))
+        debug_label.setAutoresizingMask_(2 | 8)  # Width | MinYMargin (anchor top)
+        root.addSubview_(debug_label)
 
-        close = NSButton.alloc().initWithFrame_(NSMakeRect(w - 44, h - 42, 24, 24))
-        close.setTitle_("×")
-        close.setBordered_(False)
-        close.setFont_(NSFont.systemFontOfSize_(18))
-        close.setAction_(b"close:")
-        close_handler = _ChatCloseHandler.alloc().initWithOverlay_(self)
-        self._chat_close_handler = close_handler
-        close.setTarget_(close_handler)
-        root.addSubview_(close)
+        terminal_frame = NSMakeRect(12, 12, w - 24, h - 36)
+        from tokenmon.claude_session.terminal_view import TerminalWebView
+        terminal = TerminalWebView(session, terminal_frame)
+        self._terminal_view = terminal
+        self._chat_session = session
+        # autoresize: width + height track the panel
+        try:
+            terminal.view.setAutoresizingMask_(2 | 16)  # Width | Height
+        except Exception:
+            pass
+        root.addSubview_(terminal.view)
 
-        # Transcript: NSScrollView containing an NSTextView so long
-        # conversations get a real scroll wheel + scrollbar instead of
-        # silently clipping like an NSTextField does. Read-only,
-        # selectable so the user can copy lines out.
-        transcript_frame = NSMakeRect(18, 62, w - 36, h - 112)
-        transcript_scroll = NSScrollView.alloc().initWithFrame_(transcript_frame)
-        transcript_scroll.setHasVerticalScroller_(True)
-        transcript_scroll.setHasHorizontalScroller_(False)
-        transcript_scroll.setAutohidesScrollers_(True)
-        transcript_scroll.setBorderType_(0)  # NSNoBorder
-        transcript_scroll.setDrawsBackground_(False)
-        transcript_scroll.contentView().setDrawsBackground_(False)
-
-        text_view = NSTextView.alloc().initWithFrame_(
-            NSMakeRect(0, 0, transcript_frame.size.width, transcript_frame.size.height)
-        )
-        text_view.setEditable_(False)
-        text_view.setSelectable_(True)
-        text_view.setRichText_(False)
-        text_view.setDrawsBackground_(False)
-        text_view.setFont_(NSFont.systemFontOfSize_(13))
-        text_view.setTextColor_(NSColor.secondaryLabelColor())
-        text_view.setAlignment_(NSTextAlignmentLeft)
-        # Vertical resize so the document grows past the scroll viewport
-        # when the conversation is longer than the panel; horizontal
-        # tracking pinned so word-wrap kicks in instead of horizontal
-        # scrolling.
-        text_view.setHorizontallyResizable_(False)
-        text_view.setVerticallyResizable_(True)
-        text_view.setAutoresizingMask_(2)  # NSViewWidthSizable
-        text_view.setMinSize_(NSMakeSize(transcript_frame.size.width, 0))
-        text_view.setMaxSize_(NSMakeSize(transcript_frame.size.width, 1e7))
-        tc = text_view.textContainer()
-        if tc is not None:
-            tc.setContainerSize_(NSMakeSize(transcript_frame.size.width, 1e7))
-            tc.setWidthTracksTextView_(True)
-        text_view.setString_(
-            "Type a message and press Enter to chat with your companion."
-        )
-
-        transcript_scroll.setDocumentView_(text_view)
-        # We expose the text view as ``_chat_transcript`` so the
-        # renderer can keep calling a single thing without caring that
-        # the underlying control changed from NSTextField to NSTextView.
-        transcript = text_view
-        self._chat_transcript_scroll = transcript_scroll
-        root.addSubview_(transcript_scroll)
-
-        input_field = NSTextField.alloc().initWithFrame_(NSMakeRect(18, 18, w - 36, 30))
-        input_field.setPlaceholderString_("Message your companion …")
-        input_field.setFont_(NSFont.systemFontOfSize_(13))
-        input_field.setBezeled_(True)
-        input_field.setDrawsBackground_(True)
-        input_field.setEditable_(True)
-        input_field.setSelectable_(True)
-        input_field.setAction_(b"send:")
-        handler = _ChatInputHandler.alloc().initWithOverlay_(self)
-        self._chat_input_handler = handler
-        input_field.setTarget_(handler)
-        input_field.setDelegate_(handler)
-        root.addSubview_(input_field)
+        # Recall button — floating Pokéball window beside the chat panel.
+        # Built lazily and shown after the chat animation completes (we
+        # need the chat's *final* frame, not its morph-start origin, so
+        # the recall window lines up with the bottom-centred panel).
+        if self._recall_button is None:
+            self._recall_button = _RecallButton(self)
 
         win.setContentView_(root)
         self._chat_window = win
-        self._chat_transcript = transcript
-        self._chat_input = input_field
         delegate = _ChatWindowDelegate.alloc().initWithOverlay_(self)
         self._chat_window_delegate = delegate
         win.setDelegate_(delegate)
         self._install_chat_outside_monitor()
-        self._render_chat_messages()
         win.makeKeyAndOrderFront_(None)
         try:
             win.makeKeyWindow()
@@ -1219,33 +1418,206 @@ class PokemonOverlay:
         except Exception:
             win.setFrame_display_(final_frame, True)
             win.setAlphaValue_(1.0)
-        win.makeFirstResponder_(input_field)
-        input_field.selectText_(None)
+        # Show the recall button at the chat's final frame. We pass
+        # ``final_frame`` (not ``win.frame()``) so the position is
+        # correct even mid-morph-animation.
+        if self._recall_button is not None:
+            try:
+                self._recall_button.show_at(final_frame)
+            except Exception:
+                log.exception("recall button show_at failed")
+        # Hand keyboard focus to the WKWebView so xterm.js receives
+        # keystrokes immediately — without this the user has to click
+        # inside the terminal before they can type.
+        try:
+            win.makeFirstResponder_(terminal.view)
+        except Exception:
+            log.exception("chat first-responder failed")
+
+    def _reattach_chat_window(self) -> None:
+        """Re-show an existing chat window (the WKWebView + PTY are already
+        alive). Only the AppKit-side observers were torn down on hide."""
+        win = self._chat_window
+        if win is None:
+            return
+
+        # Reinstall delegate (we set it to None on hide so a stray
+        # resignKey notification can't fire while the panel is hidden).
+        delegate = _ChatWindowDelegate.alloc().initWithOverlay_(self)
+        self._chat_window_delegate = delegate
+        try:
+            win.setDelegate_(delegate)
+        except Exception:
+            log.exception("chat delegate reinstall failed")
+
+        self._install_chat_outside_monitor()
+        try:
+            win.makeKeyAndOrderFront_(None)
+            win.makeKeyWindow()
+        except Exception:
+            log.exception("chat re-order-front failed")
+        # Re-show the recall button beside the chat. The chat hasn't
+        # moved between hide and show so we can read its current frame
+        # directly.
+        if self._recall_button is not None:
+            try:
+                self._recall_button.show_at(win.frame())
+            except Exception:
+                log.exception("recall button reattach failed")
+        if self._terminal_view is not None:
+            try:
+                win.makeFirstResponder_(self._terminal_view.view)
+            except Exception:
+                log.exception("chat first-responder failed")
+
+    def _show_chat_unavailable_banner(self, message: str) -> None:
+        """Surface a one-shot AppKit alert when the claude session can't
+        start. Called instead of opening the chat window so the user gets
+        an explanation instead of a silently empty panel."""
+        try:
+            from AppKit import NSAlert  # type: ignore
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Companion chat unavailable")
+            alert.setInformativeText_(message)
+            alert.runModal()
+        except Exception:
+            # Fallback: log only. Better than crashing the menubar.
+            log.error("chat unavailable: %s", message)
 
     def hide_chat(self) -> None:
-        if self._chat_window is None:
+        """Order the chat panel out without releasing it. The PTY-backed
+        session and the WKWebView's xterm.js state both keep running so
+        the next ``show_chat()`` reattaches to a live terminal instead of
+        spawning a fresh one.
+
+        The session itself only dies on menubar quit (see
+        ``tokenmon.menubar._main`` for the ``atexit`` hook)."""
+        # Re-entry guard: ``_quit_chat_session`` sets this before sending
+        # ``/quit`` to the PTY, so the outside-click monitor's parallel
+        # call to hide_chat doesn't make the panel disappear before the
+        # /quit echo has had a chance to render.
+        if self._chat_quitting:
             return
-        self._remove_chat_outside_monitor()
         win = self._chat_window
+        if win is None:
+            return
+        if not win.isVisible():
+            return
+        # Take the recall button down with the chat panel — it's
+        # visually anchored to the chat and shouldn't linger after.
+        if self._recall_button is not None:
+            try:
+                self._recall_button.hide()
+            except Exception:
+                log.exception("recall button hide failed")
+        self._remove_chat_outside_monitor()
         try:
+            # Drop the delegate so a stale ``windowDidResignKey:`` can't
+            # call hide_chat() recursively while the panel is already
+            # hidden.
             win.setDelegate_(None)
         except Exception:
-            pass
+            log.exception("chat delegate drop failed")
+        self._chat_window_delegate = None
         try:
             win.orderOut_(None)
-            win.close()
         except Exception:
-            log.exception("chat teardown failed")
+            log.exception("chat orderOut failed")
+        # NB: we deliberately do NOT call win.close() or null out
+        # self._chat_window / self._terminal_view — they're meant to
+        # survive across hide/show. Cleanup happens at app quit via
+        # claude_session.shutdown() and PyObjC's normal teardown.
+
+    def _tear_down_chat_window(self) -> None:
+        """Fully release the chat window + WKWebView + terminal-view bindings
+        so the next ``show_chat()`` rebuilds from scratch. Used when the
+        underlying ``ClaudeSession`` has died while the panel was hidden
+        (the WKWebView is still bound to the corpse and would no-op on
+        keystrokes). Idempotent."""
+        self._remove_chat_outside_monitor()
+        win = self._chat_window
+        if win is not None:
+            try:
+                win.setDelegate_(None)
+            except Exception:
+                pass
+            try:
+                win.orderOut_(None)
+                win.close()
+            except Exception:
+                log.exception("chat full teardown failed")
+        # Drop bindings so the next show_chat takes the cold-start path.
+        if self._terminal_view is not None:
+            try:
+                self._terminal_view.detach()
+            except Exception:
+                log.exception("terminal_view.detach() failed")
+        # Tear down the recall button alongside the chat — it has its
+        # own NSWindow and will leak if we just null the reference.
+        if self._recall_button is not None:
+            try:
+                self._recall_button.tear_down()
+            except Exception:
+                log.exception("recall button tear-down failed")
+            self._recall_button = None
         self._chat_window = None
-        self._chat_transcript = None
-        self._chat_transcript_scroll = None
-        self._chat_input = None
-        self._chat_input_handler = None
-        self._chat_close_handler = None
         self._chat_window_delegate = None
-        # Drop captured context so the next open re-scrapes whatever
-        # window the user is on now, not the previous one.
-        self._chat_context = None
+        self._terminal_view = None
+        self._chat_session = None
+        self._chat_quitting = False
+
+    def _quit_chat_session(self) -> None:
+        """Terminate the running ``claude`` process and close the panel.
+
+        Distinct from ``hide_chat()`` — the latter only orders the window
+        out and keeps the session alive in the background. This one
+        actually kills claude (best-effort graceful via ``/quit`` first,
+        then SIGTERM/SIGKILL via ``claude_session.shutdown``) so the
+        next double-click spawns a fresh session, picking up the cwd
+        resolver's current verdict.
+        """
+        # Set the re-entry flag *before* anything else — clicking the
+        # recall button also fires the chat's outside-click monitor
+        # (which calls ``hide_chat``); without this guard the panel
+        # would orderOut while we're still mid-``/quit`` write.
+        self._chat_quitting = True
+        # Best-effort graceful exit: claude saves its session state on
+        # ``/quit`` so the user can ``--resume`` later if they want. If
+        # the PTY write fails (already dead) we still proceed to the
+        # SIGTERM path below.
+        sess = self._chat_session
+        if sess is not None and sess.is_alive():
+            try:
+                sess.write(b"/quit\r")
+            except Exception:
+                log.exception("failed to send /quit on chat-quit click")
+        try:
+            from tokenmon import claude_session as _claude_session
+            _claude_session.shutdown()
+        except Exception:
+            log.exception("claude_session.shutdown() from chat-quit failed")
+        self._tear_down_chat_window()
+
+    def _format_cwd_label(self, session) -> str:
+        """Render the cwd debug strip — path on the left, source on the
+        right. Truncated home prefix so common paths fit on one line."""
+        try:
+            cwd = session.cwd
+            source = session.cwd_source
+        except Exception:
+            return ""
+        # ``~/foo/bar`` reads cleaner than the full /Users/.../foo/bar.
+        try:
+            home = Path.home()
+            display = str(cwd)
+            home_str = str(home)
+            if display == home_str:
+                display = "~"
+            elif display.startswith(home_str + "/"):
+                display = "~" + display[len(home_str):]
+        except Exception:
+            display = str(cwd)
+        return f"📁 {display}    ({source})"
 
     def _install_chat_outside_monitor(self) -> None:
         self._remove_chat_outside_monitor()
@@ -1318,247 +1690,6 @@ class PokemonOverlay:
         except Exception:
             log.exception("sprite click monitor remove failed")
         self._sprite_click_monitor = None
-
-    def _chat_title(self) -> str:
-        try:
-            from tokenmon import box, pokemon as _pokemon
-            row = box.get_active_pokemon()
-            if row is None:
-                return "Pokémon"
-            return _pokemon.display_name(row.nickname, row.species_dex_id)
-        except Exception:
-            log.exception("chat title lookup failed")
-            return "Pokémon"
-
-    def _append_chat_message(self, text: str) -> None:
-        """Handle the user pressing Enter in the chat input.
-
-        Appends the user's message to the transcript, kicks off a
-        Claude Code subprocess on a background thread to generate the
-        companion's reply, and shows a "thinking…" placeholder while
-        it's in flight. The placeholder is replaced with the real reply
-        (or an error line) when the subprocess returns.
-        """
-        if self._chat_pending:
-            # Prevent stacking subprocesses while one is already running.
-            # The input field is disabled by ``_set_chat_pending`` but a
-            # racy Enter press could still slip through (NSPanel can
-            # re-enter the runloop during commit; an in-flight focus
-            # change can deliver a second action before the first one
-            # has flipped the pending flag).
-            log.warning(
-                "companion chat: dropped duplicate send while pending "
-                "(text=%r)", text[:60],
-            )
-            return
-        # Each request gets a unique token. The worker stamps its
-        # callback with this token and ``_handle_chat_reply`` ignores
-        # callbacks whose token doesn't match the current request. That
-        # guards against a stray ``addOperationWithBlock_`` firing
-        # twice for the same dispatch — pathological, but cheap to
-        # defend against and instantly visible in logs if it ever
-        # happens.
-        self._chat_request_token = getattr(self, "_chat_request_token", 0) + 1
-        token = self._chat_request_token
-
-        self._chat_messages.append(("user", text))
-        identity = self._companion_identity()
-        if identity is None:
-            self._chat_messages.append(
-                ("error", "(no active companion — pick a Pokémon first)"),
-            )
-            self._render_chat_messages()
-            return
-
-        # System prompt is built synchronously on the UI thread because
-        # building it is cheap (string formatting only) and the worker
-        # thread shouldn't have to reach back into Tokenmon state.
-        from tokenmon.companion.persona import build_system_prompt
-        from tokenmon.companion.llm import ask_claude
-        from tokenmon import config as _config
-
-        system_prompt = build_system_prompt(identity, self._chat_context)
-        skip_permissions = bool(_config.get("companion_skip_permissions"))
-
-        # Push "thinking…" placeholder and disable the input.
-        self._chat_messages.append(("thinking", "thinking…"))
-        self._set_chat_pending(True)
-        self._render_chat_messages()
-
-        # Snapshot the user message — the worker thread shouldn't read
-        # ``self._chat_messages`` because the UI thread keeps mutating it.
-        user_message = text
-
-        def _worker() -> None:
-            try:
-                ok, reply = ask_claude(
-                    user_message,
-                    system_prompt=system_prompt,
-                    skip_permissions=skip_permissions,
-                )
-            except Exception:
-                log.exception("companion chat worker crashed")
-                ok, reply = False, "(unexpected error — see logs)"
-
-            # One-shot latch — even if the queued block fires twice
-            # (PyObjC block-bridge edge cases have been observed in the
-            # wild), we only let it land once.
-            fired = [False]
-
-            def _on_main() -> None:
-                if fired[0]:
-                    log.warning(
-                        "companion chat: dropped duplicate _on_main "
-                        "for token=%d", token,
-                    )
-                    return
-                fired[0] = True
-                self._handle_chat_reply(token, ok, reply)
-            try:
-                from Foundation import NSOperationQueue
-                NSOperationQueue.mainQueue().addOperationWithBlock_(_on_main)
-            except Exception:
-                # If main-thread dispatch itself fails (test harness with
-                # no run loop), at least update the in-memory state so a
-                # later render picks it up.
-                log.exception("main-thread dispatch failed; updating in place")
-                self._handle_chat_reply(token, ok, reply)
-
-        import threading
-        threading.Thread(
-            target=_worker,
-            name="tokenmon.companion.chat",
-            daemon=True,
-        ).start()
-
-    def _handle_chat_reply(self, token: int, ok: bool, reply: str) -> None:
-        """Main-thread callback for the chat worker. Replaces the
-        ``thinking…`` placeholder with the reply (or an error).
-
-        ``token`` is the request id stamped by ``_append_chat_message``.
-        We compare against the current ``_chat_request_token`` so a
-        late-arriving worker for an already-replaced request can't
-        clobber the live transcript. Also defends against a duplicate
-        callback firing for the same token.
-        """
-        current = getattr(self, "_chat_request_token", 0)
-        if token != current:
-            log.warning(
-                "companion chat: ignoring stale reply (token=%d, current=%d)",
-                token, current,
-            )
-            return
-        if not self._chat_pending:
-            # Already handled — second callback for the same token.
-            log.warning(
-                "companion chat: ignoring duplicate reply for token=%d", token,
-            )
-            return
-        # Drop the placeholder if it's still at the tail — defensive in
-        # case the chat was closed/reopened mid-flight.
-        if self._chat_messages and self._chat_messages[-1][0] == "thinking":
-            self._chat_messages.pop()
-        self._chat_messages.append(("companion" if ok else "error", reply))
-        # Trim the transcript so the panel stays readable. ~12 entries =
-        # 6 round-trips visible at once.
-        self._chat_messages = self._chat_messages[-12:]
-        self._set_chat_pending(False)
-        self._render_chat_messages()
-
-    def _set_chat_pending(self, pending: bool) -> None:
-        """Enable/disable the chat input while a request is in flight.
-        Blocks the user from queuing up a second subprocess and signals
-        visually that something's happening."""
-        self._chat_pending = bool(pending)
-        if self._chat_input is None:
-            return
-        try:
-            self._chat_input.setEnabled_(not self._chat_pending)
-        except Exception:
-            log.exception("chat input enable/disable failed")
-
-    def _companion_identity(self):
-        """Build a ``CompanionIdentity`` from the active Pokémon row.
-        Returns ``None`` if there's no active companion (empty box)."""
-        try:
-            from tokenmon import box
-            from tokenmon.companion.persona import CompanionIdentity
-            row = box.get_active_pokemon()
-            if row is None:
-                return None
-            return CompanionIdentity(
-                species_dex_id=int(row.species_dex_id),
-                nickname=row.nickname,
-                nature=row.nature,
-                is_shiny=bool(row.is_shiny),
-            )
-        except Exception:
-            log.exception("companion identity lookup failed")
-            return None
-
-    def _render_chat_messages(self) -> None:
-        if self._chat_transcript is None:
-            return
-        sections: list[str] = []
-        # The OCR snapshot is passed to the LLM via the system prompt
-        # (see ``_append_chat_message``), but we don't render it in the
-        # chat panel anymore — the wall of scraped text dwarfed the
-        # actual conversation. Permission errors still surface here so
-        # the user knows why their companion can't "see" the screen.
-        snap = self._chat_context
-        if snap is not None:
-            try:
-                if snap.source.endswith(":no-permission"):
-                    sections.append(
-                        "[Window context unavailable]\n"
-                        "Tokenmon needs Screen Recording permission to read "
-                        "the active window.\n"
-                        "→ System Settings › Privacy & Security › Screen "
-                        "Recording, enable Tokenmon, then restart it."
-                    )
-            except Exception:
-                log.exception("chat context render failed")
-
-        # Per-role label so the user can tell apart their own lines from
-        # the companion's reply and from system errors. Nickname falls
-        # back to the species name via ``_chat_title``.
-        companion_label = self._chat_title() or "Companion"
-        lines: list[str] = []
-        for role, text in self._chat_messages:
-            if role == "user":
-                lines.append(f"You: {text}")
-            elif role == "companion":
-                lines.append(f"{companion_label}: {text}")
-            elif role == "thinking":
-                lines.append(f"{companion_label}: {text}")
-            elif role == "error":
-                lines.append(text)
-        if lines:
-            sections.append("\n".join(lines))
-        elif not sections:
-            sections.append(
-                "Type a message and press Enter to chat with your companion.",
-            )
-        rendered = "\n\n".join(sections)
-        # The transcript moved from NSTextField → NSTextView so the
-        # panel can scroll. NSTextView uses ``setString_`` rather than
-        # ``setStringValue_``; a getattr-fallback would silently no-op
-        # if the API drifts again, which is exactly the kind of bug we
-        # don't want here.
-        try:
-            self._chat_transcript.setString_(rendered)
-        except AttributeError:
-            # Defensive — older macOS or a swapped-in fake in tests.
-            self._chat_transcript.setStringValue_(rendered)
-        # Auto-scroll to the bottom so the latest reply is always
-        # visible. ``scrollRangeToVisible:`` on the text view handles
-        # the math against the document's text container; the clip
-        # view's bounds get adjusted as a side-effect.
-        try:
-            length = len(rendered)
-            self._chat_transcript.scrollRangeToVisible_((length, 0))
-        except Exception:
-            log.exception("chat transcript auto-scroll failed")
 
     def set_mood_alpha(self, multiplier: float) -> None:
         """Apply a Phase-5 mood multiplier (e.g. night dimming) on top of

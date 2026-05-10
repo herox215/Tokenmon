@@ -104,62 +104,6 @@ def test_chat_start_frame_centers_on_sprite():
     assert start.origin.y == 200 + 64 - CHAT_MORPH_SIZE / 2
 
 
-def test_chat_input_handler_trims_appends_and_clears():
-    from tokenmon.overlay import _ChatInputHandler
-
-    class _Overlay:
-        def __init__(self):
-            self.messages = []
-
-        def _append_chat_message(self, text):
-            self.messages.append(text)
-
-    class _Sender:
-        def __init__(self):
-            self.value = "  hello session  "
-
-        def stringValue(self):
-            return self.value
-
-        def setStringValue_(self, value):
-            self.value = value
-
-    overlay = _Overlay()
-    sender = _Sender()
-    handler = _ChatInputHandler.alloc().initWithOverlay_(overlay)
-
-    handler.send_(sender)
-
-    assert overlay.messages == ["hello session"]
-    assert sender.value == ""
-
-
-def test_chat_title_uses_active_pokemon_species_name(monkeypatch):
-    from tokenmon import box
-    from tokenmon.overlay import PokemonOverlay
-
-    monkeypatch.setattr(
-        box,
-        "get_active_pokemon",
-        lambda: SimpleNamespace(nickname=None, species_dex_id=1),
-    )
-
-    assert PokemonOverlay()._chat_title() == "Bulbasaur"
-
-
-def test_chat_title_prefers_active_pokemon_nickname(monkeypatch):
-    from tokenmon import box
-    from tokenmon.overlay import PokemonOverlay
-
-    monkeypatch.setattr(
-        box,
-        "get_active_pokemon",
-        lambda: SimpleNamespace(nickname="Buddy", species_dex_id=1),
-    )
-
-    assert PokemonOverlay()._chat_title() == "Buddy"
-
-
 def test_companion_double_click_toggles_chat():
     from Foundation import NSMakeRect
     from tokenmon.overlay import _CompanionImageView
