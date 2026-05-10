@@ -11,6 +11,7 @@ dependencies = [
     "pyobjc-core>=10.3",
     "pyobjc-framework-Cocoa>=10.3",
     "pyobjc-framework-Quartz>=10.3",
+    "pyobjc-framework-Vision>=10.3",
     "click>=8.1",
 ]
 
@@ -29,6 +30,10 @@ packages = ["src/tokenmon"]
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "py2app>=0.28",
+    # py2app 0.28 still feeds install_requires into setuptools.setup();
+    # setuptools>=80 rejects it. Pin until py2app catches up.
+    "setuptools<80",
 ]
 
 [tool.pytest.ini_options]

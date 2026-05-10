@@ -57,6 +57,7 @@ from AppKit import (
     NSEventMaskRightMouseDown,
 )
 from Foundation import NSMakeRect, NSMakeSize, NSObject
+from AppKit import NSAnimationContext
 
 log = logging.getLogger("tokenmon.overlay")
 
@@ -718,6 +719,12 @@ class PokemonOverlay:
         self._chat_window_delegate: _ChatWindowDelegate | None = None
         self._chat_outside_monitor = None
         self._sprite_click_monitor = None
+        # Window-context snapshot for the active chat session — captured
+        # right before the chat panel is ordered front. Lazily-built
+        # resolver so importing overlay.py on a system without PyObjC
+        # (tests) doesn't pull in AppKit-only context providers.
+        self._chat_context: "ContextSnapshot | None" = None
+        self._context_resolver = None
 
     def _ensure_window(self) -> None:
         if self._window is not None:
@@ -972,6 +979,44 @@ class PokemonOverlay:
             return
         self.show_chat()
 
+    def _capture_active_window_context(self):
+        """Snapshot whatever window the user was looking at, *before* we
+        steal focus. Returns ``None`` on any failure — capture is
+        best-effort and must never block the chat from opening."""
+        try:
+            from tokenmon.companion.active_app import current_bundle_id
+            from tokenmon.companion.window_geom import frontmost_pid
+            from tokenmon.context import build_default_resolver
+            from tokenmon.context.providers.macos_screenshot import (
+                has_screen_recording_permission,
+                request_screen_recording_permission,
+            )
+
+            bundle_id = current_bundle_id()
+            pid = frontmost_pid()
+            if not bundle_id or pid is None:
+                return None
+            # Skip ourselves — capturing Tokenmon's own window is useless
+            # noise. The bundle id when running under uv is typically
+            # the Python launcher; either way it's not what the user
+            # wants to talk about.
+            if bundle_id.startswith(("org.python", "com.apple.python")):
+                return None
+
+            # First-time trigger of the system permission dialog.
+            # macOS only shows it once per install; afterwards the
+            # request call is a silent no-op and the user has to flip
+            # the toggle in System Settings manually.
+            if not has_screen_recording_permission():
+                request_screen_recording_permission()
+
+            if self._context_resolver is None:
+                self._context_resolver = build_default_resolver()
+            return self._context_resolver.resolve(bundle_id, pid)
+        except Exception:
+            log.exception("active-window context capture failed")
+            return None
+
     def show_chat(self) -> None:
         """Open the bottom-centred mock chat for the active companion."""
         if not self._persistent:
@@ -981,6 +1026,13 @@ class PokemonOverlay:
             if self._chat_input is not None:
                 self._chat_window.makeFirstResponder_(self._chat_input)
             return
+        # Capture context BEFORE we touch any window — we need
+        # NSWorkspace.frontmostApplication() to still be the user's
+        # previous app, not the chat panel.
+        self._chat_context = self._capture_active_window_context()
+        # Drop stale messages from the previous chat session so the
+        # transcript doesn't keep extending each time we open it.
+        self._chat_messages = []
         screen = None
         if self._window is not None:
             screen = self._window.screen()
@@ -1099,10 +1151,15 @@ class PokemonOverlay:
         except Exception:
             pass
         try:
-            win.setFrame_display_animate_(final_frame, True, True)
-            win.animator().setAlphaValue_(1.0)
+            NSAnimationContext.beginGrouping()
+            try:
+                NSAnimationContext.currentContext().setDuration_(0.22)
+                win.animator().setFrame_display_(final_frame, True)
+                win.animator().setAlphaValue_(1.0)
+            finally:
+                NSAnimationContext.endGrouping()
         except Exception:
-            win.setFrame_display_animate_(final_frame, True, False)
+            win.setFrame_display_(final_frame, True)
             win.setAlphaValue_(1.0)
         win.makeFirstResponder_(input_field)
         input_field.selectText_(None)
@@ -1127,6 +1184,9 @@ class PokemonOverlay:
         self._chat_input_handler = None
         self._chat_close_handler = None
         self._chat_window_delegate = None
+        # Drop captured context so the next open re-scrapes whatever
+        # window the user is on now, not the previous one.
+        self._chat_context = None
 
     def _install_chat_outside_monitor(self) -> None:
         self._remove_chat_outside_monitor()
@@ -1219,13 +1279,29 @@ class PokemonOverlay:
     def _render_chat_messages(self) -> None:
         if self._chat_transcript is None:
             return
-        if not self._chat_messages:
-            self._chat_transcript.setStringValue_(
+        sections: list[str] = []
+        snap = self._chat_context
+        if snap is not None:
+            try:
+                if snap.source.endswith(":no-permission"):
+                    sections.append(
+                        '[Fenster-Kontext nicht verfügbar]\n'
+                        'Tokenmon braucht „Bildschirmaufnahme“-Erlaubnis, '
+                        'um den Inhalt des aktuellen Fensters zu lesen.\n'
+                        '→ Systemeinstellungen › Datenschutz & Sicherheit › '
+                        'Bildschirmaufnahme aktivieren, dann Tokenmon neu starten.'
+                    )
+                else:
+                    sections.append("[Fenster-Kontext]\n" + snap.short_summary())
+            except Exception:
+                log.exception("chat context render failed")
+        if self._chat_messages:
+            sections.append("\n".join(f"Du: {m}" for m in self._chat_messages))
+        elif not sections:
+            sections.append(
                 "Schreib eine Nachricht. Enter legt sie hier im Mockup ab.",
             )
-            return
-        lines = [f"Du: {msg}" for msg in self._chat_messages]
-        self._chat_transcript.setStringValue_("\n".join(lines))
+        self._chat_transcript.setStringValue_("\n\n".join(sections))
 
     def set_mood_alpha(self, multiplier: float) -> None:
         """Apply a Phase-5 mood multiplier (e.g. night dimming) on top of
