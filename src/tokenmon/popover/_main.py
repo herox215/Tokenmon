@@ -531,6 +531,9 @@ class TokenmonPopover(NSObject):
     def toggleWeather_(self, _sender):  # noqa: N802
         self._app.toggle_weather(None)
 
+    def toggleCompanionSkipPermissions_(self, _sender):  # noqa: N802
+        self._app.toggle_companion_skip_permissions(None)
+
     def restartProxy_(self, _sender):  # noqa: N802
         self._app.restart_proxy(None)
 

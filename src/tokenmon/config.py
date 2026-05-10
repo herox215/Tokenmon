@@ -28,6 +28,13 @@ _DEFAULTS: dict[str, Any] = {
     # selection toward types matching the local weather (rain → water,
     # thunderstorm → electric, etc.). Off by default — opt-in via menubar.
     "use_weather": False,
+    # Companion chat: route the chat panel through the ``claude`` CLI so
+    # the active Pokémon answers in its nature's voice. When true, the
+    # harness adds ``--dangerously-skip-permissions`` so Claude can use
+    # tools (Bash/Edit/Read) without interrupting the chat for
+    # confirmation prompts. Off by default — opt-in only, since the
+    # companion is then a free-running agent on the user's machine.
+    "companion_skip_permissions": False,
     # Provider strategies the user has installed proxies for. Each becomes its
     # own LaunchAgent at com.tokenmon.proxy.{name} listening on the strategy's
     # default port.

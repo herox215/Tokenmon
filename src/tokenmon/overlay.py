@@ -30,7 +30,9 @@ from AppKit import (
     NSPanel,
     NSRectFillUsingOperation,
     NSScreen,
+    NSScrollView,
     NSShadow,
+    NSTextView,
     NSWindowStyleMaskFullSizeContentView,
     NSTextAlignmentCenter,
     NSTextAlignmentLeft,
@@ -711,9 +713,24 @@ class PokemonOverlay:
         # NSTimers fire and the windows never animate.
         self._floating_item_handlers: list[_FloatingItemHandler] = []
         self._chat_window: NSWindow | None = None
-        self._chat_transcript: NSTextField | None = None
+        # NSTextView (not NSTextField) so long conversations scroll
+        # instead of clipping. Lives inside _chat_transcript_scroll.
+        self._chat_transcript = None
+        self._chat_transcript_scroll = None
         self._chat_input: NSTextField | None = None
-        self._chat_messages: list[str] = []
+        # Each entry is ``(role, text)`` where ``role`` is one of:
+        #   "user"      — message the user typed
+        #   "companion" — Claude's reply rendered in the Pokémon's voice
+        #   "thinking"  — placeholder shown while a reply is in flight; gets
+        #                 popped and replaced when the worker finishes
+        #   "error"     — short failure note (claude missing, timeout, …)
+        # Bounded slice keeps the transcript readable; ~12 entries gives
+        # roughly 6 round-trips before the oldest scrolls off.
+        self._chat_messages: list[tuple[str, str]] = []
+        # Tracks whether a Claude request is currently in flight so the
+        # input field is disabled and follow-up sends are dropped (instead
+        # of stacking subprocesses for every Enter press).
+        self._chat_pending: bool = False
         self._chat_input_handler: _ChatInputHandler | None = None
         self._chat_close_handler: _ChatCloseHandler | None = None
         self._chat_window_delegate: _ChatWindowDelegate | None = None
@@ -1033,6 +1050,11 @@ class PokemonOverlay:
         # Drop stale messages from the previous chat session so the
         # transcript doesn't keep extending each time we open it.
         self._chat_messages = []
+        self._chat_pending = False
+        # New session, fresh request-id counter — any in-flight worker
+        # from a previous open is now stale and will be rejected by
+        # _handle_chat_reply's token check.
+        self._chat_request_token = 0
         screen = None
         if self._window is not None:
             screen = self._window.screen()
@@ -1110,20 +1132,56 @@ class PokemonOverlay:
         close.setTarget_(close_handler)
         root.addSubview_(close)
 
-        transcript = NSTextField.alloc().initWithFrame_(NSMakeRect(18, 62, w - 36, h - 112))
-        transcript.setBezeled_(False)
-        transcript.setDrawsBackground_(False)
-        transcript.setEditable_(False)
-        transcript.setSelectable_(True)
-        transcript.setFont_(NSFont.systemFontOfSize_(13))
-        transcript.setTextColor_(NSColor.secondaryLabelColor())
-        transcript.setAlignment_(NSTextAlignmentLeft)
-        transcript.setLineBreakMode_(NSLineBreakByWordWrapping)
-        transcript.setStringValue_("Schreib eine Nachricht. Enter legt sie hier im Mockup ab.")
-        root.addSubview_(transcript)
+        # Transcript: NSScrollView containing an NSTextView so long
+        # conversations get a real scroll wheel + scrollbar instead of
+        # silently clipping like an NSTextField does. Read-only,
+        # selectable so the user can copy lines out.
+        transcript_frame = NSMakeRect(18, 62, w - 36, h - 112)
+        transcript_scroll = NSScrollView.alloc().initWithFrame_(transcript_frame)
+        transcript_scroll.setHasVerticalScroller_(True)
+        transcript_scroll.setHasHorizontalScroller_(False)
+        transcript_scroll.setAutohidesScrollers_(True)
+        transcript_scroll.setBorderType_(0)  # NSNoBorder
+        transcript_scroll.setDrawsBackground_(False)
+        transcript_scroll.contentView().setDrawsBackground_(False)
+
+        text_view = NSTextView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, transcript_frame.size.width, transcript_frame.size.height)
+        )
+        text_view.setEditable_(False)
+        text_view.setSelectable_(True)
+        text_view.setRichText_(False)
+        text_view.setDrawsBackground_(False)
+        text_view.setFont_(NSFont.systemFontOfSize_(13))
+        text_view.setTextColor_(NSColor.secondaryLabelColor())
+        text_view.setAlignment_(NSTextAlignmentLeft)
+        # Vertical resize so the document grows past the scroll viewport
+        # when the conversation is longer than the panel; horizontal
+        # tracking pinned so word-wrap kicks in instead of horizontal
+        # scrolling.
+        text_view.setHorizontallyResizable_(False)
+        text_view.setVerticallyResizable_(True)
+        text_view.setAutoresizingMask_(2)  # NSViewWidthSizable
+        text_view.setMinSize_(NSMakeSize(transcript_frame.size.width, 0))
+        text_view.setMaxSize_(NSMakeSize(transcript_frame.size.width, 1e7))
+        tc = text_view.textContainer()
+        if tc is not None:
+            tc.setContainerSize_(NSMakeSize(transcript_frame.size.width, 1e7))
+            tc.setWidthTracksTextView_(True)
+        text_view.setString_(
+            "Type a message and press Enter to chat with your companion."
+        )
+
+        transcript_scroll.setDocumentView_(text_view)
+        # We expose the text view as ``_chat_transcript`` so the
+        # renderer can keep calling a single thing without caring that
+        # the underlying control changed from NSTextField to NSTextView.
+        transcript = text_view
+        self._chat_transcript_scroll = transcript_scroll
+        root.addSubview_(transcript_scroll)
 
         input_field = NSTextField.alloc().initWithFrame_(NSMakeRect(18, 18, w - 36, 30))
-        input_field.setPlaceholderString_("Nachricht an diese Session ...")
+        input_field.setPlaceholderString_("Message your companion …")
         input_field.setFont_(NSFont.systemFontOfSize_(13))
         input_field.setBezeled_(True)
         input_field.setDrawsBackground_(True)
@@ -1180,6 +1238,7 @@ class PokemonOverlay:
             log.exception("chat teardown failed")
         self._chat_window = None
         self._chat_transcript = None
+        self._chat_transcript_scroll = None
         self._chat_input = None
         self._chat_input_handler = None
         self._chat_close_handler = None
@@ -1272,36 +1331,234 @@ class PokemonOverlay:
             return "Pokémon"
 
     def _append_chat_message(self, text: str) -> None:
-        self._chat_messages.append(text)
-        self._chat_messages = self._chat_messages[-8:]
+        """Handle the user pressing Enter in the chat input.
+
+        Appends the user's message to the transcript, kicks off a
+        Claude Code subprocess on a background thread to generate the
+        companion's reply, and shows a "thinking…" placeholder while
+        it's in flight. The placeholder is replaced with the real reply
+        (or an error line) when the subprocess returns.
+        """
+        if self._chat_pending:
+            # Prevent stacking subprocesses while one is already running.
+            # The input field is disabled by ``_set_chat_pending`` but a
+            # racy Enter press could still slip through (NSPanel can
+            # re-enter the runloop during commit; an in-flight focus
+            # change can deliver a second action before the first one
+            # has flipped the pending flag).
+            log.warning(
+                "companion chat: dropped duplicate send while pending "
+                "(text=%r)", text[:60],
+            )
+            return
+        # Each request gets a unique token. The worker stamps its
+        # callback with this token and ``_handle_chat_reply`` ignores
+        # callbacks whose token doesn't match the current request. That
+        # guards against a stray ``addOperationWithBlock_`` firing
+        # twice for the same dispatch — pathological, but cheap to
+        # defend against and instantly visible in logs if it ever
+        # happens.
+        self._chat_request_token = getattr(self, "_chat_request_token", 0) + 1
+        token = self._chat_request_token
+
+        self._chat_messages.append(("user", text))
+        identity = self._companion_identity()
+        if identity is None:
+            self._chat_messages.append(
+                ("error", "(no active companion — pick a Pokémon first)"),
+            )
+            self._render_chat_messages()
+            return
+
+        # System prompt is built synchronously on the UI thread because
+        # building it is cheap (string formatting only) and the worker
+        # thread shouldn't have to reach back into Tokenmon state.
+        from tokenmon.companion.persona import build_system_prompt
+        from tokenmon.companion.llm import ask_claude
+        from tokenmon import config as _config
+
+        system_prompt = build_system_prompt(identity, self._chat_context)
+        skip_permissions = bool(_config.get("companion_skip_permissions"))
+
+        # Push "thinking…" placeholder and disable the input.
+        self._chat_messages.append(("thinking", "thinking…"))
+        self._set_chat_pending(True)
         self._render_chat_messages()
+
+        # Snapshot the user message — the worker thread shouldn't read
+        # ``self._chat_messages`` because the UI thread keeps mutating it.
+        user_message = text
+
+        def _worker() -> None:
+            try:
+                ok, reply = ask_claude(
+                    user_message,
+                    system_prompt=system_prompt,
+                    skip_permissions=skip_permissions,
+                )
+            except Exception:
+                log.exception("companion chat worker crashed")
+                ok, reply = False, "(unexpected error — see logs)"
+
+            # One-shot latch — even if the queued block fires twice
+            # (PyObjC block-bridge edge cases have been observed in the
+            # wild), we only let it land once.
+            fired = [False]
+
+            def _on_main() -> None:
+                if fired[0]:
+                    log.warning(
+                        "companion chat: dropped duplicate _on_main "
+                        "for token=%d", token,
+                    )
+                    return
+                fired[0] = True
+                self._handle_chat_reply(token, ok, reply)
+            try:
+                from Foundation import NSOperationQueue
+                NSOperationQueue.mainQueue().addOperationWithBlock_(_on_main)
+            except Exception:
+                # If main-thread dispatch itself fails (test harness with
+                # no run loop), at least update the in-memory state so a
+                # later render picks it up.
+                log.exception("main-thread dispatch failed; updating in place")
+                self._handle_chat_reply(token, ok, reply)
+
+        import threading
+        threading.Thread(
+            target=_worker,
+            name="tokenmon.companion.chat",
+            daemon=True,
+        ).start()
+
+    def _handle_chat_reply(self, token: int, ok: bool, reply: str) -> None:
+        """Main-thread callback for the chat worker. Replaces the
+        ``thinking…`` placeholder with the reply (or an error).
+
+        ``token`` is the request id stamped by ``_append_chat_message``.
+        We compare against the current ``_chat_request_token`` so a
+        late-arriving worker for an already-replaced request can't
+        clobber the live transcript. Also defends against a duplicate
+        callback firing for the same token.
+        """
+        current = getattr(self, "_chat_request_token", 0)
+        if token != current:
+            log.warning(
+                "companion chat: ignoring stale reply (token=%d, current=%d)",
+                token, current,
+            )
+            return
+        if not self._chat_pending:
+            # Already handled — second callback for the same token.
+            log.warning(
+                "companion chat: ignoring duplicate reply for token=%d", token,
+            )
+            return
+        # Drop the placeholder if it's still at the tail — defensive in
+        # case the chat was closed/reopened mid-flight.
+        if self._chat_messages and self._chat_messages[-1][0] == "thinking":
+            self._chat_messages.pop()
+        self._chat_messages.append(("companion" if ok else "error", reply))
+        # Trim the transcript so the panel stays readable. ~12 entries =
+        # 6 round-trips visible at once.
+        self._chat_messages = self._chat_messages[-12:]
+        self._set_chat_pending(False)
+        self._render_chat_messages()
+
+    def _set_chat_pending(self, pending: bool) -> None:
+        """Enable/disable the chat input while a request is in flight.
+        Blocks the user from queuing up a second subprocess and signals
+        visually that something's happening."""
+        self._chat_pending = bool(pending)
+        if self._chat_input is None:
+            return
+        try:
+            self._chat_input.setEnabled_(not self._chat_pending)
+        except Exception:
+            log.exception("chat input enable/disable failed")
+
+    def _companion_identity(self):
+        """Build a ``CompanionIdentity`` from the active Pokémon row.
+        Returns ``None`` if there's no active companion (empty box)."""
+        try:
+            from tokenmon import box
+            from tokenmon.companion.persona import CompanionIdentity
+            row = box.get_active_pokemon()
+            if row is None:
+                return None
+            return CompanionIdentity(
+                species_dex_id=int(row.species_dex_id),
+                nickname=row.nickname,
+                nature=row.nature,
+                is_shiny=bool(row.is_shiny),
+            )
+        except Exception:
+            log.exception("companion identity lookup failed")
+            return None
 
     def _render_chat_messages(self) -> None:
         if self._chat_transcript is None:
             return
         sections: list[str] = []
+        # The OCR snapshot is passed to the LLM via the system prompt
+        # (see ``_append_chat_message``), but we don't render it in the
+        # chat panel anymore — the wall of scraped text dwarfed the
+        # actual conversation. Permission errors still surface here so
+        # the user knows why their companion can't "see" the screen.
         snap = self._chat_context
         if snap is not None:
             try:
                 if snap.source.endswith(":no-permission"):
                     sections.append(
-                        '[Fenster-Kontext nicht verfügbar]\n'
-                        'Tokenmon braucht „Bildschirmaufnahme“-Erlaubnis, '
-                        'um den Inhalt des aktuellen Fensters zu lesen.\n'
-                        '→ Systemeinstellungen › Datenschutz & Sicherheit › '
-                        'Bildschirmaufnahme aktivieren, dann Tokenmon neu starten.'
+                        "[Window context unavailable]\n"
+                        "Tokenmon needs Screen Recording permission to read "
+                        "the active window.\n"
+                        "→ System Settings › Privacy & Security › Screen "
+                        "Recording, enable Tokenmon, then restart it."
                     )
-                else:
-                    sections.append("[Fenster-Kontext]\n" + snap.short_summary())
             except Exception:
                 log.exception("chat context render failed")
-        if self._chat_messages:
-            sections.append("\n".join(f"Du: {m}" for m in self._chat_messages))
+
+        # Per-role label so the user can tell apart their own lines from
+        # the companion's reply and from system errors. Nickname falls
+        # back to the species name via ``_chat_title``.
+        companion_label = self._chat_title() or "Companion"
+        lines: list[str] = []
+        for role, text in self._chat_messages:
+            if role == "user":
+                lines.append(f"You: {text}")
+            elif role == "companion":
+                lines.append(f"{companion_label}: {text}")
+            elif role == "thinking":
+                lines.append(f"{companion_label}: {text}")
+            elif role == "error":
+                lines.append(text)
+        if lines:
+            sections.append("\n".join(lines))
         elif not sections:
             sections.append(
-                "Schreib eine Nachricht. Enter legt sie hier im Mockup ab.",
+                "Type a message and press Enter to chat with your companion.",
             )
-        self._chat_transcript.setStringValue_("\n\n".join(sections))
+        rendered = "\n\n".join(sections)
+        # The transcript moved from NSTextField → NSTextView so the
+        # panel can scroll. NSTextView uses ``setString_`` rather than
+        # ``setStringValue_``; a getattr-fallback would silently no-op
+        # if the API drifts again, which is exactly the kind of bug we
+        # don't want here.
+        try:
+            self._chat_transcript.setString_(rendered)
+        except AttributeError:
+            # Defensive — older macOS or a swapped-in fake in tests.
+            self._chat_transcript.setStringValue_(rendered)
+        # Auto-scroll to the bottom so the latest reply is always
+        # visible. ``scrollRangeToVisible:`` on the text view handles
+        # the math against the document's text container; the clip
+        # view's bounds get adjusted as a side-effect.
+        try:
+            length = len(rendered)
+            self._chat_transcript.scrollRangeToVisible_((length, 0))
+        except Exception:
+            log.exception("chat transcript auto-scroll failed")
 
     def set_mood_alpha(self, multiplier: float) -> None:
         """Apply a Phase-5 mood multiplier (e.g. night dimming) on top of

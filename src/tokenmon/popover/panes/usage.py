@@ -154,7 +154,7 @@ class UsageController(PaneController):
         # can't push it into the toggles below. Sits between the cost
         # summary and the footer toolbar.
         chart_h = 100
-        chart_y = 144  # 4 px above the debug-button row (top=138)
+        chart_y = 166  # 4 px above the debug-button row (top=160)
         chart_frame = NSMakeRect(
             margin_x, chart_y, CONTENT_WIDTH - 32, chart_h,
         )
@@ -177,8 +177,8 @@ class UsageController(PaneController):
         )
 
         # Footer toolbar — toggles + buttons. All anchored bottom-up so
-        # the chart above never overlaps. Restart/Quit at y=12, three
-        # switches stacked above at y=50/72/94 (h=18, 22 px stride).
+        # the chart above never overlaps. Restart/Quit at y=12, four
+        # switches stacked above at y=50/72/94/116 (h=18, 22 px stride).
         sw_companion = NSButton.alloc().initWithFrame_(
             NSMakeRect(margin_x, 50, CONTENT_WIDTH - 32, 18)
         )
@@ -211,6 +211,20 @@ class UsageController(PaneController):
         sw_pokemon.setAction_(b"toggleMenubarPokemon:")
         view.addSubview_(sw_pokemon)
 
+        sw_skip_perms = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin_x, 116, CONTENT_WIDTH - 32, 18)
+        )
+        sw_skip_perms.setButtonType_(NSButtonTypeSwitch)
+        sw_skip_perms.setTitle_("Companion chat: skip Claude tool prompts")
+        sw_skip_perms.setState_(
+            1 if getattr(
+                self.popover._app, "_companion_skip_permissions", False,
+            ) else 0
+        )
+        sw_skip_perms.setTarget_(self.popover)
+        sw_skip_perms.setAction_(b"toggleCompanionSkipPermissions:")
+        view.addSubview_(sw_skip_perms)
+
         # Buttons row: Restart Proxy + Quit, anchored to bottom.
         btn_y = 12
         restart = NSButton.alloc().initWithFrame_(
@@ -235,7 +249,7 @@ class UsageController(PaneController):
         # chart. Force-spawning bypasses probability + cooldown but
         # respects pending-guard, so a second click while one is queued
         # navigates to the existing pending entity instead of stacking.
-        debug_y = 116
+        debug_y = 138
         half_w = (CONTENT_WIDTH - margin_x * 2 - 8) // 2
 
         spawn_trainer_btn = NSButton.alloc().initWithFrame_(
