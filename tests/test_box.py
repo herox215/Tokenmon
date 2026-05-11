@@ -14,6 +14,11 @@ def test_ensure_today_pokemon_idempotent(db_path):
     assert a.id == b.id
 
 
+def test_ensure_today_pokemon_starts_with_pikachu_on_empty_box(db_path):
+    row = box.ensure_today_pokemon(path=db_path)
+    assert row.species_dex_id == box.STARTER_SPECIES_DEX_ID == 25
+
+
 def test_add_caught_pokemon_uses_today_and_wild_source(db_path):
     pid = box.add_caught_pokemon(
         species_dex_id=25,

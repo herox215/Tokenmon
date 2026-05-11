@@ -27,9 +27,15 @@ from tokenmon.storage import (
     get_pokemon_by_id,
     get_pokemon_for_date,
     insert_pokemon,
+    list_pokemon,
     query_xp_for_pokemon,
     update_pokemon_species,
 )
+
+# Species handed out as the very first Pokémon on a fresh box. Picked so the
+# user always starts with a recognizable mascot instead of whatever
+# ``random_species`` happens to roll on day one.
+STARTER_SPECIES_DEX_ID = 25  # Pikachu
 
 TZ = ZoneInfo("Europe/Berlin")
 TZ_NAME = "Europe/Berlin"
@@ -95,7 +101,10 @@ def ensure_today_pokemon(path: Path = DB_PATH) -> Pokemon:
     if existing is not None:
         return existing
 
-    species = pokemon.random_species()
+    if not list_pokemon(path=path):
+        species = STARTER_SPECIES_DEX_ID
+    else:
+        species = pokemon.random_species()
     nature = pokemon.random_nature()
     ivs = pokemon.roll_ivs()
     characteristic = pokemon.characteristic_for_ivs(ivs)
