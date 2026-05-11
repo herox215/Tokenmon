@@ -1,15 +1,19 @@
-"""PTY-backed wrapper around the interactive ``claude`` CLI.
+"""PTY-backed wrapper around a persistent shell terminal.
 
-We spawn ``claude`` on a real pseudo-terminal (via ``ptyprocess``) so it
-behaves exactly like it does in Terminal.app — fancy bottom input box,
-ANSI colors, syntax highlighting, sub-agent rendering, tool-use prompts,
-the works. Reading bytes off the master fd happens on a daemon thread; the
+We spawn the user's shell inside a named ``tmux`` session via a real
+pseudo-terminal (``ptyprocess``) so it behaves exactly like a regular
+terminal. The tmux wrapper is what makes the terminal survive Tokenmon
+restarts: ``tmux new-session -A -s <name>`` attaches to the named
+session if it already exists (kept alive by the tmux server, which is
+independent of our process) and creates it otherwise. Quitting the
+menubar app reaps only the local PTY client; the tmux server and its
+shell history live on for the next launch.
+
+When ``tmux`` isn't on PATH we fall back to running ``$SHELL`` directly
+— same UX in the chat panel, but no cross-restart persistence.
+
+Reading bytes off the master fd happens on a daemon thread; the
 WKWebView host registers a listener and forwards every chunk to xterm.js.
-
-The session intentionally outlives the chat window. ``ClaudeSession`` is
-held by the module-level singleton in ``__init__.py``; the chat panel only
-attaches a listener on show and detaches on hide. Quitting the menubar app
-runs ``shutdown()`` from an ``atexit`` hook to reap the child cleanly.
 """
 from __future__ import annotations
 
@@ -38,24 +42,73 @@ DEFAULT_COLS = 100
 # tail-latency on quiet input.
 READ_CHUNK = 4096
 
-# How long to wait for ``claude`` to exit on its own after SIGTERM before
-# escalating to SIGKILL. ``claude`` is a Node.js process and reliably
-# unwinds quickly; 2 seconds is comfortable.
+# How long to wait for the PTY child to exit on its own after SIGTERM
+# before escalating to SIGKILL. A tmux client / login shell unwinds
+# quickly; 2 seconds is comfortable.
 TERMINATE_GRACE_S = 2.0
+
+# Name of the persistent tmux session backing the companion chat. We use
+# a fixed name so every restart attaches to the same scrollback / cwd /
+# running processes via ``tmux new-session -A``.
+TMUX_SESSION_NAME = "tokenmon-companion"
 
 
 class SessionUnavailable(RuntimeError):
-    """Raised when the ``claude`` CLI can't be spawned at all.
+    """Raised when neither a tmux-wrapped shell nor a plain shell can be
+    spawned. We use this rather than ``FileNotFoundError`` so callers
+    can format a user-facing message instead of leaking OS-level paths."""
 
-    We use this rather than ``FileNotFoundError`` so callers can format a
-    user-facing message instead of leaking the OS-level path."""
+
+def _resolve_shell() -> str:
+    """Pick the user's interactive shell. ``$SHELL`` wins; otherwise
+    fall back to ``/bin/zsh`` (macOS default since Catalina) then
+    ``/bin/bash``."""
+    candidate = os.environ.get("SHELL") or ""
+    if candidate and shutil.which(candidate):
+        return candidate
+    for fallback in ("/bin/zsh", "/bin/bash", "/bin/sh"):
+        if shutil.which(fallback):
+            return fallback
+    raise SessionUnavailable("no usable shell on PATH")
+
+
+def _default_shell_command() -> list[str]:
+    """Build the default argv for the persistent companion terminal.
+
+    Preference order:
+
+    1. ``tmux new-session -A -s <name> <shell> -l`` — ``-A`` attaches
+       to the named session if it already exists, so Tokenmon restarts
+       reuse the same scrollback / running processes / cwd. We pass
+       the login shell explicitly rather than relying on tmux's
+       ``default-command`` so the user's ``.zprofile`` always runs.
+    2. ``screen -DR <name>`` — same persistence idea via GNU screen
+       when tmux isn't on PATH. ``-DR`` detaches any other client and
+       reattaches, creating the session if needed.
+    3. Bare login shell. No restart persistence, but the chat panel
+       still works.
+    """
+    shell = _resolve_shell()
+    tmux = shutil.which("tmux")
+    if tmux is not None:
+        return [tmux, "new-session", "-A", "-s", TMUX_SESSION_NAME, shell, "-l"]
+    screen = shutil.which("screen")
+    if screen is not None:
+        return [screen, "-DR", TMUX_SESSION_NAME]
+    return [shell, "-l"]
 
 
 Listener = Callable[[bytes], None]
 
 
 class ClaudeSession:
-    """One long-lived interactive ``claude`` process.
+    """One long-lived PTY-backed terminal session.
+
+    By default this wraps the user's shell in a persistent tmux session
+    (see ``TMUX_SESSION_NAME``), so closing the chat panel / restarting
+    Tokenmon both reattach to the same scrollback. Tests can inject a
+    custom ``command`` (typically ``/bin/cat``) to exercise the PTY
+    plumbing without depending on tmux.
 
     Thread-safety: ``write`` / ``resize`` / ``close`` are safe to call
     from any thread. Listeners are invoked on the reader thread — they
@@ -72,25 +125,14 @@ class ClaudeSession:
         env: dict[str, str] | None = None,
         rows: int = DEFAULT_ROWS,
         cols: int = DEFAULT_COLS,
-        skip_permissions: bool = False,
     ) -> None:
-        # Default: real ``claude`` CLI from PATH. Tests inject ``/bin/cat``
-        # so the smoke suite doesn't depend on Anthropic's CLI being
-        # installed on CI.
+        # Default: persistent tmux-wrapped shell. The ``-A`` flag turns
+        # ``new-session`` into attach-or-create so we hit the same
+        # session on every restart, preserving the tab's running
+        # processes, cwd and scrollback. Falls back to ``$SHELL``
+        # directly when tmux is missing — same UX, no persistence.
         if command is None:
-            claude_path = shutil.which("claude")
-            if claude_path is None:
-                raise SessionUnavailable(
-                    "claude CLI not found on PATH — install Claude Code to chat"
-                )
-            command = [claude_path]
-            # ``--dangerously-skip-permissions`` is gated on the
-            # ``companion_skip_permissions`` config flag. The flag only
-            # takes effect on session spawn; flipping it while a session
-            # is live is a no-op until the user runs ``/quit`` and
-            # reopens the panel.
-            if skip_permissions:
-                command.append("--dangerously-skip-permissions")
+            command = _default_shell_command()
         self._command = list(command)
         # Both ``cwd`` and ``cwd_source`` are exposed publicly via
         # @property — the chat panel renders the source string in its

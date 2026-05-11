@@ -1,10 +1,10 @@
 """Smoke tests for ClaudeSession.
 
-We deliberately spawn ``/bin/cat`` instead of the real ``claude`` CLI so
-the suite has no dependency on Claude Code being installed — every CI box
-has cat. The PTY code path is identical: ``cat`` echoes back exactly what
-we write, which is the cleanest possible roundtrip for verifying the
-read/write/listener plumbing.
+We deliberately spawn ``/bin/cat`` instead of the real default
+tmux-wrapped shell so the suite has no dependency on tmux/zsh being
+installed — every POSIX box has cat. The PTY code path is identical:
+``cat`` echoes back exactly what we write, which is the cleanest
+possible roundtrip for verifying the read/write/listener plumbing.
 """
 from __future__ import annotations
 
@@ -96,29 +96,87 @@ def test_remove_listener():
 
 
 def test_unavailable_command_raises():
-    """A non-existent default ``claude`` should surface as SessionUnavailable.
+    """A non-existent command surfaces as ``SessionUnavailable``.
 
-    We can't easily simulate ``claude`` missing from PATH from inside a
-    test (it would corrupt the user's PATH), so instead we exercise the
-    same exception path by passing a definitely-missing command and
-    triggering the FileNotFoundError → SessionUnavailable mapping in
-    ``start``.
+    The bare ``ClaudeSession`` constructor accepts any argv — we
+    exercise the FileNotFoundError → SessionUnavailable mapping inside
+    ``start`` by passing a path that definitely doesn't exist.
     """
     sess = ClaudeSession(command=["/usr/bin/definitely-not-a-real-binary-xyz"])
     with pytest.raises(SessionUnavailable):
         sess.start()
 
 
+def test_default_shell_command_prefers_tmux(monkeypatch):
+    """When tmux is on PATH, the default argv is ``tmux new-session -A -s ...``.
+
+    Patches ``shutil.which`` to claim tmux exists at ``/usr/local/bin/tmux``
+    and ``$SHELL`` exists at ``/bin/zsh`` so we can assert on the shape of
+    the returned argv without spawning anything.
+    """
+    from tokenmon.claude_session import session as session_mod
+
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+
+    def fake_which(name):
+        return {"/bin/zsh": "/bin/zsh", "tmux": "/usr/local/bin/tmux"}.get(name)
+
+    monkeypatch.setattr(session_mod.shutil, "which", fake_which)
+    argv = session_mod._default_shell_command()
+    assert argv[0] == "/usr/local/bin/tmux"
+    assert "new-session" in argv
+    assert "-A" in argv
+    assert session_mod.TMUX_SESSION_NAME in argv
+    # Shell + login flag are appended so the user's .zprofile runs.
+    assert argv[-2:] == ["/bin/zsh", "-l"]
+
+
+def test_default_shell_command_falls_back_to_screen(monkeypatch):
+    """When tmux is missing but screen exists, we use ``screen -DR <name>``."""
+    from tokenmon.claude_session import session as session_mod
+
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+
+    def fake_which(name):
+        if name == "tmux":
+            return None
+        return {
+            "/bin/zsh": "/bin/zsh",
+            "screen": "/usr/bin/screen",
+        }.get(name)
+
+    monkeypatch.setattr(session_mod.shutil, "which", fake_which)
+    argv = session_mod._default_shell_command()
+    assert argv == ["/usr/bin/screen", "-DR", session_mod.TMUX_SESSION_NAME]
+
+
+def test_default_shell_command_falls_back_to_plain_shell(monkeypatch):
+    """No tmux, no screen → bare login shell, no persistence."""
+    from tokenmon.claude_session import session as session_mod
+
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+
+    def fake_which(name):
+        if name in ("tmux", "screen"):
+            return None
+        return {"/bin/zsh": "/bin/zsh"}.get(name)
+
+    monkeypatch.setattr(session_mod.shutil, "which", fake_which)
+    argv = session_mod._default_shell_command()
+    assert argv == ["/bin/zsh", "-l"]
+
+
 def test_get_session_is_singleton(monkeypatch):
     """``claude_session.get_session()`` returns the same instance across calls.
 
-    Patch the spawn target to ``/bin/cat`` so this works on machines
-    without claude installed. We also clean up the module-level slot at
-    the end so we don't leak a session into other tests.
+    Force the spawn target to ``/bin/cat`` so this works without tmux or
+    a specific user shell. We clean up the module-level slot at the end
+    so we don't leak a session into other tests.
     """
     monkeypatch.setattr(
-        claude_session.session, "shutil",
-        type("shim", (), {"which": staticmethod(lambda _: "/bin/cat")}),
+        claude_session.session,
+        "_default_shell_command",
+        lambda: ["/bin/cat"],
     )
     # Force a fresh slot — previous tests may have left one.
     claude_session.shutdown()

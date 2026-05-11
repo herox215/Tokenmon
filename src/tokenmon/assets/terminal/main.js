@@ -15,20 +15,47 @@
   "use strict";
 
   const term = new Terminal({
-    fontFamily: "Menlo, Monaco, 'Courier New', monospace",
+    // ``Apple Color Emoji`` first so emoji glyphs hit their colour
+    // font fallback before we reach the monospace family — without it
+    // claude's checkmarks, sparkles, etc. render as tofu.
+    fontFamily: "Menlo, Monaco, 'Apple Color Emoji', 'Courier New', monospace",
     fontSize: 13,
     cursorBlink: true,
     scrollback: 5000,
-    // Transparent background so the panel's HUD blur shows through.
-    // ``allowTransparency: true`` is xterm.js's switch for letting
+    // Transparent canvas — the surrounding #term div provides a solid
+    // dark surface via CSS so ANSI bg cells composite predictably.
+    // ``allowTransparency: true`` is xterm.js's switch for letting an
     // alpha-zero theme.background actually compose with what's behind
-    // the canvas; without it the default opaque buffer is used and the
-    // CSS transparency above is wasted.
+    // the canvas; without it the default opaque buffer is used.
     allowTransparency: true,
+    // Full One-Dark-ish 16-colour palette. Without explicit ANSI
+    // colours xterm.js falls back to its built-in defaults, which are
+    // tuned for white backgrounds — claude's TUI (red Bash callouts,
+    // light slash-command menus) renders as glaring coral / white-on-
+    // white blocks. The palette below matches Claude Code's expected
+    // dark-terminal contrast.
     theme: {
       background: "rgba(0, 0, 0, 0)",
       foreground: "#e6e6e6",
       cursor: "#e6e6e6",
+      cursorAccent: "#1a1a1a",
+      selectionBackground: "rgba(255, 255, 255, 0.18)",
+      black:         "#1a1a1a",
+      red:           "#e06c75",
+      green:         "#98c379",
+      yellow:        "#e5c07b",
+      blue:          "#61afef",
+      magenta:       "#c678dd",
+      cyan:          "#56b6c2",
+      white:         "#abb2bf",
+      brightBlack:   "#5c6370",
+      brightRed:     "#e06c75",
+      brightGreen:   "#98c379",
+      brightYellow:  "#e5c07b",
+      brightBlue:    "#61afef",
+      brightMagenta: "#c678dd",
+      brightCyan:    "#56b6c2",
+      brightWhite:   "#ffffff",
     },
     allowProposedApi: true,
   });

@@ -95,9 +95,6 @@ class TokenmonApp(rumps.App):
         )
         self._companion_mode = bool(config.get("companion_mode"))
         self._use_weather = bool(config.get("use_weather"))
-        self._companion_skip_permissions = bool(
-            config.get("companion_skip_permissions"),
-        )
         # Wire companion-mode persistence into the overlay so level-up /
         # evolution endings don't hide the sprite while the companion is on.
         self._overlay.set_persistent(self._companion_mode)
@@ -380,17 +377,6 @@ class TokenmonApp(rumps.App):
         config.set_("use_weather", self._use_weather)
         self.refresh(None)
 
-    def toggle_companion_skip_permissions(self, _sender) -> None:
-        # Power-user opt-in: lets the companion run Claude Code with
-        # ``--dangerously-skip-permissions`` so tool calls don't prompt
-        # mid-chat. Stored as an explicit flag so the user has to flip
-        # it intentionally; harness reads it on every request.
-        self._companion_skip_permissions = not self._companion_skip_permissions
-        config.set_(
-            "companion_skip_permissions", self._companion_skip_permissions,
-        )
-        self.refresh(None)
-
     def open_tokendex(self, _sender) -> None:
         try:
             tokendex.show()
@@ -506,12 +492,12 @@ def main() -> None:
     global _SINGLETON_LOCK
     _SINGLETON_LOCK = _acquire_singleton_lock(restart=args.restart)
 
-    # Reap the long-lived ``claude`` PTY when the menubar quits — both via
-    # the normal ``Quit`` menu item (which exits the run loop and lets
-    # atexit fire) and via SIGTERM from ``launchctl bootout`` (handled by
-    # Python's default SIGTERM → atexit-via-PyExc_KeyboardInterrupt
-    # convention). Without this hook a stray ``claude`` survives the
-    # menubar app and shows up in ``pgrep claude``.
+    # Reap the local terminal PTY when the menubar quits — both via the
+    # normal ``Quit`` menu item (which exits the run loop and lets
+    # atexit fire) and via SIGTERM from ``launchctl bootout`` (handled
+    # by Python's default SIGTERM → atexit-via-PyExc_KeyboardInterrupt
+    # convention). The tmux server backing the companion terminal is
+    # independent of this process and keeps running for the next launch.
     import atexit
     from tokenmon import claude_session as _claude_session
     atexit.register(_claude_session.shutdown)

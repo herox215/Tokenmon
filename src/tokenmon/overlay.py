@@ -209,305 +209,6 @@ class _ChatWindowDelegate(NSObject):
         self._overlay.hide_chat()
 
 
-class _RecallButtonView(NSView):
-    """Custom NSView for the floating Pokéball recall button.
-
-    Holds an image + caption rendered into subviews. Owns its
-    NSTrackingArea (rebuilt on ``updateTrackingAreas`` per AppKit
-    convention so resize/visibility changes re-arm tracking cleanly).
-
-    Hover scaling is done via the layer's affine transform rather than
-    by resizing the NSWindow — keeping the window frame fixed avoids
-    backing-store reallocs and shadow flicker, and the scale animation
-    is implicitly applied by Core Animation when we set the transform
-    inside an NSAnimationContext group.
-
-    Click → ``overlay._quit_chat_session()``: same destructive
-    end-of-session as the previous × button.
-    """
-
-    REST_SCALE = 0.667
-    HOVER_SCALE = 1.0
-    SCALE_DURATION_S = 0.15
-
-    def initWithOverlay_frame_(self, overlay, frame):  # noqa: N802
-        self = objc.super(_RecallButtonView, self).initWithFrame_(frame)
-        if self is None:
-            return None
-        self._overlay = overlay
-        self._tracking_area = None
-        self._hovered = False
-        self.setWantsLayer_(True)
-        layer = self.layer()
-        if layer is not None:
-            # Anchor at center so transform-scale grows about the middle.
-            # AppKit fixes the layer position when we set anchorPoint, so
-            # we don't have to reposition the layer explicitly.
-            layer.setAnchorPoint_((0.5, 0.5))
-            from Quartz import CATransform3DMakeScale  # type: ignore
-            layer.setTransform_(
-                CATransform3DMakeScale(
-                    _RecallButtonView.REST_SCALE,
-                    _RecallButtonView.REST_SCALE,
-                    1.0,
-                )
-            )
-        return self
-
-    def acceptsFirstMouse_(self, _event):  # noqa: N802
-        # Receive the first click even when the parent window isn't key.
-        # Without this, clicks on a non-activating panel are eaten as
-        # focus changes instead of mouseDown events.
-        return True
-
-    def updateTrackingAreas(self):  # noqa: N802
-        # AppKit calls this on bounds/visibility changes and on initial
-        # add-to-window. Rebuilding the area here is the canonical
-        # idiom — manually recreating on resize fires too often (and
-        # misses initial setup).
-        if self._tracking_area is not None:
-            try:
-                self.removeTrackingArea_(self._tracking_area)
-            except Exception:
-                pass
-        from AppKit import NSTrackingArea  # type: ignore
-        opts = (
-            0x01  # NSTrackingMouseEnteredAndExited
-            | 0x80  # NSTrackingActiveAlways — recall window never becomes key
-            | 0x200  # NSTrackingInVisibleRect — auto-resizes with view
-        )
-        area = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
-            self.bounds(), opts, self, None,
-        )
-        self.addTrackingArea_(area)
-        self._tracking_area = area
-        objc.super(_RecallButtonView, self).updateTrackingAreas()
-
-    def mouseEntered_(self, _event):  # noqa: N802
-        self._set_scale(_RecallButtonView.HOVER_SCALE)
-
-    def mouseExited_(self, _event):  # noqa: N802
-        self._set_scale(_RecallButtonView.REST_SCALE)
-
-    def mouseDown_(self, _event):  # noqa: N802
-        try:
-            self._overlay._quit_chat_session()
-        except Exception:
-            log.exception("recall-button quit failed")
-
-    def _set_scale(self, scale: float) -> None:
-        layer = self.layer()
-        if layer is None:
-            return
-        try:
-            from Quartz import CATransform3DMakeScale  # type: ignore
-            NSAnimationContext.beginGrouping()
-            try:
-                NSAnimationContext.currentContext().setDuration_(
-                    _RecallButtonView.SCALE_DURATION_S
-                )
-                # Animator proxy on a CALayer applies the implicit
-                # animation duration we just set on the context.
-                layer.setTransform_(CATransform3DMakeScale(scale, scale, 1.0))
-            finally:
-                NSAnimationContext.endGrouping()
-        except Exception:
-            log.exception("recall-button scale animation failed")
-
-
-class _RecallButton:
-    """Floating Pokéball window beside the chat panel.
-
-    Owns its own borderless ``NSPanel`` (non-activating, so clicks don't
-    pull key focus away from the chat panel). The panel hosts a single
-    ``_RecallButtonView`` containing the Pokéball sprite + a caption.
-
-    The window stays at a fixed 96×128 — hover-grow is done by scaling
-    the contentView's layer, not by resizing the window. Position is
-    computed once at ``show_at`` time from the chat panel's frame; we
-    don't track ongoing moves because the chat panel is bottom-anchored
-    and doesn't move during its lifetime.
-    """
-
-    WINDOW_W = 96
-    WINDOW_H = 128
-    GAP_FROM_CHAT = 12  # px between chat right-edge and recall left-edge
-    SPRITE_SIZE = 64    # square; sits in the upper portion of the view
-    CAPTION_TEXT = "Komm zurück!"
-
-    def __init__(self, overlay) -> None:
-        self._overlay = overlay
-        self._window = None
-        self._view: _RecallButtonView | None = None
-
-    def show_at(self, chat_frame) -> None:
-        """Build (or reuse) the recall window and place it next to ``chat_frame``.
-
-        Call after the chat panel has been animated to its final position;
-        we read ``chat_frame`` for the right-edge anchor and the vertical
-        midline. ``chat_frame`` is expected in AppKit screen coords.
-        """
-        if self._window is None:
-            self._build_window()
-        self._reposition(chat_frame)
-        try:
-            # orderFrontRegardless rather than makeKeyAndOrderFront —
-            # we don't want to steal key focus from the chat panel.
-            self._window.orderFrontRegardless()
-        except Exception:
-            log.exception("recall window order-front failed")
-
-    def hide(self) -> None:
-        if self._window is None:
-            return
-        try:
-            self._window.orderOut_(None)
-        except Exception:
-            log.exception("recall window orderOut failed")
-
-    def tear_down(self) -> None:
-        """Fully release the window; called from ``_tear_down_chat_window``."""
-        if self._view is not None:
-            try:
-                self._view.removeFromSuperview()
-            except Exception:
-                pass
-            self._view = None
-        if self._window is not None:
-            try:
-                self._window.orderOut_(None)
-                self._window.close()
-            except Exception:
-                log.exception("recall window close failed")
-            self._window = None
-
-    def _build_window(self) -> None:
-        rect = NSMakeRect(0, 0, _RecallButton.WINDOW_W, _RecallButton.WINDOW_H)
-        # Non-activating panel — clicks don't pull key focus from the
-        # chat panel (which would trigger its windowDidResignKey →
-        # hide_chat path).
-        style = (
-            NSWindowStyleMaskBorderless
-            | NSWindowStyleMaskNonactivatingPanel
-        )
-        win = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            rect, style, NSBackingStoreBuffered, False,
-        )
-        win.setOpaque_(False)
-        win.setBackgroundColor_(NSColor.clearColor())
-        win.setHasShadow_(False)
-        win.setMovable_(False)
-        win.setLevel_(NSFloatingWindowLevel)
-        win.setCollectionBehavior_(
-            NSWindowCollectionBehaviorCanJoinAllSpaces
-            | NSWindowCollectionBehaviorFullScreenAuxiliary
-            | NSWindowCollectionBehaviorStationary
-            | NSWindowCollectionBehaviorIgnoresCycle
-            | NSWindowCollectionBehaviorTransient
-        )
-        win.setReleasedWhenClosed_(False)
-
-        view = _RecallButtonView.alloc().initWithOverlay_frame_(
-            self._overlay,
-            NSMakeRect(0, 0, _RecallButton.WINDOW_W, _RecallButton.WINDOW_H),
-        )
-        # Sprite at top, caption at bottom.
-        sprite_size = _RecallButton.SPRITE_SIZE
-        sprite_x = (_RecallButton.WINDOW_W - sprite_size) / 2.0
-        sprite_y = _RecallButton.WINDOW_H - sprite_size - 12
-        sprite_view = NSImageView.alloc().initWithFrame_(
-            NSMakeRect(sprite_x, sprite_y, sprite_size, sprite_size)
-        )
-        sprite_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
-        sprite_view.setWantsLayer_(True)
-        # Crisp pixel-art scaling — the Pokéball sprite is 32×32, we're
-        # rendering at 64 + an extra hover scale-up; bilinear would
-        # mush the edges.
-        if sprite_view.layer() is not None:
-            sprite_view.layer().setMagnificationFilter_("nearest")
-            sprite_view.layer().setMinificationFilter_("nearest")
-
-        try:
-            from tokenmon import items_remote
-            img = items_remote.get_sprite_by_name("poke-ball")
-        except Exception:
-            log.exception("recall-button sprite load failed")
-            img = None
-        if img is not None:
-            sprite_view.setImage_(img)
-        view.addSubview_(sprite_view)
-
-        # Caption — small, centred, dim-white with a soft shadow so it
-        # reads against any desktop wallpaper.
-        caption = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(0, 6, _RecallButton.WINDOW_W, 18),
-        )
-        caption.setStringValue_(_RecallButton.CAPTION_TEXT)
-        caption.setBezeled_(False)
-        caption.setDrawsBackground_(False)
-        caption.setEditable_(False)
-        caption.setSelectable_(False)
-        caption.setAlignment_(NSTextAlignmentCenter)
-        caption.setFont_(NSFont.boldSystemFontOfSize_(11))
-        caption.setTextColor_(NSColor.whiteColor())
-        # Shadow for legibility over light wallpapers.
-        try:
-            shadow = NSShadow.alloc().init()
-            shadow.setShadowColor_(NSColor.colorWithCalibratedWhite_alpha_(0, 0.6))
-            shadow.setShadowOffset_((0, -1))
-            shadow.setShadowBlurRadius_(2.0)
-            caption.setShadow_(shadow)
-        except Exception:
-            pass
-        view.addSubview_(caption)
-
-        win.setContentView_(view)
-        self._window = win
-        self._view = view
-
-    def _reposition(self, chat_frame) -> None:
-        """Place the recall window centred vertically on ``chat_frame`` and
-        12 px to its right. If that would clip the right screen edge,
-        flip to the left of the chat instead."""
-        from AppKit import NSScreen as _NSScreen  # type: ignore
-
-        cx = float(chat_frame.origin.x)
-        cy = float(chat_frame.origin.y)
-        cw = float(chat_frame.size.width)
-        ch = float(chat_frame.size.height)
-        right_x = cx + cw + _RecallButton.GAP_FROM_CHAT
-        left_x = cx - _RecallButton.GAP_FROM_CHAT - _RecallButton.WINDOW_W
-        # Vertically centre on the chat panel.
-        y = cy + (ch - _RecallButton.WINDOW_H) / 2.0
-
-        # Pick the right side by default; fall back to left if the
-        # right side overflows the chat's screen.
-        screen = None
-        try:
-            screen = self._window.screen() if self._window is not None else None
-            if screen is None:
-                screen = _NSScreen.mainScreen()
-        except Exception:
-            screen = _NSScreen.mainScreen()
-        if screen is not None:
-            vf = screen.visibleFrame()
-            screen_right = float(vf.origin.x) + float(vf.size.width)
-            if right_x + _RecallButton.WINDOW_W > screen_right:
-                x = left_x
-            else:
-                x = right_x
-        else:
-            x = right_x
-
-        try:
-            self._window.setFrame_display_(
-                NSMakeRect(x, y, _RecallButton.WINDOW_W, _RecallButton.WINDOW_H),
-                True,
-            )
-        except Exception:
-            log.exception("recall window reposition failed")
-
-
 class _CompanionImageView(NSImageView):
     """NSImageView subclass that disables image interpolation in its
     draw path so animated pixel-art GIFs stay crisp when scaled
@@ -970,25 +671,17 @@ class PokemonOverlay:
         # The chat window is a thin shell around a long-lived terminal
         # view. Once created, both window and view persist across hide/
         # show cycles — only the outside-click monitor and delegate are
-        # torn down on hide. The PTY-backed ``ClaudeSession`` lives in
+        # torn down on hide. The PTY-backed session lives in
         # ``tokenmon.claude_session`` (module-level singleton) and
-        # outlives even this overlay.
+        # outlives even this overlay; tmux keeps the actual shell
+        # alive across Tokenmon restarts.
         self._chat_window: NSWindow | None = None
         self._terminal_view = None  # claude_session.TerminalWebView | None
         # Strong-ref to the session that ``_terminal_view`` is wired to
-        # so we can detect a fresh-spawn (e.g. user typed ``/quit``
-        # while the panel was hidden) and rebuild the WKWebView before
-        # showing it again.
+        # so we can detect that the local PTY died while the panel was
+        # hidden (e.g. user typed ``exit`` inside the shell) and
+        # rebuild the WKWebView before showing it again.
         self._chat_session = None  # claude_session.ClaudeSession | None
-        # Floating Pokéball recall button beside the chat panel —
-        # owned by ``_RecallButton`` (helper class), built lazily on
-        # first chat-open and torn down with the chat window.
-        self._recall_button = None  # _RecallButton | None
-        # Re-entry guard: set True at the top of ``_quit_chat_session``
-        # so the chat's outside-click monitor's parallel ``hide_chat``
-        # call early-exits and the panel doesn't disappear before the
-        # ``/quit`` echo lands in the terminal.
-        self._chat_quitting = False
         self._chat_window_delegate: _ChatWindowDelegate | None = None
         self._chat_outside_monitor = None
         self._sprite_click_monitor = None
@@ -1291,23 +984,24 @@ class PokemonOverlay:
         else:
             start_frame = final_frame
 
-        # Spawn (or reuse) the long-lived claude session. If the CLI
-        # isn't installed we surface a graceful banner instead of opening
-        # a doomed window. Imports done before the try/except so the
-        # ``SessionUnavailable`` reference in the except clause is bound
-        # even if the import itself were to fail (it shouldn't, but be
-        # defensive — the chat panel is the user's recovery path).
+        # Spawn (or reuse) the long-lived terminal session. If no shell
+        # can be spawned we surface a graceful banner instead of
+        # opening a doomed window. Imports done before the try/except
+        # so the ``SessionUnavailable`` reference in the except clause
+        # is bound even if the import itself were to fail (it
+        # shouldn't, but be defensive — the chat panel is the user's
+        # recovery path).
         from tokenmon import claude_session as _claude_session
         try:
             session = _claude_session.get_session()
         except _claude_session.SessionUnavailable as exc:
-            log.warning("companion chat: cannot start claude session — %s", exc)
+            log.warning("companion chat: cannot start terminal — %s", exc)
             self._show_chat_unavailable_banner(str(exc))
             return
         except Exception:
-            log.exception("companion chat: claude_session.get_session() failed")
+            log.exception("companion chat: terminal session spawn failed")
             self._show_chat_unavailable_banner(
-                "Couldn't start the claude session — see logs.",
+                "Couldn't start the companion terminal — see logs.",
             )
             return
 
@@ -1356,7 +1050,7 @@ class PokemonOverlay:
         border.setWantsLayer_(True)
         root.addSubview_(border)
 
-        # Debug label at the top: shows the cwd we spawned ``claude`` in
+        # Debug label at the top: shows the cwd the terminal spawned in
         # plus the resolver stage that picked it. Single-line, dim,
         # selectable so users can copy the path. Sits above the terminal
         # with its own thin strip; the terminal frame is shrunk to
@@ -1389,13 +1083,6 @@ class PokemonOverlay:
             pass
         root.addSubview_(terminal.view)
 
-        # Recall button — floating Pokéball window beside the chat panel.
-        # Built lazily and shown after the chat animation completes (we
-        # need the chat's *final* frame, not its morph-start origin, so
-        # the recall window lines up with the bottom-centred panel).
-        if self._recall_button is None:
-            self._recall_button = _RecallButton(self)
-
         win.setContentView_(root)
         self._chat_window = win
         delegate = _ChatWindowDelegate.alloc().initWithOverlay_(self)
@@ -1418,14 +1105,6 @@ class PokemonOverlay:
         except Exception:
             win.setFrame_display_(final_frame, True)
             win.setAlphaValue_(1.0)
-        # Show the recall button at the chat's final frame. We pass
-        # ``final_frame`` (not ``win.frame()``) so the position is
-        # correct even mid-morph-animation.
-        if self._recall_button is not None:
-            try:
-                self._recall_button.show_at(final_frame)
-            except Exception:
-                log.exception("recall button show_at failed")
         # Hand keyboard focus to the WKWebView so xterm.js receives
         # keystrokes immediately — without this the user has to click
         # inside the terminal before they can type.
@@ -1456,14 +1135,6 @@ class PokemonOverlay:
             win.makeKeyWindow()
         except Exception:
             log.exception("chat re-order-front failed")
-        # Re-show the recall button beside the chat. The chat hasn't
-        # moved between hide and show so we can read its current frame
-        # directly.
-        if self._recall_button is not None:
-            try:
-                self._recall_button.show_at(win.frame())
-            except Exception:
-                log.exception("recall button reattach failed")
         if self._terminal_view is not None:
             try:
                 win.makeFirstResponder_(self._terminal_view.view)
@@ -1471,7 +1142,7 @@ class PokemonOverlay:
                 log.exception("chat first-responder failed")
 
     def _show_chat_unavailable_banner(self, message: str) -> None:
-        """Surface a one-shot AppKit alert when the claude session can't
+        """Surface a one-shot AppKit alert when the terminal session can't
         start. Called instead of opening the chat window so the user gets
         an explanation instead of a silently empty panel."""
         try:
@@ -1485,31 +1156,20 @@ class PokemonOverlay:
             log.error("chat unavailable: %s", message)
 
     def hide_chat(self) -> None:
-        """Order the chat panel out without releasing it. The PTY-backed
-        session and the WKWebView's xterm.js state both keep running so
-        the next ``show_chat()`` reattaches to a live terminal instead of
+        """Order the chat panel out without releasing it. The local PTY
+        and the WKWebView's xterm.js state both keep running so the next
+        ``show_chat()`` reattaches to a live terminal instead of
         spawning a fresh one.
 
-        The session itself only dies on menubar quit (see
-        ``tokenmon.menubar._main`` for the ``atexit`` hook)."""
-        # Re-entry guard: ``_quit_chat_session`` sets this before sending
-        # ``/quit`` to the PTY, so the outside-click monitor's parallel
-        # call to hide_chat doesn't make the panel disappear before the
-        # /quit echo has had a chance to render.
-        if self._chat_quitting:
-            return
+        The local PTY only dies on menubar quit (see
+        ``tokenmon.menubar._main`` for the ``atexit`` hook). The
+        underlying tmux session keeps running across menubar restarts
+        — that's what makes the terminal persist."""
         win = self._chat_window
         if win is None:
             return
         if not win.isVisible():
             return
-        # Take the recall button down with the chat panel — it's
-        # visually anchored to the chat and shouldn't linger after.
-        if self._recall_button is not None:
-            try:
-                self._recall_button.hide()
-            except Exception:
-                log.exception("recall button hide failed")
         self._remove_chat_outside_monitor()
         try:
             # Drop the delegate so a stale ``windowDidResignKey:`` can't
@@ -1531,9 +1191,9 @@ class PokemonOverlay:
     def _tear_down_chat_window(self) -> None:
         """Fully release the chat window + WKWebView + terminal-view bindings
         so the next ``show_chat()`` rebuilds from scratch. Used when the
-        underlying ``ClaudeSession`` has died while the panel was hidden
-        (the WKWebView is still bound to the corpse and would no-op on
-        keystrokes). Idempotent."""
+        local PTY has died while the panel was hidden (the WKWebView is
+        still bound to the corpse and would no-op on keystrokes).
+        Idempotent."""
         self._remove_chat_outside_monitor()
         win = self._chat_window
         if win is not None:
@@ -1552,51 +1212,10 @@ class PokemonOverlay:
                 self._terminal_view.detach()
             except Exception:
                 log.exception("terminal_view.detach() failed")
-        # Tear down the recall button alongside the chat — it has its
-        # own NSWindow and will leak if we just null the reference.
-        if self._recall_button is not None:
-            try:
-                self._recall_button.tear_down()
-            except Exception:
-                log.exception("recall button tear-down failed")
-            self._recall_button = None
         self._chat_window = None
         self._chat_window_delegate = None
         self._terminal_view = None
         self._chat_session = None
-        self._chat_quitting = False
-
-    def _quit_chat_session(self) -> None:
-        """Terminate the running ``claude`` process and close the panel.
-
-        Distinct from ``hide_chat()`` — the latter only orders the window
-        out and keeps the session alive in the background. This one
-        actually kills claude (best-effort graceful via ``/quit`` first,
-        then SIGTERM/SIGKILL via ``claude_session.shutdown``) so the
-        next double-click spawns a fresh session, picking up the cwd
-        resolver's current verdict.
-        """
-        # Set the re-entry flag *before* anything else — clicking the
-        # recall button also fires the chat's outside-click monitor
-        # (which calls ``hide_chat``); without this guard the panel
-        # would orderOut while we're still mid-``/quit`` write.
-        self._chat_quitting = True
-        # Best-effort graceful exit: claude saves its session state on
-        # ``/quit`` so the user can ``--resume`` later if they want. If
-        # the PTY write fails (already dead) we still proceed to the
-        # SIGTERM path below.
-        sess = self._chat_session
-        if sess is not None and sess.is_alive():
-            try:
-                sess.write(b"/quit\r")
-            except Exception:
-                log.exception("failed to send /quit on chat-quit click")
-        try:
-            from tokenmon import claude_session as _claude_session
-            _claude_session.shutdown()
-        except Exception:
-            log.exception("claude_session.shutdown() from chat-quit failed")
-        self._tear_down_chat_window()
 
     def _format_cwd_label(self, session) -> str:
         """Render the cwd debug strip — path on the left, source on the

@@ -25,6 +25,7 @@ import logging
 import threading
 from pathlib import Path
 
+from .ansi_filter import AnsiBgStripper
 from .session import ClaudeSession
 
 log = logging.getLogger("tokenmon.claude_session.terminal_view")
@@ -105,6 +106,10 @@ class TerminalWebView:
         self._lock = threading.Lock()
         self._ready = False
         self._pending_output: list[bytes] = []
+        # Strip ANSI background-colour codes so claude's blocky red /
+        # white tool-call callouts don't drown the panel. Stateful
+        # because PTY reads can split escape sequences across chunks.
+        self._bg_stripper = AnsiBgStripper()
 
         config = WKWebViewConfiguration.alloc().init()
         # We're loading bundled local files — no remote pages, no cookies
@@ -169,6 +174,15 @@ class TerminalWebView:
 
     def _on_session_output(self, data: bytes) -> None:
         """Listener installed on the ClaudeSession. Runs on its reader thread."""
+        # Filter bg colours on the reader thread so the buffered-output
+        # path below sees the same flattened bytes that the
+        # post-ready path emits — keeps ordering and state consistent.
+        try:
+            data = self._bg_stripper.feed(data)
+        except Exception:
+            log.exception("ansi bg-stripper failed; passing raw")
+        if not data:
+            return
         with self._lock:
             if not self._ready:
                 self._pending_output.append(data)

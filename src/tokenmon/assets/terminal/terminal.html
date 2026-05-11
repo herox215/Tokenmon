@@ -5,11 +5,13 @@
 <title>Tokenmon Terminal</title>
 <link rel="stylesheet" href="vendor/xterm.css">
 <style>
-  /* Fully transparent so the HUD blur of the surrounding panel shows
-     through. WKWebView is set non-opaque on the Python side; together
-     these two are enough to skip the default white page background. */
+  /* Fully transparent so the panel's HUD blur shows through. ANSI
+     background-colour codes and reverse-video are stripped server-side
+     in ``ansi_filter.AnsiBgStripper`` so we don't get blocky callouts
+     against the blur. WKWebView is non-opaque on the Python side;
+     ``allowTransparency: true`` on the xterm.js side lets the
+     alpha-zero theme.background compose with what's behind the canvas. */
   html, body { margin: 0; padding: 0; height: 100%; background: transparent; overflow: hidden; }
-  /* Pad the canvas off the rounded panel corners and the title bar above. */
   #term { position: absolute; inset: 0; padding: 8px; box-sizing: border-box; background: transparent; }
   .xterm, .xterm-viewport, .xterm-screen { background: transparent !important; }
 </style>
