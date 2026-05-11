@@ -29,6 +29,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from tokenmon.proc_tree import list_descendants as _list_descendants
+from tokenmon.proc_tree import process_name as _process_name
+
 log = logging.getLogger("tokenmon.claude_session.cwd_resolver")
 
 # Names matched against ``ps -o comm`` for the descendant scan. We
@@ -183,62 +186,6 @@ def _try_process_tree(pid: int, *, bundle: str = "") -> tuple[Path, str] | None:
         label = bundle or f"PID {pid}"
         return cwd, f"lsof {label}"
     return None
-
-
-def _list_descendants(pid: int) -> list[int]:
-    """Return all descendant PIDs of ``pid`` (BFS via repeated ``pgrep -P``).
-
-    macOS' ``pgrep -P`` only lists direct children; we iterate to walk
-    the full tree. Capped at 2 levels of recursion in practice — chat
-    panel can't afford to fan out into hundreds of subprocesses.
-    """
-    if shutil.which("pgrep") is None:
-        return []
-    out: list[int] = []
-    frontier = [int(pid)]
-    seen = {int(pid)}
-    # Depth limit: 4 should cover even nested tmux/zellij/screen setups
-    # while keeping the worst-case cost bounded.
-    for _depth in range(4):
-        if not frontier:
-            break
-        try:
-            proc = subprocess.run(
-                ["pgrep", "-P", ",".join(str(p) for p in frontier)],
-                capture_output=True, text=True, timeout=2,
-            )
-        except Exception:
-            break
-        children = []
-        for line in proc.stdout.split():
-            try:
-                cpid = int(line)
-            except ValueError:
-                continue
-            if cpid in seen:
-                continue
-            seen.add(cpid)
-            children.append(cpid)
-            out.append(cpid)
-        frontier = children
-    return out
-
-
-def _process_name(pid: int) -> str:
-    """``ps -o comm=`` basename for ``pid``, or ``""``."""
-    try:
-        proc = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "comm="],
-            capture_output=True, text=True, timeout=2,
-        )
-    except Exception:
-        return ""
-    name = (proc.stdout or "").strip()
-    if not name:
-        return ""
-    # Strip absolute path; ps -o comm gives the full argv[0] path on
-    # macOS for some procs.
-    return name.rsplit("/", 1)[-1]
 
 
 def _process_cwd(pid: int) -> Path | None:

@@ -345,3 +345,73 @@ def tick_orientation(app, *, force: bool = False) -> None:
         app._last_orientation = want
     except Exception:
         log.exception("orientation swap failed")
+
+
+# Thresholds for the "claude is actively working" badge. 500 bytes /
+# 3 s discriminates an idle claude prompt (cursor blink + tiny status
+# refreshes, ~30-150 bytes per 3 s) from one that is streaming tokens
+# or running a tool (multi-kB/s). Constants at module scope so they're
+# easy to tune after dogfooding.
+_BADGE_OUTPUT_THRESHOLD_BYTES = 500
+_BADGE_OUTPUT_WINDOW_S = 3.0
+
+
+def tick_claude_badge(app) -> None:
+    """Show/hide the rotating Pokéball badge based on whether an agent
+    (``claude`` initially; future: also ``opencode``) is actively
+    producing output in the companion-chat PTY.
+
+    Two gates must both be true for the badge to show:
+
+      1. An agent process is running in the descendant tree of the
+         PTY child (``proc_tree.descendant_matches``).
+      2. The session has emitted more than
+         ``_BADGE_OUTPUT_THRESHOLD_BYTES`` bytes in the last
+         ``_BADGE_OUTPUT_WINDOW_S`` seconds.
+
+    Bails early when companion mode is off, the overlay is hidden, the
+    session singleton has never been created (chat panel never opened),
+    or the PTY has died. In every early-exit path we still drive the
+    badge to the off state so a stale "on" doesn't linger.
+    """
+    overlay = app._overlay
+    if not app._companion_mode or not overlay.visible:
+        if overlay.claude_badge_visible:
+            overlay.hide_claude_badge()
+        return
+
+    # IMPORTANT: peek at the singleton *without* spawning it. Calling
+    # ``get_session()`` lazily creates the PTY+screen/tmux on first
+    # invocation, which would materialise a shell every 5 s for users
+    # who never opened the chat panel. Reading the module-level
+    # ``_session`` directly is the only correct probe.
+    from tokenmon import claude_session
+    sess = claude_session._session
+    if sess is None or not sess.is_alive() or sess.pid is None:
+        if overlay.claude_badge_visible:
+            overlay.hide_claude_badge()
+        return
+
+    # When the PTY wraps `screen -DR` (or `tmux new-session -A`), the
+    # PTY child is a *client* — the server daemon runs in a separate
+    # process tree and owns the user's shells. ``agent_root_pid``
+    # resolves the correct root to walk; ``None`` means the wrapper's
+    # server isn't running yet, so there's no shell to host an agent.
+    root = sess.agent_root_pid()
+    if root is None:
+        if overlay.claude_badge_visible:
+            overlay.hide_claude_badge()
+        return
+
+    from tokenmon import proc_tree
+    agent_running = proc_tree.descendant_matches(root) is not None
+    output_busy = (
+        sess.recent_output_bytes(_BADGE_OUTPUT_WINDOW_S)
+        > _BADGE_OUTPUT_THRESHOLD_BYTES
+    )
+    want = agent_running and output_busy
+
+    if want and not overlay.claude_badge_visible:
+        overlay.show_claude_badge()
+    elif not want and overlay.claude_badge_visible:
+        overlay.hide_claude_badge()

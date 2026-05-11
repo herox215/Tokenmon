@@ -21,8 +21,10 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
@@ -52,6 +54,11 @@ TERMINATE_GRACE_S = 2.0
 # running processes via ``tmux new-session -A``.
 TMUX_SESSION_NAME = "tokenmon-companion"
 
+# How long to retain output-byte samples for the recent-activity window.
+# Sized a touch above the longest window ``recent_output_bytes`` callers
+# query (3 s today) so the queries don't have to re-trim on every call.
+ACTIVITY_RETENTION_S = 10.0
+
 
 class SessionUnavailable(RuntimeError):
     """Raised when neither a tmux-wrapped shell nor a plain shell can be
@@ -70,6 +77,76 @@ def _resolve_shell() -> str:
         if shutil.which(fallback):
             return fallback
     raise SessionUnavailable("no usable shell on PATH")
+
+
+def _screen_server_pid(session_name: str) -> int | None:
+    """Return the PID of the GNU ``screen`` server for ``session_name``,
+    or ``None`` if no matching session exists.
+
+    ``screen -ls`` lists sessions as ``<server_pid>.<session_name>``;
+    we parse out the PID for the entry whose tail matches our name.
+    ``screen -ls`` exits with rc=1 even on success (legacy behaviour),
+    so we don't gate on the return code.
+    """
+    if shutil.which("screen") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["screen", "-ls"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return None
+    for raw_line in (proc.stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line or not line[0].isdigit():
+            continue
+        # Format: "12345.tokenmon-companion\t(Attached)" — tab-separated.
+        # First whitespace-delimited token is the <pid>.<name>.
+        head = line.split()[0]
+        if "." not in head:
+            continue
+        pid_str, _, name = head.partition(".")
+        if name != session_name:
+            continue
+        try:
+            return int(pid_str)
+        except ValueError:
+            continue
+    return None
+
+
+def _tmux_server_pid(session_name: str) -> int | None:
+    """Return the tmux server's PID, or ``None`` if no tmux server /
+    matching session is running.
+
+    tmux's ``#{pid}`` format variable resolves to the server PID; we
+    filter to the session we own so multiple unrelated tmux servers on
+    the same machine don't get conflated.
+    """
+    if shutil.which("tmux") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "tmux",
+                "list-sessions",
+                "-F", "#{session_name}\t#{pid}",
+            ],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in (proc.stdout or "").splitlines():
+        name, _, pid_str = line.partition("\t")
+        if name == session_name:
+            try:
+                return int(pid_str)
+            except ValueError:
+                return None
+    return None
 
 
 def _default_shell_command() -> list[str]:
@@ -159,6 +236,13 @@ class ClaudeSession:
         self._listeners: list[Listener] = []
         self._listeners_lock = threading.RLock()
         self._closed = False
+        # Rolling output-byte log for ``recent_output_bytes``. Populated
+        # by the reader thread on every chunk; pruned in-place to
+        # ``ACTIVITY_RETENTION_S`` of history. The lock guards both the
+        # deque mutation and the windowed read so we never iterate
+        # while the reader appends.
+        self._activity_buf: deque[tuple[float, int]] = deque()
+        self._activity_lock = threading.Lock()
 
     # --- public state --------------------------------------------------
 
@@ -176,6 +260,68 @@ class ClaudeSession:
         right directory was picked.
         """
         return self._cwd_source
+
+    @property
+    def pid(self) -> int | None:
+        """PID of the local PTY child, or ``None`` before ``start()`` /
+        after ``close()``.
+
+        Exposed for the menubar tick that walks the descendant tree to
+        detect a running agent — reaching into ``self._proc.pid`` from
+        outside the session module would be a private-attribute trap.
+        """
+        proc = self._proc
+        if proc is None or self._closed:
+            return None
+        return int(proc.pid)
+
+    def agent_root_pid(self) -> int | None:
+        """PID to walk for "is an agent running inside this session?".
+
+        Most callers want to know whether claude (or another agent) is a
+        descendant of the user's interactive shell. With a bare-shell
+        PTY that's just ``self.pid``. With tmux or GNU screen wrapping,
+        the PTY child is the *client* — it has no shell descendants of
+        its own because the **server** (tmux daemon / screen server)
+        owns the shells in a separate process tree. We resolve the
+        server PID via the wrapper's own introspection commands.
+
+        Returns ``None`` if the wrapper command is recognised but its
+        server can't be located (server died, no session yet).
+        """
+        if self.pid is None:
+            return None
+        argv0 = self._command[0] if self._command else ""
+        basename = argv0.rsplit("/", 1)[-1] if argv0 else ""
+
+        if basename == "screen":
+            return _screen_server_pid(TMUX_SESSION_NAME)
+        if basename == "tmux":
+            return _tmux_server_pid(TMUX_SESSION_NAME)
+        # Bare shell (no multiplexer) — walk our own descendants.
+        return self.pid
+
+    def recent_output_bytes(self, window_s: float = 3.0) -> int:
+        """Total bytes received in the last ``window_s`` seconds.
+
+        Backed by a small rolling deque the reader thread appends to on
+        each chunk. The badge tick uses this with a 500 B / 3 s
+        threshold to discriminate "claude is generating tokens / running
+        a tool" from "claude is idle and the cursor is blinking".
+        """
+        if window_s <= 0:
+            return 0
+        now = time.monotonic()
+        cutoff = now - float(window_s)
+        with self._activity_lock:
+            # Prune entries older than retention; cheap because the
+            # deque is already sorted by insertion time.
+            retention_cutoff = now - ACTIVITY_RETENTION_S
+            while self._activity_buf and self._activity_buf[0][0] < retention_cutoff:
+                self._activity_buf.popleft()
+            return sum(
+                count for ts, count in self._activity_buf if ts >= cutoff
+            )
 
     # --- lifecycle -----------------------------------------------------
 
@@ -325,6 +471,18 @@ class ClaudeSession:
             if not chunk:
                 # Should not happen in blocking mode but guard anyway.
                 continue
+            # Record byte count for the activity-rate gate. ``time.monotonic``
+            # is cheap; under the lock so the menubar tick never sees a
+            # half-appended entry.
+            now = time.monotonic()
+            with self._activity_lock:
+                self._activity_buf.append((now, len(chunk)))
+                retention_cutoff = now - ACTIVITY_RETENTION_S
+                while (
+                    self._activity_buf
+                    and self._activity_buf[0][0] < retention_cutoff
+                ):
+                    self._activity_buf.popleft()
             with self._listeners_lock:
                 listeners = list(self._listeners)
             for cb in listeners:

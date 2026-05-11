@@ -599,6 +599,200 @@ class _EvolutionHandler(NSObject):
         self._scheduleNext()
 
 
+# Badge geometry, sprite-relative. _BADGE_INSET is positive: an
+# overlap *into* the sprite (so the badge peeks under the sprite's
+# bottom-right corner rather than free-floating outside it).
+_BADGE_SIZE = 48
+_BADGE_INSET = 6
+
+
+class _PokeballBadgeHandler:
+    """Floating rotating-Pokéball window pinned to the companion sprite.
+
+    Owns its own borderless transparent click-through NSPanel — same
+    construction shape as ``_FloatingItemHandler`` so the badge composes
+    cleanly with the sprite window without interfering with mouse
+    routing.
+
+    Rotation is driven by a single ``CABasicAnimation`` on the image
+    view's CALayer (``transform.rotation.z``). Core Animation runs the
+    spin on the render server so the badge costs zero Python cycles
+    while visible — unlike the four NSTimer-driven handlers elsewhere
+    in this module, which all need per-frame Python logic for things
+    like wiggle amplitude decay or evolution silhouette swaps.
+    """
+
+    def __init__(self, overlay) -> None:
+        self._overlay = overlay
+        self._window: NSWindow | None = None
+        # The CALayer that actually holds the Pokéball image. We attach
+        # the rotation animation to this sublayer, NOT to the host view's
+        # backing layer — that one is managed by AppKit and would have
+        # its anchorPoint reset on layout, making the rotation drift
+        # off-centre. See ``_build_window`` for the layer-hosting setup.
+        self._spinner_layer = None
+
+    def start(self) -> None:
+        """Build the window (lazy) and install the spin animation."""
+        if self._window is None:
+            self._build_window()
+            self._install_spin()
+        try:
+            # orderFrontRegardless — non-key, non-activating; the chat
+            # panel / sprite still keep their focus state.
+            if self._window is not None:
+                self._window.orderFrontRegardless()
+        except Exception:
+            log.exception("badge order-front failed")
+
+    def stop(self) -> None:
+        """Tear the window down. The CABasicAnimation dies with the
+        layer, which dies with the view, which dies with the window —
+        no explicit ``removeAnimationForKey_`` needed."""
+        if self._window is not None:
+            try:
+                self._window.orderOut_(None)
+                self._window.close()
+            except Exception:
+                log.exception("badge close failed")
+        self._window = None
+        self._spinner_layer = None
+
+    def set_alpha(self, alpha: float) -> None:
+        """Mirror the sprite's effective alpha onto the badge window.
+
+        Driven by ``PokemonOverlay._apply_alpha`` so the badge fades
+        and un-fades in lock-step with the companion sprite — cursor
+        proximity + night-mood share one pipeline.
+        """
+        if self._window is None:
+            return
+        try:
+            self._window.setAlphaValue_(max(0.0, min(1.0, float(alpha))))
+        except Exception:
+            log.exception("badge setAlphaValue_ failed")
+
+    def reposition_to_sprite_frame(self, rect, *, animate: bool = False) -> None:
+        """Pin the badge to the bottom-right of ``rect`` with overlap.
+
+        ``rect`` is the sprite window's frame in AppKit screen coords.
+        Caller supplies ``animate=True`` to match a sprite slide
+        animation — the badge then animates its frame in lockstep
+        (~250 ms, Cocoa default).
+        """
+        if self._window is None:
+            return
+        sx = float(rect.origin.x)
+        sy = float(rect.origin.y)
+        sw = float(rect.size.width)
+        # Bottom-right corner with inward overlap on both axes.
+        bx = sx + sw - _BADGE_SIZE + _BADGE_INSET
+        by = sy - _BADGE_INSET
+        frame = NSMakeRect(bx, by, _BADGE_SIZE, _BADGE_SIZE)
+        try:
+            self._window.setFrame_display_animate_(frame, True, bool(animate))
+        except Exception:
+            log.exception("badge reposition failed")
+
+    def _build_window(self) -> None:
+        rect = NSMakeRect(0, 0, _BADGE_SIZE, _BADGE_SIZE)
+        # Same flags as ``_FloatingItemHandler`` so the badge behaves
+        # like a sibling of the sprite window across every Space and
+        # never steals mouse events.
+        win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect, NSWindowStyleMaskBorderless, NSBackingStoreBuffered, False,
+        )
+        win.setOpaque_(False)
+        win.setBackgroundColor_(NSColor.clearColor())
+        win.setHasShadow_(False)
+        win.setIgnoresMouseEvents_(True)
+        win.setMovable_(False)
+        win.setLevel_(NSFloatingWindowLevel)
+        win.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorIgnoresCycle
+            | NSWindowCollectionBehaviorTransient
+        )
+        win.setReleasedWhenClosed_(False)
+
+        # Layer-HOSTING view (not layer-backed): we own the layer
+        # entirely. AppKit doesn't auto-manage its geometry — without
+        # this, the host's anchorPoint gets reset on layout and the
+        # rotation drifts off-centre. The order matters: setLayer_
+        # *before* setWantsLayer_(True) switches the view into hosting
+        # mode (the opposite of the usual layer-backed setup).
+        from Quartz import CALayer  # type: ignore
+
+        container = NSView.alloc().initWithFrame_(rect)
+        host = CALayer.layer()
+        host.setFrame_(rect)
+        container.setLayer_(host)
+        container.setWantsLayer_(True)
+
+        # The rotating sublayer. AppKit doesn't touch sublayers we
+        # add ourselves, so the anchorPoint we set here is permanent
+        # and the spin pivots around the badge centre.
+        spinner = CALayer.layer()
+        spinner.setFrame_(rect)
+        spinner.setAnchorPoint_((0.5, 0.5))
+        half = float(_BADGE_SIZE) / 2.0
+        spinner.setPosition_((half, half))
+        spinner.setMagnificationFilter_("nearest")
+        spinner.setMinificationFilter_("nearest")
+
+        # NSImage → CGImage so the sublayer can render it as its
+        # ``contents``. TIFFRepresentation + NSBitmapImageRep is the
+        # boring, no-deprecation-warnings route; works for any image
+        # loaded via NSImage.
+        cg = None
+        try:
+            from tokenmon import items_remote
+            img = items_remote.get_sprite_by_name("poke-ball")
+            if img is not None:
+                from AppKit import NSBitmapImageRep  # type: ignore
+                tiff = img.TIFFRepresentation()
+                if tiff is not None:
+                    rep = NSBitmapImageRep.alloc().initWithData_(tiff)
+                    if rep is not None:
+                        cg = rep.CGImage()
+        except Exception:
+            log.exception("badge sprite load failed")
+        if cg is not None:
+            spinner.setContents_(cg)
+
+        host.addSublayer_(spinner)
+        win.setContentView_(container)
+
+        self._window = win
+        self._spinner_layer = spinner
+
+    def _install_spin(self) -> None:
+        """Attach the infinite z-rotation animation to the spinner sublayer.
+
+        We animate the *sublayer* (which we own) rather than the host
+        view's backing layer (which AppKit manages). The sublayer's
+        anchorPoint stays put at (0.5, 0.5) and Core Animation pivots
+        the rotation around its centre.
+        """
+        layer = self._spinner_layer
+        if layer is None:
+            return
+        try:
+            import math
+            from Quartz import CABasicAnimation  # type: ignore
+            anim = CABasicAnimation.animationWithKeyPath_("transform.rotation.z")
+            anim.setFromValue_(0.0)
+            anim.setToValue_(-2.0 * math.pi)  # negative → clockwise
+            anim.setDuration_(1.6)
+            anim.setRepeatCount_(float("inf"))
+            anim.setRemovedOnCompletion_(False)
+            layer.addAnimation_forKey_(anim, "spin")
+        except Exception:
+            log.exception("badge spin install failed")
+
+
 def _position_for(corner: str, screen_frame, size: int, margin: int) -> tuple[float, float]:
     sx, sy, sw, sh = (
         screen_frame.origin.x, screen_frame.origin.y,
@@ -685,6 +879,11 @@ class PokemonOverlay:
         self._chat_window_delegate: _ChatWindowDelegate | None = None
         self._chat_outside_monitor = None
         self._sprite_click_monitor = None
+        # Strong-ref to the rotating Pokéball badge that signals
+        # "claude is actively working" in the companion terminal.
+        # The handler owns its own NSPanel + CABasicAnimation; without
+        # the strong-ref PyObjC would GC it and the window would close.
+        self._claude_badge_handler: _PokeballBadgeHandler | None = None
 
     def _ensure_window(self) -> None:
         if self._window is not None:
@@ -730,6 +929,7 @@ class PokemonOverlay:
             return
         x, y = _position_for(self._corner, screen.visibleFrame(), self._size, self._margin)
         self._window.setFrameOrigin_((x, y))
+        self._reposition_claude_badge(animate=False)
 
     def move_to(self, x: float, y: float, *, animate: bool = True) -> None:
         """Slide the overlay to absolute AppKit coordinates ``(x, y)``.
@@ -746,6 +946,7 @@ class PokemonOverlay:
             self._window.setFrame_display_animate_(rect, True, bool(animate))
         except Exception:
             log.exception("move_to failed")
+        self._reposition_claude_badge(animate=animate)
 
     def move_to_corner(self, *, animate: bool = True) -> None:
         """Slide back to the configured screen corner. Used when the user
@@ -759,6 +960,22 @@ class PokemonOverlay:
             self._corner, screen.visibleFrame(), self._size, self._margin,
         )
         self.move_to(x, y, animate=animate)
+
+    def _reposition_claude_badge(self, *, animate: bool) -> None:
+        """Pin the claude-active badge to the sprite's current frame.
+
+        Called from each of the three sprite-move sites (`_reposition`,
+        `move_to`, `move_to_corner`). No-op when the badge isn't visible.
+        """
+        handler = self._claude_badge_handler
+        if handler is None or self._window is None:
+            return
+        try:
+            handler.reposition_to_sprite_frame(
+                self._window.frame(), animate=animate,
+            )
+        except Exception:
+            log.exception("badge follow-sprite failed")
 
     def update_sprite(
         self,
@@ -914,6 +1131,7 @@ class PokemonOverlay:
             self._window.orderOut_(None)
         self._remove_sprite_click_monitor()
         self.hide_chat()
+        self.hide_claude_badge()
         self._visible = False
 
     def set_persistent(self, persistent: bool) -> None:
@@ -930,6 +1148,41 @@ class PokemonOverlay:
             self._remove_sprite_click_monitor()
         if not self._persistent:
             self.hide_chat()
+            self.hide_claude_badge()
+
+    # --- Claude-active badge --------------------------------------------
+
+    @property
+    def claude_badge_visible(self) -> bool:
+        """True iff the rotating-Pokéball "claude is working" badge is up."""
+        return self._claude_badge_handler is not None
+
+    def show_claude_badge(self) -> None:
+        """Show the rotating Pokéball badge anchored to the sprite's
+        bottom-right corner. Idempotent. No-op when the sprite window
+        doesn't exist (companion mode off / overlay hidden)."""
+        if self._window is None:
+            return
+        if self._claude_badge_handler is not None:
+            return
+        handler = _PokeballBadgeHandler(self)
+        handler.start()
+        handler.reposition_to_sprite_frame(self._window.frame(), animate=False)
+        # Seed the badge alpha to the sprite's current effective value so
+        # it doesn't pop in at 1.0 while the cursor is hovering near.
+        handler.set_alpha(self._mood_alpha * self._proximity_alpha)
+        self._claude_badge_handler = handler
+
+    def hide_claude_badge(self) -> None:
+        """Tear down the badge window. Idempotent."""
+        handler = self._claude_badge_handler
+        if handler is None:
+            return
+        try:
+            handler.stop()
+        except Exception:
+            log.exception("claude badge stop failed")
+        self._claude_badge_handler = None
 
     # --- Companion chat --------------------------------------------------
 
@@ -1352,6 +1605,17 @@ class PokemonOverlay:
             self._window.setAlphaValue_(alpha)
         except Exception:
             log.exception("setAlphaValue_ failed")
+        # Mirror the alpha onto the claude-active badge so it fades with
+        # the sprite on cursor proximity (and dims with night-mode mood).
+        # The badge handler owns a separate NSWindow so we have to push
+        # the value explicitly — it doesn't inherit window-level alpha
+        # from the sprite.
+        handler = self._claude_badge_handler
+        if handler is not None:
+            try:
+                handler.set_alpha(alpha)
+            except Exception:
+                log.exception("badge alpha sync failed")
 
     # --- Generic alert flash ---------------------------------------------
 

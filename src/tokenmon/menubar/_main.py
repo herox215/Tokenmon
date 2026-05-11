@@ -322,6 +322,7 @@ class TokenmonApp(rumps.App):
         _ticks.tick_mood(self)
         _ticks.tick_dock(self)
         _ticks.tick_orientation(self)
+        _ticks.tick_claude_badge(self)
         if self._last_known_level != prev_level:
             # Refresh now so the menubar title picks up the new level immediately
             # (otherwise we'd wait up to 30s for the next refresh).
