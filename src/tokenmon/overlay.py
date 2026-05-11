@@ -19,6 +19,7 @@ from AppKit import (
     NSCompositingOperationSourceAtop,
     NSCompositingOperationSourceOver,
     NSFloatingWindowLevel,
+    NSPopUpMenuWindowLevel,
     NSFont,
     NSGraphicsContext,
     NSImage,
@@ -53,7 +54,7 @@ from AppKit import (
     NSEventMaskOtherMouseDown,
     NSEventMaskRightMouseDown,
 )
-from Foundation import NSMakeRect, NSMakeSize, NSObject
+from Foundation import NSDate, NSMakeRect, NSMakeSize, NSObject
 from AppKit import NSAnimationContext
 
 log = logging.getLogger("tokenmon.overlay")
@@ -70,7 +71,6 @@ CHAT_MAX_WIDTH = 900
 CHAT_MIN_HEIGHT = 300
 CHAT_MAX_HEIGHT = 440
 CHAT_BOTTOM_MARGIN = 44
-CHAT_MORPH_SIZE = 36
 
 # Evolution sequence: (delay_before_step_seconds, step_name).
 # Mirrors the Gen-3 Pokémon evolution feel: silhouette flicker that accelerates
@@ -159,16 +159,47 @@ def _chat_frame_for_screen(screen_frame):
     return NSMakeRect(x, y, width, height)
 
 
-def _chat_start_frame(sprite_frame, final_frame):
-    """Tiny origin frame for the open animation, centred on the sprite."""
-    cx = float(sprite_frame.origin.x) + float(sprite_frame.size.width) / 2.0
-    cy = float(sprite_frame.origin.y) + float(sprite_frame.size.height) / 2.0
-    size = min(
-        CHAT_MORPH_SIZE,
+def _chat_start_frame(final_frame):
+    """Offscreen frame below the final position so the panel slides up into view."""
+    return NSMakeRect(
+        float(final_frame.origin.x),
+        float(final_frame.origin.y) - float(final_frame.size.height),
         float(final_frame.size.width),
         float(final_frame.size.height),
     )
-    return NSMakeRect(cx - size / 2.0, cy - size / 2.0, size, size)
+
+
+# Vertical gap between the chat panel's top edge and the sprite's
+# bottom. Used instead of an overlap because the sprite + chat share
+# the floating window level — any overlap would put the sprite's lower
+# half behind the chat panel (the chat is most-recently-front-ordered
+# at show time). A small positive gap also leaves room for BOB's ±3 px
+# breath sine without dipping into the chat.
+_CHAT_SPRITE_GAP_PX = 6
+# Horizontal inset from the chat panel's right edge so the sprite isn't
+# flush with the macOS window-shadow gradient.
+_CHAT_SPRITE_RIGHT_INSET = 8
+
+
+def _sprite_origin_for_chat(chat_frame, sprite_size: int) -> tuple[float, float]:
+    """Top-right anchor of ``chat_frame`` with the sprite resting just
+    above the panel's top edge. AppKit origin is bottom-left, so y
+    grows upward.
+
+    Pure function — no AppKit calls — so it's covered by a unit test.
+    """
+    chat_x = float(chat_frame.origin.x)
+    chat_y = float(chat_frame.origin.y)
+    chat_w = float(chat_frame.size.width)
+    chat_h = float(chat_frame.size.height)
+    size = float(sprite_size)
+    x = chat_x + chat_w - size - _CHAT_SPRITE_RIGHT_INSET
+    # Sprite sits ABOVE the chat top with a small gap. Without this the
+    # bottom of the sprite ends up behind the chat panel because both
+    # windows live at NSFloatingWindowLevel and the chat is front-of-
+    # level after show_chat's makeKeyAndOrderFront_.
+    y = chat_y + chat_h + _CHAT_SPRITE_GAP_PX
+    return x, y
 
 
 class _ChatCardView(NSView):
@@ -195,6 +226,76 @@ class _ChatWindow(NSPanel):
 
     def worksWhenModal(self):  # noqa: N802
         return True
+
+    def constrainFrameRect_toScreen_(self, frame_rect, _screen):  # noqa: N802
+        # Default NSWindow behaviour clamps the frame onto the visible screen,
+        # which kills the slide-up: a start frame below visibleFrame gets
+        # snapped to the bottom of the screen before the animation begins.
+        return frame_rect
+
+
+class _ChatSlideHandler(NSObject):
+    """NSTimer-driven slide-up: interpolates window y from start to end.
+
+    macOS' built-in window animations (`animator().setFrame:`,
+    `setFrame:display:animate:`) refused to actually move our floating panel
+    — frame mutations through both paths snapped instantly to the target. A
+    manual ~60 Hz timer with ease-out cubic gives us a reliable slide and
+    co-animates alpha for a fade-in.
+    """
+
+    def initWithWindow_startFrame_endFrame_startAlpha_endAlpha_duration_onComplete_(  # noqa: N802
+        self, window, start_frame, end_frame, start_alpha, end_alpha, duration, on_complete,
+    ):
+        self = objc.super(_ChatSlideHandler, self).init()
+        if self is None:
+            return None
+        self._window = window
+        self._start_x = float(start_frame.origin.x)
+        self._start_y = float(start_frame.origin.y)
+        self._start_w = float(start_frame.size.width)
+        self._start_h = float(start_frame.size.height)
+        self._end_x = float(end_frame.origin.x)
+        self._end_y = float(end_frame.origin.y)
+        self._end_w = float(end_frame.size.width)
+        self._end_h = float(end_frame.size.height)
+        self._start_alpha = float(start_alpha)
+        self._end_alpha = float(end_alpha)
+        self._duration = float(duration)
+        self._on_complete = on_complete  # callable or None
+        self._t0 = NSDate.date().timeIntervalSinceReferenceDate()
+        self._timer = None
+        return self
+
+    def start(self):
+        self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0 / 60.0, self, "tick:", None, True,
+        )
+
+    def tick_(self, _timer):  # noqa: N802
+        now = NSDate.date().timeIntervalSinceReferenceDate()
+        t = (now - self._t0) / self._duration
+        if t >= 1.0:
+            t = 1.0
+        # ease-out cubic — fast at the start, soft landing at the end.
+        eased = 1.0 - (1.0 - t) ** 3
+        x = self._start_x + (self._end_x - self._start_x) * eased
+        y = self._start_y + (self._end_y - self._start_y) * eased
+        w = self._start_w + (self._end_w - self._start_w) * eased
+        h = self._start_h + (self._end_h - self._start_h) * eased
+        alpha = self._start_alpha + (self._end_alpha - self._start_alpha) * eased
+        self._window.setFrame_display_(NSMakeRect(x, y, w, h), True)
+        self._window.setAlphaValue_(alpha)
+        if t >= 1.0:
+            if self._timer is not None:
+                self._timer.invalidate()
+                self._timer = None
+            if self._on_complete is not None:
+                try:
+                    self._on_complete()
+                except Exception:
+                    log.exception("chat slide on_complete failed")
+                self._on_complete = None
 
 
 class _ChatWindowDelegate(NSObject):
@@ -878,6 +979,26 @@ class PokemonOverlay:
         self._chat_session = None  # claude_session.ClaudeSession | None
         self._chat_window_delegate: _ChatWindowDelegate | None = None
         self._chat_outside_monitor = None
+        # NSTimer-backed slide-up handler for the chat window opener;
+        # GC anchor so the timer keeps firing until the slide completes.
+        self._chat_slide_handler = None
+        # While the chat panel is on-screen the sprite is pinned to the
+        # top-right of that panel so the user has a visual anchor
+        # between the companion and its terminal. companion_drv.py
+        # checks this flag and skips its own bottom-right-of-focused-
+        # window docking while it's True — without that the periodic
+        # _tick_dock would yank the sprite back down within ~5 s.
+        self._sprite_pinned_to_chat: bool = False
+        # Callback the menubar installs so the sprite can be redocked
+        # immediately on chat close (rather than waiting up to 5 s for
+        # the next _tick_dock pass). Optional — overlay still works
+        # without it, the redock just lands on the next periodic tick.
+        self._on_chat_hidden = None  # type: ignore[assignment]
+        # Ambient idle animator (BOB / HOP / SHAKE / PACE) — lives in
+        # tokenmon.companion.chat_idle. Spawned by _dock_sprite_to_chat
+        # and torn down by _stop_chat_idle_animator. Strong-ref kept
+        # because the NSTimer target needs to outlive this method.
+        self._chat_idle_animator = None
         self._sprite_click_monitor = None
         # Strong-ref to the rotating Pokéball badge that signals
         # "claude is actively working" in the companion terminal.
@@ -947,6 +1068,80 @@ class PokemonOverlay:
         except Exception:
             log.exception("move_to failed")
         self._reposition_claude_badge(animate=animate)
+
+    def _dock_sprite_to_chat(self, chat_frame) -> None:
+        """Slide the companion sprite to the top-right of the chat panel
+        and set ``_sprite_pinned_to_chat`` so companion_drv stops
+        re-docking it to the focused window's bottom-right.
+
+        Animated — the move runs alongside the chat panel's own slide-up
+        so the two arrive together. Safe to call repeatedly (e.g. on a
+        reattach); idempotent at the position level because
+        ``setFrame_display_animate_`` lands on the same target both
+        times.
+
+        Spawns the ambient idle animator (BOB baseline + occasional
+        HOP/SHAKE/PACE) so the sprite *lives* on the chat panel
+        instead of standing still.
+        """
+        if self._window is None:
+            return
+        x, y = _sprite_origin_for_chat(chat_frame, self._size)
+        self._sprite_pinned_to_chat = True
+        # Lift the sprite above the chat panel's window level. Both
+        # windows otherwise live at NSFloatingWindowLevel, and the
+        # chat panel is most-recently-front-ordered → without this,
+        # any BOB dip or HOP that touches the chat's bounds would
+        # clip behind the panel. PopUpMenu level sits comfortably
+        # above floating and below status icons.
+        try:
+            self._window.setLevel_(NSPopUpMenuWindowLevel)
+        except Exception:
+            log.exception("sprite level lift failed")
+        self.move_to(x, y, animate=True)
+        # x-range for PACE — sprite must stay above the chat panel's
+        # horizontal extent. Match the dock helper's 8 px right inset
+        # on both sides so PACE doesn't slide the sprite over the
+        # window-shadow gradient.
+        chat_x = float(chat_frame.origin.x)
+        chat_w = float(chat_frame.size.width)
+        x_lo = chat_x + 8
+        x_hi = chat_x + chat_w - self._size - 8
+        if x_hi < x_lo:
+            x_lo = x_hi = x  # degenerate-narrow chat; pace becomes no-op
+        try:
+            from tokenmon.companion.chat_idle import ChatIdleAnimator
+            # Tear down any prior animator first (reattach path can
+            # call _dock_sprite_to_chat twice). ChatIdleAnimator.start
+            # is itself idempotent but we drop the old strong-ref
+            # here so PyObjC can GC it instead of leaking the
+            # NSTimer target.
+            self._stop_chat_idle_animator()
+            anim = ChatIdleAnimator.alloc().initWithWindow_anchor_xRange_(
+                self._window, (x, y), (x_lo, x_hi),
+            )
+            self._chat_idle_animator = anim
+            anim.start()
+        except Exception:
+            log.exception("chat idle animator start failed")
+
+    def _stop_chat_idle_animator(self) -> None:
+        anim = self._chat_idle_animator
+        if anim is None:
+            return
+        try:
+            anim.stop()
+        except Exception:
+            log.exception("chat idle animator stop failed")
+        self._chat_idle_animator = None
+        # Drop the sprite back to the default floating level so it
+        # doesn't sit above e.g. system pop-up menus once the chat is
+        # gone. Paired with the setLevel_ call in _dock_sprite_to_chat.
+        if self._window is not None:
+            try:
+                self._window.setLevel_(NSFloatingWindowLevel)
+            except Exception:
+                log.exception("sprite level restore failed")
 
     def move_to_corner(self, *, animate: bool = True) -> None:
         """Slide back to the configured screen corner. Used when the user
@@ -1232,10 +1427,7 @@ class PokemonOverlay:
         if screen is None:
             return
         final_frame = _chat_frame_for_screen(screen.visibleFrame())
-        if self._window is not None:
-            start_frame = _chat_start_frame(self._window.frame(), final_frame)
-        else:
-            start_frame = final_frame
+        start_frame = _chat_start_frame(final_frame)
 
         # Spawn (or reuse) the long-lived terminal session. If no shell
         # can be spawned we surface a graceful banner instead of
@@ -1347,17 +1539,29 @@ class PokemonOverlay:
             win.makeKeyWindow()
         except Exception:
             pass
+        # Manual NSTimer-driven slide: macOS' built-in window animations
+        # refused to move this floating panel, so we interpolate the frame
+        # ourselves at ~60 Hz. The handler is anchored on `self` to outlive
+        # this method.
         try:
-            NSAnimationContext.beginGrouping()
-            try:
-                NSAnimationContext.currentContext().setDuration_(0.22)
-                win.animator().setFrame_display_(final_frame, True)
-                win.animator().setAlphaValue_(1.0)
-            finally:
-                NSAnimationContext.endGrouping()
+            self._chat_slide_handler = (
+                _ChatSlideHandler.alloc().initWithWindow_startFrame_endFrame_startAlpha_endAlpha_duration_onComplete_(
+                    win, start_frame, final_frame, 0.0, 1.0, 0.28, None,
+                )
+            )
+            self._chat_slide_handler.start()
         except Exception:
+            log.exception("chat slide animation failed")
             win.setFrame_display_(final_frame, True)
             win.setAlphaValue_(1.0)
+        # Dock the companion sprite to the top-right of the chat panel
+        # so the two move together — visually links the Pokémon to the
+        # terminal it just summoned. companion_drv sees the pinned
+        # flag and stops re-docking while the chat is open.
+        try:
+            self._dock_sprite_to_chat(final_frame)
+        except Exception:
+            log.exception("dock sprite to chat failed")
         # Hand keyboard focus to the WKWebView so xterm.js receives
         # keystrokes immediately — without this the user has to click
         # inside the terminal before they can type.
@@ -1383,11 +1587,46 @@ class PokemonOverlay:
             log.exception("chat delegate reinstall failed")
 
         self._install_chat_outside_monitor()
+
+        # Recompute the final frame (display config / screen may have
+        # changed since last open) and park the window at the offscreen
+        # start position before ordering it front, so the slide-up
+        # handler has somewhere to slide from.
+        screen = win.screen() or NSScreen.mainScreen()
+        if screen is not None:
+            final_frame = _chat_frame_for_screen(screen.visibleFrame())
+            start_frame = _chat_start_frame(final_frame)
+            try:
+                win.setFrame_display_(start_frame, False)
+                win.setAlphaValue_(0.0)
+            except Exception:
+                log.exception("chat reattach start-frame failed")
+        else:
+            final_frame = None
+
         try:
             win.makeKeyAndOrderFront_(None)
             win.makeKeyWindow()
         except Exception:
             log.exception("chat re-order-front failed")
+
+        if final_frame is not None:
+            try:
+                self._chat_slide_handler = (
+                    _ChatSlideHandler.alloc().initWithWindow_startFrame_endFrame_startAlpha_endAlpha_duration_onComplete_(
+                        win, start_frame, final_frame, 0.0, 1.0, 0.28, None,
+                    )
+                )
+                self._chat_slide_handler.start()
+            except Exception:
+                log.exception("chat reattach slide failed")
+                win.setFrame_display_(final_frame, True)
+                win.setAlphaValue_(1.0)
+            try:
+                self._dock_sprite_to_chat(final_frame)
+            except Exception:
+                log.exception("dock sprite to chat on reattach failed")
+
         if self._terminal_view is not None:
             try:
                 win.makeFirstResponder_(self._terminal_view.view)
@@ -1423,6 +1662,21 @@ class PokemonOverlay:
             return
         if not win.isVisible():
             return
+        # Unpin the sprite and let the menubar redock it immediately to
+        # the focused window's bottom-right. Without this the periodic
+        # _tick_dock would do the redock with up to ~5 s of lag —
+        # firing the callback gives a smooth hand-off where the chat
+        # slides down and the sprite slides back at the same time.
+        # Stop the idle animator BEFORE clearing the pin so its final
+        # snap-to-anchor doesn't race the redock callback.
+        self._stop_chat_idle_animator()
+        was_pinned = self._sprite_pinned_to_chat
+        self._sprite_pinned_to_chat = False
+        if was_pinned and self._on_chat_hidden is not None:
+            try:
+                self._on_chat_hidden()
+            except Exception:
+                log.exception("chat-hidden callback raised")
         self._remove_chat_outside_monitor()
         try:
             # Drop the delegate so a stale ``windowDidResignKey:`` can't
@@ -1432,10 +1686,39 @@ class PokemonOverlay:
         except Exception:
             log.exception("chat delegate drop failed")
         self._chat_window_delegate = None
+
+        # Slide-down: mirror the slide-up by interpolating from the current
+        # frame down to a frame one panel-height below it, while fading
+        # alpha to 0. orderOut runs in the on_complete so the window
+        # actually disappears once the animation finishes.
         try:
-            win.orderOut_(None)
+            current_frame = win.frame()
+            below_frame = NSMakeRect(
+                float(current_frame.origin.x),
+                float(current_frame.origin.y) - float(current_frame.size.height),
+                float(current_frame.size.width),
+                float(current_frame.size.height),
+            )
+
+            def _finish_hide(w=win):
+                try:
+                    w.orderOut_(None)
+                except Exception:
+                    log.exception("chat orderOut failed")
+
+            self._chat_slide_handler = (
+                _ChatSlideHandler.alloc().initWithWindow_startFrame_endFrame_startAlpha_endAlpha_duration_onComplete_(
+                    win, current_frame, below_frame,
+                    float(win.alphaValue()), 0.0, 0.22, _finish_hide,
+                )
+            )
+            self._chat_slide_handler.start()
         except Exception:
-            log.exception("chat orderOut failed")
+            log.exception("chat slide-down failed")
+            try:
+                win.orderOut_(None)
+            except Exception:
+                log.exception("chat orderOut fallback failed")
         # NB: we deliberately do NOT call win.close() or null out
         # self._chat_window / self._terminal_view — they're meant to
         # survive across hide/show. Cleanup happens at app quit via
@@ -1447,6 +1730,8 @@ class PokemonOverlay:
         local PTY has died while the panel was hidden (the WKWebView is
         still bound to the corpse and would no-op on keystrokes).
         Idempotent."""
+        self._stop_chat_idle_animator()
+        self._sprite_pinned_to_chat = False
         self._remove_chat_outside_monitor()
         win = self._chat_window
         if win is not None:
@@ -1809,9 +2094,19 @@ class PokemonOverlay:
             return
         # Cancel a previous wiggle by overwriting the handler ref — the
         # old handler's fire_ early-exits when it sees a stranger.
-        current = self._window.frame()
-        ox = float(current.origin.x)
-        oy = float(current.origin.y)
+        # Origin source: while the chat-idle animator owns the window
+        # we'd otherwise latch onto a mid-BOB / mid-PACE position and
+        # snap there at the end of the wiggle. Read the animator's
+        # anchor instead so wiggle ends at the *stable* dock position.
+        # Also pause the animator so its 20 Hz ticks don't fight the
+        # wiggle's per-frame setFrameOrigin.
+        if self._chat_idle_animator is not None:
+            ox, oy = self._chat_idle_animator.anchor()
+            self._stop_chat_idle_animator()
+        else:
+            current = self._window.frame()
+            ox = float(current.origin.x)
+            oy = float(current.origin.y)
         handler = _WiggleHandler.alloc().initWithOverlay_originX_originY_amplitude_frames_(
             self, ox, oy, amplitude_px, frames,
         )

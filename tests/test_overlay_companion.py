@@ -89,19 +89,17 @@ def test_chat_frame_is_bottom_centered_and_roughly_40_percent_width():
     assert frame.origin.y == CHAT_BOTTOM_MARGIN
 
 
-def test_chat_start_frame_centers_on_sprite():
+def test_chat_start_frame_sits_below_final_for_slide_up():
     from Foundation import NSMakeRect
-    from tokenmon.overlay import CHAT_MORPH_SIZE, _chat_start_frame
+    from tokenmon.overlay import _chat_start_frame
 
-    start = _chat_start_frame(
-        NSMakeRect(100, 200, 128, 128),
-        NSMakeRect(510, 44, 900, 410),
-    )
+    final = NSMakeRect(510, 44, 900, 410)
+    start = _chat_start_frame(final)
 
-    assert start.size.width == CHAT_MORPH_SIZE
-    assert start.size.height == CHAT_MORPH_SIZE
-    assert start.origin.x == 100 + 64 - CHAT_MORPH_SIZE / 2
-    assert start.origin.y == 200 + 64 - CHAT_MORPH_SIZE / 2
+    assert start.size.width == final.size.width
+    assert start.size.height == final.size.height
+    assert start.origin.x == final.origin.x
+    assert start.origin.y == final.origin.y - final.size.height
 
 
 def test_companion_double_click_toggles_chat():

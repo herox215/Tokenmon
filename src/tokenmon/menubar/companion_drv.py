@@ -11,6 +11,7 @@ screen).
 State stays on TokenmonApp:
   - ``app._companion_mode`` / ``app._overlay``
   - ``app._input_monitor`` / ``app._active_app_observer``  (PyObjC GC anchors)
+  - ``app._chat_hotkey`` (Carbon RegisterEventHotKey ref for ⌘⇧Space)
   - ``app._last_dock_rect`` / ``app._last_dock_check_mono`` (drift detection
     + per-keystroke throttle)
 """
@@ -93,6 +94,46 @@ def uninstall_input_monitor(app) -> None:
     app._input_monitor = None
 
 
+def install_chat_hotkey(app) -> None:
+    """Register ⌘⇧Space as a system-wide hotkey that toggles the
+    companion chat. The hotkey lives on the app for as long as
+    companion mode is on — `toggle_companion` unregisters it when the
+    feature is switched off so we don't keep eating ⌘⇧Space when the
+    chat panel is unreachable anyway."""
+    if getattr(app, "_chat_hotkey", None) is not None:
+        return
+    try:
+        from tokenmon.companion.hotkey import (
+            GlobalHotKey,
+            cmdKey,
+            kVK_Space,
+            shiftKey,
+        )
+
+        def _on_press() -> None:
+            try:
+                app._overlay.toggle_chat()
+            except Exception:
+                log.exception("hotkey toggle_chat failed")
+
+        hk = GlobalHotKey(kVK_Space, cmdKey | shiftKey, on_press=_on_press)
+        if hk.start():
+            app._chat_hotkey = hk
+    except Exception:
+        log.exception("install chat hotkey failed")
+
+
+def uninstall_chat_hotkey(app) -> None:
+    hk = getattr(app, "_chat_hotkey", None)
+    if hk is None:
+        return
+    try:
+        hk.stop()
+    except Exception:
+        log.exception("stop chat hotkey failed")
+    app._chat_hotkey = None
+
+
 def install_active_app_observer(app) -> None:
     if app._active_app_observer is not None:
         return
@@ -164,7 +205,16 @@ def dock_to_focused_window(app, *, force: bool = False) -> None:
     different display than the current one.
 
     ``force=True`` re-issues the move even if the rect is unchanged.
+
+    While the companion chat is open the sprite is pinned to the
+    top-right of that panel (see ``PokemonOverlay._dock_sprite_to_chat``).
+    Skip all docking in that mode so the periodic _tick_dock /
+    on_input redocks don't yank the sprite back down. The pin is
+    cleared by ``hide_chat``, which also fires the redock callback
+    we install in _main.py for an immediate hand-off.
     """
+    if getattr(app._overlay, "_sprite_pinned_to_chat", False):
+        return
     try:
         from tokenmon.companion.window_geom import (
             focused_window_bounds, frontmost_pid, screen_containing_point,

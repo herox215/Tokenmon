@@ -93,6 +93,13 @@ class TokenmonApp(rumps.App):
             size=int(config.get("overlay_size") or 128),
             corner=str(config.get("overlay_corner") or "bottom-right"),
         )
+        # Immediate redock when the chat panel closes — otherwise the
+        # sprite would sit where the chat used to be until the next
+        # _tick_dock pass (up to 5 s later). Wired here so the overlay
+        # stays decoupled from the menubar driver.
+        self._overlay._on_chat_hidden = (
+            lambda: _companion_drv.dock_to_focused_window(self, force=True)
+        )
         self._companion_mode = bool(config.get("companion_mode"))
         self._use_weather = bool(config.get("use_weather"))
         # Wire companion-mode persistence into the overlay so level-up /
@@ -104,6 +111,10 @@ class TokenmonApp(rumps.App):
         # PyObjC doesn't GC them.
         self._active_app_observer = None
         self._input_monitor = None
+        # Carbon RegisterEventHotKey handle for ⌘⇧Space → toggle chat.
+        # Installed alongside the input monitor when companion mode is
+        # on (companion_drv.install_chat_hotkey).
+        self._chat_hotkey = None
         # Tracks which orientation the overlay last rendered ("front"/"back")
         # so the 5-s tick doesn't redundantly reload sprite paths every poll
         # when nothing changed.
@@ -125,6 +136,7 @@ class TokenmonApp(rumps.App):
                 self._overlay.show()
                 _companion_drv.install_active_app_observer(self)
                 _companion_drv.install_input_monitor(self)
+                _companion_drv.install_chat_hotkey(self)
             except Exception:
                 log.exception("companion overlay show on init failed")
         # Level-up detection state. The overlay never appears outside of
@@ -355,6 +367,7 @@ class TokenmonApp(rumps.App):
                 self._overlay.show()
                 _companion_drv.install_active_app_observer(self)
                 _companion_drv.install_input_monitor(self)
+                _companion_drv.install_chat_hotkey(self)
                 # Seed orientation + position from whatever app is currently
                 # in front so we don't wait for the next activation event.
                 _companion_drv.on_active_app_changed(
@@ -365,6 +378,7 @@ class TokenmonApp(rumps.App):
         else:
             _companion_drv.uninstall_active_app_observer(self)
             _companion_drv.uninstall_input_monitor(self)
+            _companion_drv.uninstall_chat_hotkey(self)
             self._last_orientation = None
             # Don't yank a level-up animation mid-flight; the next
             # _end_level_up / _end_evolution will hide it now that
