@@ -198,7 +198,6 @@ class ClaudeSession:
         *,
         command: list[str] | None = None,
         cwd: Path | None = None,
-        cwd_source: str = "default",
         env: dict[str, str] | None = None,
         rows: int = DEFAULT_ROWS,
         cols: int = DEFAULT_COLS,
@@ -211,12 +210,7 @@ class ClaudeSession:
         if command is None:
             command = _default_shell_command()
         self._command = list(command)
-        # Both ``cwd`` and ``cwd_source`` are exposed publicly via
-        # @property — the chat panel renders the source string in its
-        # debug label so users can see which resolver stage picked
-        # this directory.
         self._cwd = cwd or Path.home()
-        self._cwd_source = cwd_source
         # Full UTF-8 + a recognisable TERM so claude renders colours and
         # the fancy box-drawing characters its TUI relies on. We also
         # tell node not to fall back to ASCII when stdout isn't a TTY
@@ -248,18 +242,8 @@ class ClaudeSession:
 
     @property
     def cwd(self) -> Path:
-        """Working directory the ``claude`` child was spawned in."""
+        """Working directory the local PTY child was spawned in."""
         return self._cwd
-
-    @property
-    def cwd_source(self) -> str:
-        """Short human-readable string describing how ``cwd`` was chosen.
-
-        Set by ``get_session`` from ``cwd_resolver.resolve()``; rendered
-        in the chat panel's debug label so users can verify the
-        right directory was picked.
-        """
-        return self._cwd_source
 
     @property
     def pid(self) -> int | None:

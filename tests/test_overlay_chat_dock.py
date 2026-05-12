@@ -50,26 +50,62 @@ def test_sprite_origin_for_chat_returns_floats():
     assert isinstance(y, float)
 
 
-def test_dock_sprite_to_chat_sets_pin_and_moves_window(monkeypatch):
+def test_dock_sprite_to_chat_sets_pin_and_arms_slide(monkeypatch):
     """The dock helper must set the pin flag (so companion_drv skips
-    its own docking) and trigger an animated move to the computed
-    position. We stub move_to to capture coordinates without touching
-    AppKit."""
+    its own docking) and arm a _ChatSlideHandler that targets the
+    computed top-right anchor. We stub the slide handler so the real
+    AppKit machinery (NSTimer, NSWindow.frame) never runs.
+    """
+    import tokenmon.overlay as overlay_mod
     from tokenmon.overlay import PokemonOverlay, _sprite_origin_for_chat
+
+    captured: dict[str, object] = {}
+
+    class _FakeSlideHandler:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def initWithWindow_startFrame_endFrame_startAlpha_endAlpha_duration_onComplete_(  # noqa: N802
+            self, window, start_frame, end_frame,
+            start_alpha, end_alpha, duration, on_complete,
+        ):
+            captured["window"] = window
+            captured["end_frame"] = end_frame
+            captured["duration"] = duration
+            captured["on_complete"] = on_complete
+            return self
+
+        def start(self):
+            captured["started"] = True
+
+    class _FakeWindow:
+        def setLevel_(self, _level):  # noqa: N802
+            pass
+
+        def frame(self):
+            return _rect(0, 0, 128, 128)
+
+        def alphaValue(self):  # noqa: N802
+            return 1.0
+
+    monkeypatch.setattr(overlay_mod, "_ChatSlideHandler", _FakeSlideHandler)
+
     o = PokemonOverlay(size=128)
-    # Pretend the sprite window is alive — the dock helper bails when
-    # _window is None.
-    o._window = object()
-    calls: list[tuple[float, float, bool]] = []
-    monkeypatch.setattr(
-        o, "move_to",
-        lambda x, y, animate=True: calls.append((x, y, animate)),
-    )
+    o._window = _FakeWindow()
     chat = _rect(0, 0, 1200, 700)
     o._dock_sprite_to_chat(chat)
+
     assert o._sprite_pinned_to_chat is True
+    assert captured.get("started") is True
     expected_x, expected_y = _sprite_origin_for_chat(chat, 128)
-    assert calls == [(expected_x, expected_y, True)]
+    end_frame = captured["end_frame"]
+    assert end_frame.origin.x == expected_x
+    assert end_frame.origin.y == expected_y
+    assert end_frame.size.width == 128 and end_frame.size.height == 128
+    # Same duration as the chat-panel slide so the two animations
+    # arrive in sync.
+    assert captured["duration"] == 0.28
 
 
 def test_dock_sprite_to_chat_is_noop_without_window():

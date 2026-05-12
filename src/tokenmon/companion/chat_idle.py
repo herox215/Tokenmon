@@ -47,30 +47,41 @@ log = logging.getLogger("tokenmon.companion.chat_idle")
 # fast enough that the ±3 px BOB sine looks smooth rather than steppy.
 TICK_INTERVAL = 0.05
 
-# BOB — slow breathing motion.
-BOB_PERIOD_S = 2.4
-BOB_AMPLITUDE_PX = 3.0
+# BOB — breathing motion. A bit faster + taller than the old
+# 2.4 s / 3 px so a stationary sprite still reads as alive when the
+# user glances over from the terminal.
+BOB_PERIOD_S = 1.4
+BOB_AMPLITUDE_PX = 6.0
 
-# HOP — single ballistic arc.
+# HOP — single ballistic arc. Bumped from 18 px so excited little
+# hops actually read across the panel-sized sprite.
 HOP_DURATION_S = 0.6
-HOP_HEIGHT_PX = 18.0
+HOP_HEIGHT_PX = 26.0
 
 # SHAKE — short damped horizontal oscillation. Damping schedule mirrors
 # the existing _WiggleHandler so a SHAKE looks like a small head-shake
 # rather than a panic-jitter.
 SHAKE_DURATION_S = 0.3
-SHAKE_AMPLITUDE_PX = 5.0
+SHAKE_AMPLITUDE_PX = 7.0
 SHAKE_CYCLES = 3.0  # number of full ±swings inside the duration
 
 # PACE — horizontal slide to a new x inside the chat panel's range.
 PACE_DURATION_S = 0.8
 
 # How often a one-shot action fires while BOB is the active baseline.
-# Drawn uniformly from this range at the end of each one-shot (and once
-# at start()). Lower bound is high enough that the sprite has time to
-# settle visually; upper bound keeps the companion from feeling dead.
-NEXT_ACTION_MIN_S = 4.0
-NEXT_ACTION_MAX_S = 9.0
+# Drawn uniformly from this range at the end of each one-shot.
+# Tighter than the original 4–9 s window so the Pokémon feels like a
+# curious party member rather than a desktop ornament.
+NEXT_ACTION_MIN_S = 1.2
+NEXT_ACTION_MAX_S = 3.0
+
+# First-action delay applied once right after ``reset()`` — short
+# enough that the user sees a HOP / SHAKE / PACE within a beat of
+# the chat panel finishing its slide-in, instead of waiting up to
+# NEXT_ACTION_MAX_S of BOB-only time. Subsequent one-shots use the
+# steady-state range above.
+FIRST_ACTION_MIN_S = 0.35
+FIRST_ACTION_MAX_S = 1.1
 
 
 class Action(Enum):
@@ -107,15 +118,20 @@ class IdleStateMachine:
     _pace_target_x: float = 0.0
 
     def reset(self, now: float) -> None:
-        """Restart with BOB as the active state and the next one-shot
-        scheduled NEXT_ACTION_MIN..MAX seconds out. Called from
-        ``start()`` so the first tick after start picks up clean
+        """Restart with BOB as the active state and the *first* one-shot
+        scheduled FIRST_ACTION_MIN..MAX seconds out — much sooner than
+        the steady-state cadence so the companion springs to life
+        right after the chat panel finishes its dock animation. Called
+        from ``start()`` so the first tick after start picks up clean
         state."""
         self._t0 = now
         self._state = Action.BOB
         self._action_start_t = now
         self._action_end_t = now
-        self._next_action_t = now + self._roll_next_action_delay()
+        self._next_action_t = now + self._roll_first_action_delay()
+
+    def _roll_first_action_delay(self) -> float:
+        return self.rng.uniform(FIRST_ACTION_MIN_S, FIRST_ACTION_MAX_S)
 
     def _roll_next_action_delay(self) -> float:
         return self.rng.uniform(NEXT_ACTION_MIN_S, NEXT_ACTION_MAX_S)

@@ -31,11 +31,16 @@ _lock = threading.Lock()
 def get_session() -> ClaudeSession:
     """Return the live session, lazily spawning it on first call.
 
+    First start always lands in ``~`` — a plain terminal environment,
+    no peeking at the user's frontmost window or process tree. With
+    tmux on PATH subsequent restarts reattach to the same named
+    session so scrollback / running processes / cwd persist regardless
+    of where the user happened to be when they first opened the chat.
+
     If the previous local PTY died (e.g. the user typed ``exit`` inside
-    the shell) we transparently spawn a fresh one on the next call — the
-    chat panel should always reattach to a working terminal, not a
-    corpse. With tmux on PATH the new PTY attaches to the same named
-    session so the user's scrollback is preserved.
+    the shell) we transparently spawn a fresh one on the next call —
+    the chat panel should always reattach to a working terminal, not a
+    corpse.
 
     Raises ``SessionUnavailable`` if no shell can be spawned at all
     (highly unusual — see ``_resolve_shell``).
@@ -43,11 +48,8 @@ def get_session() -> ClaudeSession:
     global _session
     with _lock:
         if _session is None or not _session.is_alive():
-            from .cwd_resolver import resolve as resolve_cwd
-
-            cwd, cwd_source = resolve_cwd()
-            log.info("spawning companion terminal in %s (%s)", cwd, cwd_source)
-            _session = ClaudeSession(cwd=cwd, cwd_source=cwd_source)
+            log.info("spawning companion terminal (cwd=~)")
+            _session = ClaudeSession()
             _session.start()
         return _session
 

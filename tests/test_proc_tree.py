@@ -159,16 +159,3 @@ def test_descendant_matches_respects_custom_names():
     finally:
         child.terminate()
         child.wait(timeout=2)
-
-
-def test_cwd_resolver_still_uses_shared_helpers():
-    """Smoke: cwd_resolver re-exports proc_tree helpers and they still work.
-
-    Guards the extraction — if someone deletes the re-import in
-    cwd_resolver this test fails loudly instead of silently breaking
-    the spawn-cwd cascade.
-    """
-    from tokenmon.claude_session import cwd_resolver
-
-    assert cwd_resolver._list_descendants is proc_tree.list_descendants
-    assert cwd_resolver._process_name is proc_tree.process_name

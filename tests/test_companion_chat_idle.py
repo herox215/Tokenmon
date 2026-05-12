@@ -15,6 +15,8 @@ import random
 from tokenmon.companion.chat_idle import (
     BOB_AMPLITUDE_PX,
     BOB_PERIOD_S,
+    FIRST_ACTION_MAX_S,
+    FIRST_ACTION_MIN_S,
     HOP_DURATION_S,
     HOP_HEIGHT_PX,
     NEXT_ACTION_MAX_S,
@@ -58,11 +60,13 @@ def test_bob_amplitude_peaks_at_quarter_period():
 
 
 def test_next_action_scheduled_within_bounds():
-    """The first one-shot must land NEXT_ACTION_MIN..MAX seconds after
-    reset. Anything tighter would feel hyperactive; anything looser
-    would feel dead."""
+    """The *first* one-shot lands inside the FIRST_ACTION_* window —
+    sooner than steady-state so the sprite kicks into HOP/SHAKE/PACE
+    right after the chat panel finishes its dock slide, rather than
+    sitting through a long BOB-only stretch the user reads as 'frozen'.
+    """
     sm = _make()
-    assert NEXT_ACTION_MIN_S <= sm._next_action_t <= NEXT_ACTION_MAX_S
+    assert FIRST_ACTION_MIN_S <= sm._next_action_t <= FIRST_ACTION_MAX_S
 
 
 def test_one_shot_action_fires_on_schedule():

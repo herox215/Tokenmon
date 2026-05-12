@@ -169,6 +169,37 @@ def _chat_start_frame(final_frame):
     )
 
 
+def _screen_under_mouse():
+    """Return the NSScreen the mouse cursor is currently on, or None.
+
+    The chat panel is a global-hotkey trigger — the user expects it to
+    appear on the display they're looking at, not on whatever monitor
+    the companion sprite happens to live on. We iterate NSScreen.screens()
+    and pick the one whose frame contains ``NSEvent.mouseLocation()``;
+    AppKit's frame coords are bottom-up so a direct point-in-rect test
+    works without conversion.
+    """
+    try:
+        loc = NSEvent.mouseLocation()
+    except Exception:
+        return None
+    try:
+        screens = NSScreen.screens()
+    except Exception:
+        return None
+    for screen in screens or []:
+        frame = screen.frame()
+        x = float(loc.x)
+        y = float(loc.y)
+        left = float(frame.origin.x)
+        bottom = float(frame.origin.y)
+        right = left + float(frame.size.width)
+        top = bottom + float(frame.size.height)
+        if left <= x < right and bottom <= y < top:
+            return screen
+    return None
+
+
 # Vertical gap between the chat panel's top edge and the sprite's
 # bottom. Used instead of an overlap because the sprite + chat share
 # the floating window level — any overlap would put the sprite's lower
@@ -271,6 +302,19 @@ class _ChatSlideHandler(NSObject):
         self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             1.0 / 60.0, self, "tick:", None, True,
         )
+
+    def cancel(self):
+        """Tear down the timer mid-flight. Called when a new dock /
+        slide is scheduled before this one completed (e.g. user
+        toggles the chat panel rapidly). Drops the on_complete so it
+        doesn't fire after cancellation."""
+        if self._timer is not None:
+            try:
+                self._timer.invalidate()
+            except Exception:
+                log.exception("chat slide cancel failed")
+            self._timer = None
+        self._on_complete = None
 
     def tick_(self, _timer):  # noqa: N802
         now = NSDate.date().timeIntervalSinceReferenceDate()
@@ -999,6 +1043,12 @@ class PokemonOverlay:
         # and torn down by _stop_chat_idle_animator. Strong-ref kept
         # because the NSTimer target needs to outlive this method.
         self._chat_idle_animator = None
+        # _ChatSlideHandler instance that animates the sprite from its
+        # current position to the chat-panel dock target, started in
+        # lockstep with the chat panel's own slide handler so the two
+        # windows arrive together. Strong-ref so PyObjC doesn't GC the
+        # NSTimer target before its on_complete fires.
+        self._sprite_dock_handler = None
         self._sprite_click_monitor = None
         # Strong-ref to the rotating Pokéball badge that signals
         # "claude is actively working" in the companion terminal.
@@ -1074,19 +1124,24 @@ class PokemonOverlay:
         and set ``_sprite_pinned_to_chat`` so companion_drv stops
         re-docking it to the focused window's bottom-right.
 
-        Animated — the move runs alongside the chat panel's own slide-up
-        so the two arrive together. Safe to call repeatedly (e.g. on a
-        reattach); idempotent at the position level because
-        ``setFrame_display_animate_`` lands on the same target both
-        times.
+        The sprite slide is driven by the same NSTimer-based
+        ``_ChatSlideHandler`` the chat panel uses, with the same 0.28 s
+        duration and ease-out cubic curve. Both handlers are armed
+        back-to-back from ``show_chat`` so they tick in lockstep —
+        the panel and the sprite arrive at their targets visually
+        glued together rather than racing on independent curves.
 
-        Spawns the ambient idle animator (BOB baseline + occasional
-        HOP/SHAKE/PACE) so the sprite *lives* on the chat panel
-        instead of standing still.
+        Once the slide completes, hands off to the ambient idle
+        animator (BOB baseline + frequent HOP/SHAKE/PACE) so the
+        sprite *lives* on the chat panel instead of standing still.
+
+        Safe to call repeatedly (e.g. on a reattach); each call
+        invalidates any in-flight dock handler / idle animator before
+        starting a fresh one.
         """
         if self._window is None:
             return
-        x, y = _sprite_origin_for_chat(chat_frame, self._size)
+        target_x, target_y = _sprite_origin_for_chat(chat_frame, self._size)
         self._sprite_pinned_to_chat = True
         # Lift the sprite above the chat panel's window level. Both
         # windows otherwise live at NSFloatingWindowLevel, and the
@@ -1098,7 +1153,7 @@ class PokemonOverlay:
             self._window.setLevel_(NSPopUpMenuWindowLevel)
         except Exception:
             log.exception("sprite level lift failed")
-        self.move_to(x, y, animate=True)
+
         # x-range for PACE — sprite must stay above the chat panel's
         # horizontal extent. Match the dock helper's 8 px right inset
         # on both sides so PACE doesn't slide the sprite over the
@@ -1108,22 +1163,68 @@ class PokemonOverlay:
         x_lo = chat_x + 8
         x_hi = chat_x + chat_w - self._size - 8
         if x_hi < x_lo:
-            x_lo = x_hi = x  # degenerate-narrow chat; pace becomes no-op
+            x_lo = x_hi = target_x  # degenerate-narrow chat; pace no-op
+
+        # Stop any prior idle animator and dock handler first so they
+        # don't fight the fresh slide. The slide handler self-cancels
+        # on completion; dropping the strong-ref here lets PyObjC GC
+        # any leftover from a previous reattach.
+        self._stop_chat_idle_animator()
+        prior = self._sprite_dock_handler
+        if prior is not None:
+            try:
+                prior.cancel()
+            except Exception:
+                pass
+        self._sprite_dock_handler = None
+
         try:
-            from tokenmon.companion.chat_idle import ChatIdleAnimator
-            # Tear down any prior animator first (reattach path can
-            # call _dock_sprite_to_chat twice). ChatIdleAnimator.start
-            # is itself idempotent but we drop the old strong-ref
-            # here so PyObjC can GC it instead of leaking the
-            # NSTimer target.
-            self._stop_chat_idle_animator()
-            anim = ChatIdleAnimator.alloc().initWithWindow_anchor_xRange_(
-                self._window, (x, y), (x_lo, x_hi),
-            )
-            self._chat_idle_animator = anim
-            anim.start()
+            start_frame = self._window.frame()
         except Exception:
-            log.exception("chat idle animator start failed")
+            log.exception("sprite frame read failed")
+            return
+        end_frame = NSMakeRect(target_x, target_y, self._size, self._size)
+        try:
+            current_alpha = float(self._window.alphaValue())
+        except Exception:
+            current_alpha = 1.0
+
+        def _on_dock_complete():
+            # Keep the badge with the sprite once it's settled. We
+            # didn't animate the badge during the slide (it'd lag a
+            # frame behind the manual interpolator) — re-anchor now.
+            try:
+                self._reposition_claude_badge(animate=False)
+            except Exception:
+                log.exception("badge reposition after dock failed")
+            try:
+                from tokenmon.companion.chat_idle import ChatIdleAnimator
+                anim = ChatIdleAnimator.alloc().initWithWindow_anchor_xRange_(
+                    self._window, (target_x, target_y), (x_lo, x_hi),
+                )
+                self._chat_idle_animator = anim
+                anim.start()
+            except Exception:
+                log.exception("chat idle animator start failed")
+
+        try:
+            self._sprite_dock_handler = (
+                _ChatSlideHandler.alloc().initWithWindow_startFrame_endFrame_startAlpha_endAlpha_duration_onComplete_(
+                    self._window, start_frame, end_frame,
+                    current_alpha, current_alpha,
+                    0.28, _on_dock_complete,
+                )
+            )
+            self._sprite_dock_handler.start()
+        except Exception:
+            log.exception("sprite dock slide failed")
+            # Fall back to a snap-to-target so the dock still happens
+            # and the idle animator picks up from the right anchor.
+            try:
+                self._window.setFrame_display_(end_frame, True)
+            except Exception:
+                log.exception("sprite snap-to-target failed")
+            _on_dock_complete()
 
     def _stop_chat_idle_animator(self) -> None:
         anim = self._chat_idle_animator
@@ -1419,8 +1520,13 @@ class PokemonOverlay:
                 self._reattach_chat_window()
                 return
 
-        screen = None
-        if self._window is not None:
+        # Pick the screen the user is currently looking at — the chat
+        # panel is summoned via a global hotkey from arbitrary apps, so
+        # "where the mouse is" is a much better answer than "where the
+        # sprite happens to live". Falls back to the sprite's screen,
+        # then mainScreen if all else fails.
+        screen = _screen_under_mouse()
+        if screen is None and self._window is not None:
             screen = self._window.screen()
         if screen is None:
             screen = NSScreen.mainScreen()
@@ -1495,28 +1601,7 @@ class PokemonOverlay:
         border.setWantsLayer_(True)
         root.addSubview_(border)
 
-        # Debug label at the top: shows the cwd the terminal spawned in
-        # plus the resolver stage that picked it. Single-line, dim,
-        # selectable so users can copy the path. Sits above the terminal
-        # with its own thin strip; the terminal frame is shrunk to
-        # leave room (h - 36 vs h - 24 without the label).
-        debug_frame = NSMakeRect(14, h - 22, w - 28, 14)
-        debug_label = NSTextField.alloc().initWithFrame_(debug_frame)
-        debug_label.setBezeled_(False)
-        debug_label.setDrawsBackground_(False)
-        debug_label.setEditable_(False)
-        debug_label.setSelectable_(True)
-        # Try monospace so the path lines up nicely with the terminal
-        # below; fall back to system font if Menlo is missing (won't
-        # happen on stock macOS but keep the call defensive).
-        mono = NSFont.fontWithName_size_("Menlo", 10) or NSFont.systemFontOfSize_(10)
-        debug_label.setFont_(mono)
-        debug_label.setTextColor_(NSColor.tertiaryLabelColor())
-        debug_label.setStringValue_(self._format_cwd_label(session))
-        debug_label.setAutoresizingMask_(2 | 8)  # Width | MinYMargin (anchor top)
-        root.addSubview_(debug_label)
-
-        terminal_frame = NSMakeRect(12, 12, w - 24, h - 36)
+        terminal_frame = NSMakeRect(12, 12, w - 24, h - 24)
         from tokenmon.claude_session.terminal_view import TerminalWebView
         terminal = TerminalWebView(session, terminal_frame)
         self._terminal_view = terminal
@@ -1591,8 +1676,11 @@ class PokemonOverlay:
         # Recompute the final frame (display config / screen may have
         # changed since last open) and park the window at the offscreen
         # start position before ordering it front, so the slide-up
-        # handler has somewhere to slide from.
-        screen = win.screen() or NSScreen.mainScreen()
+        # handler has somewhere to slide from. We prefer the screen the
+        # mouse is on so reattaches follow the user across displays;
+        # only fall back to the window's last-known screen if the
+        # mouse-lookup somehow returns nothing.
+        screen = _screen_under_mouse() or win.screen() or NSScreen.mainScreen()
         if screen is not None:
             final_frame = _chat_frame_for_screen(screen.visibleFrame())
             start_frame = _chat_start_frame(final_frame)
@@ -1754,27 +1842,6 @@ class PokemonOverlay:
         self._chat_window_delegate = None
         self._terminal_view = None
         self._chat_session = None
-
-    def _format_cwd_label(self, session) -> str:
-        """Render the cwd debug strip — path on the left, source on the
-        right. Truncated home prefix so common paths fit on one line."""
-        try:
-            cwd = session.cwd
-            source = session.cwd_source
-        except Exception:
-            return ""
-        # ``~/foo/bar`` reads cleaner than the full /Users/.../foo/bar.
-        try:
-            home = Path.home()
-            display = str(cwd)
-            home_str = str(home)
-            if display == home_str:
-                display = "~"
-            elif display.startswith(home_str + "/"):
-                display = "~" + display[len(home_str):]
-        except Exception:
-            display = str(cwd)
-        return f"📁 {display}    ({source})"
 
     def _install_chat_outside_monitor(self) -> None:
         self._remove_chat_outside_monitor()
