@@ -4,8 +4,10 @@ Local LLM-API token tracker with a macOS menubar app. 🥚
 
 Runs one HTTP reverse proxy per provider (Anthropic by default, OpenRouter
 optional), records every request's token usage in SQLite, and shows today's
-total in the macOS menubar. Click the egg for a per-model breakdown,
-estimated USD cost, and a per-day Pokémon (gen-1) you level up by using LLMs.
+total in the macOS menubar. Click the egg for a per-model cost breakdown
+and a small gen-1 Pokémon game whose progression is driven by your LLM
+usage — every API call earns your active Pokémon XP, and large responses
+can roll into wild encounters or trainer battles right in the popover.
 
 ## How it works
 
@@ -32,19 +34,43 @@ non-streaming — and writes one row per request.
 
 ## Features
 
+### Tracking & cost
+
 - 📊 **Per-model breakdown** of today's input / output / cache-read tokens.
-- 💵 **Estimated USD cost** with a coverage percentage when some models lack
-  hardcoded pricing (most of OpenRouter's catalog).
-- 🐣 **Pokémon-style XP system.** Each day picks one gen-1 Pokémon you
-  level up by using LLMs; longer streaks evolve it. Box + Tokendex panes let
-  you browse what you've caught.
-- 🤝 **Companion chat.** Double-click the on-screen sprite (or hit
-  ⌘⇧Space) to open a chat panel that captures a snapshot of whatever window
-  you were looking at via the macOS Vision OCR framework — one Screen
-  Recording permission covers every app.
+- 💵 **Estimated USD cost** with a coverage percentage when some models
+  lack hardcoded pricing (most of OpenRouter's catalog).
 - 🔌 **Multi-provider.** Anthropic + OpenRouter out of the box; the
-  proxy is a Strategy pattern so adding another OpenAI-compatible provider
-  is small.
+  proxy uses a Strategy pattern so adding another OpenAI-compatible
+  provider is small.
+
+### Game loop
+
+- 🥚 **Active Pokémon.** Pikachu is the starter on a fresh box. Every API
+  call you make through the proxy adds its `output_tokens` as XP to whichever
+  Pokémon you've pinned as active (defaults to today's). Level-ups fire a
+  macOS notification, auto-learn new moves, and animate the menubar icon.
+- ⚡ **Wild encounters.** Long responses can roll a wild Pokémon — spawn
+  probability scales with `output_tokens` along `1 - exp(-tokens/2000)` so a
+  short reply has a small chance and a substantive one a meaningful one,
+  with a 5-minute cooldown so encounters never feel mandatory. Weather
+  optionally biases the type pool.
+- ⚔️ **Trainer battles.** Same idea at roughly ⅓ the rate and a 10-minute
+  cooldown. Win = money + XP; lose = no XP and a small money penalty.
+- 🎮 **Full battles** with type effectiveness, status conditions (poison,
+  burn, paralysis, sleep, freeze, confusion, flinch), persistent PP across
+  fights, and items mid-battle.
+- 📦 **Box, Tokendex, Items, Shop.** Browse caught Pokémon (with per-mon
+  detail, move swap, evolution hints), the seen/caught Pokédex, your bag
+  split into pockets, and a shop you spend trainer-fight winnings in.
+
+### Companion
+
+- 🤝 **Companion sprite + chat.** Your active Pokémon hovers on the
+  desktop. Double-click it (or hit ⌘⇧Space) to open a chat panel backed by
+  a persistent `tmux`-wrapped shell — terminal state survives Tokenmon
+  restarts. On open it captures a snapshot of whatever window you were
+  looking at via the macOS Vision OCR framework; one Screen Recording
+  permission covers every app.
 
 ## Requirements
 
@@ -209,7 +235,11 @@ venv path. Re-run `uv run tokenmon install` from the new location.
 
 ## Scope
 
-- macOS only for the menubar; the proxy itself is portable Python.
+- macOS only for the menubar (`rumps` / AppKit / Vision); the proxy
+  itself is portable Python.
+- Providers: Anthropic + any OpenAI-compatible endpoint (OpenRouter is
+  the wired-up example). Adding another OpenAI-shaped provider is a
+  small subclass.
 - No retention policy — the SQLite DB grows forever until you `DELETE`
   from it.
 
