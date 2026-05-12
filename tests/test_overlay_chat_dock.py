@@ -50,6 +50,29 @@ def test_sprite_origin_for_chat_returns_floats():
     assert isinstance(y, float)
 
 
+def test_guest_origin_left_of_active_at_same_height():
+    """The guest cameo sits as the mirror image of the active sprite:
+    same y (visually symmetric pair on top of the panel) but anchored
+    at the panel's left edge instead of its right. Without this
+    contract the guest could end up clipping either the panel or the
+    active companion."""
+    from tokenmon.overlay import (
+        _CHAT_SPRITE_GAP_PX,
+        _CHAT_SPRITE_RIGHT_INSET,
+        _guest_origin_for_chat,
+        _sprite_origin_for_chat,
+    )
+    chat = _rect(100, 200, 800, 500)
+    gx, gy = _guest_origin_for_chat(chat, sprite_size=128)
+    ax, ay = _sprite_origin_for_chat(chat, sprite_size=128)
+
+    assert gy == ay  # same height as active
+    assert gy == 200 + 500 + _CHAT_SPRITE_GAP_PX
+    assert gx == 100 + _CHAT_SPRITE_RIGHT_INSET
+    # Guest fully to the left of active — no overlap at anchor.
+    assert gx + 128 < ax
+
+
 def test_dock_sprite_to_chat_sets_pin_and_arms_slide(monkeypatch):
     """The dock helper must set the pin flag (so companion_drv skips
     its own docking) and arm a _ChatSlideHandler that targets the

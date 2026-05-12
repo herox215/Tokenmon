@@ -233,6 +233,23 @@ def _sprite_origin_for_chat(chat_frame, sprite_size: int) -> tuple[float, float]
     return x, y
 
 
+def _guest_origin_for_chat(chat_frame, sprite_size: int) -> tuple[float, float]:
+    """Top-LEFT anchor of ``chat_frame`` for a transient guest-Pokémon
+    cameo — mirror image of ``_sprite_origin_for_chat``. Same y so
+    guest and active sit at identical height (reads as a symmetric
+    pair), x is the panel's left edge plus the same 8 px inset the
+    active uses on the right.
+
+    Pure function — no AppKit calls — so it's covered by a unit test.
+    """
+    chat_x = float(chat_frame.origin.x)
+    chat_y = float(chat_frame.origin.y)
+    chat_h = float(chat_frame.size.height)
+    x = chat_x + _CHAT_SPRITE_RIGHT_INSET
+    y = chat_y + chat_h + _CHAT_SPRITE_GAP_PX
+    return x, y
+
+
 class _ChatCardView(NSView):
     """Subtle border over the system blur backing."""
 
@@ -1043,6 +1060,14 @@ class PokemonOverlay:
         # and torn down by _stop_chat_idle_animator. Strong-ref kept
         # because the NSTimer target needs to outlive this method.
         self._chat_idle_animator = None
+        # Chat-guest cameo driver — randomly slides in a box Pokémon
+        # next to the active companion every 60-180 s while the chat
+        # is open, idles for 6-12 s, then slides out. Lives in
+        # tokenmon.companion.chat_guests. Lifecycle is tied to the
+        # idle animator above: started in _dock_sprite_to_chat's
+        # on_complete, stopped in _stop_chat_idle_animator. Strong-
+        # ref because PyObjC would GC the NSTimer target otherwise.
+        self._chat_guest_driver = None
         # _ChatSlideHandler instance that animates the sprite from its
         # current position to the chat-panel dock target, started in
         # lockstep with the chat panel's own slide handler so the two
@@ -1250,6 +1275,28 @@ class PokemonOverlay:
                 anim.start()
             except Exception:
                 log.exception("chat idle animator start failed")
+            # Arm the guest-cameo driver. Provider closure returns
+            # the live chat-panel frame each tick, or None when the
+            # panel is gone — the driver self-stops in that case.
+            try:
+                from tokenmon.companion.chat_guests import ChatGuestDriver
+                def _chat_frame_provider():
+                    win = self._chat_window
+                    if win is None:
+                        return None
+                    try:
+                        if not win.isVisible():
+                            return None
+                        return win.frame()
+                    except Exception:
+                        return None
+                drv = ChatGuestDriver.alloc().initWithOverlay_chatFrameProvider_(
+                    self, _chat_frame_provider,
+                )
+                self._chat_guest_driver = drv
+                drv.start()
+            except Exception:
+                log.exception("chat guest driver start failed")
 
         try:
             self._sprite_dock_handler = (
@@ -1271,6 +1318,23 @@ class PokemonOverlay:
             _on_dock_complete()
 
     def _stop_chat_idle_animator(self) -> None:
+        # Tear down the guest-cameo driver first — guests share the
+        # chat panel's lifetime, so they must be gone before we
+        # consider the active sprite "unpinned" from the chat.
+        # Unconditional (not gated on animator presence) so the
+        # _dock_sprite_to_chat "pre-dock cleanup" call also clears any
+        # leftover guest, while leaving the level-restore below
+        # gated on animator presence — _dock_sprite_to_chat raises
+        # the level *after* calling this method and would otherwise
+        # see its own setLevel clobbered.
+        drv = self._chat_guest_driver
+        if drv is not None:
+            try:
+                drv.stop()
+            except Exception:
+                log.exception("chat guest driver stop failed")
+            self._chat_guest_driver = None
+
         anim = self._chat_idle_animator
         if anim is None:
             return
