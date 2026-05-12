@@ -97,8 +97,16 @@ class TokenmonApp(rumps.App):
         # sprite would sit where the chat used to be until the next
         # _tick_dock pass (up to 5 s later). Wired here so the overlay
         # stays decoupled from the menubar driver.
+        #
+        # ``slide_duration`` matches the chat panel's own slide-down
+        # duration in ``PokemonOverlay.hide_chat`` so the sprite and
+        # the panel land at their final positions in lockstep — same
+        # symmetry the open path already gets from ``show_chat`` /
+        # ``_dock_sprite_to_chat`` both running on a 0.28 s handler.
         self._overlay._on_chat_hidden = (
-            lambda: _companion_drv.dock_to_focused_window(self, force=True)
+            lambda: _companion_drv.dock_to_focused_window(
+                self, force=True, slide_duration=0.22,
+            )
         )
         self._companion_mode = bool(config.get("companion_mode"))
         self._use_weather = bool(config.get("use_weather"))

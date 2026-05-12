@@ -1102,17 +1102,61 @@ class PokemonOverlay:
         self._window.setFrameOrigin_((x, y))
         self._reposition_claude_badge(animate=False)
 
-    def move_to(self, x: float, y: float, *, animate: bool = True) -> None:
+    def move_to(
+        self,
+        x: float,
+        y: float,
+        *,
+        animate: bool = True,
+        slide_duration: float | None = None,
+    ) -> None:
         """Slide the overlay to absolute AppKit coordinates ``(x, y)``.
 
         Used by companion mode to dock the sprite to the bottom-left of
         the active app's window. ``animate=True`` uses Cocoa's built-in
         ~250 ms slide so the move feels like the Pokémon walked there
         rather than teleported.
+
+        Pass ``slide_duration`` to drive the move with the NSTimer-based
+        ``_ChatSlideHandler`` (same engine the chat panel uses) so the
+        sprite move can land in lockstep with another animation — e.g.
+        ``hide_chat`` slides the panel down at 0.22 s and the redock
+        callback hands the same duration in so the two finish together.
         """
         if self._window is None:
             return
         rect = NSMakeRect(float(x), float(y), self._size, self._size)
+        if animate and slide_duration is not None and slide_duration > 0:
+            try:
+                start_frame = self._window.frame()
+                try:
+                    current_alpha = float(self._window.alphaValue())
+                except Exception:
+                    current_alpha = 1.0
+                prior = self._sprite_dock_handler
+                if prior is not None:
+                    try:
+                        prior.cancel()
+                    except Exception:
+                        pass
+
+                def _on_slide_complete():
+                    try:
+                        self._reposition_claude_badge(animate=False)
+                    except Exception:
+                        log.exception("badge follow-sprite failed")
+
+                self._sprite_dock_handler = (
+                    _ChatSlideHandler.alloc().initWithWindow_startFrame_endFrame_startAlpha_endAlpha_duration_onComplete_(
+                        self._window, start_frame, rect,
+                        current_alpha, current_alpha,
+                        float(slide_duration), _on_slide_complete,
+                    )
+                )
+                self._sprite_dock_handler.start()
+                return
+            except Exception:
+                log.exception("move_to slide failed; falling back to OS animation")
         try:
             self._window.setFrame_display_animate_(rect, True, bool(animate))
         except Exception:
@@ -1244,7 +1288,12 @@ class PokemonOverlay:
             except Exception:
                 log.exception("sprite level restore failed")
 
-    def move_to_corner(self, *, animate: bool = True) -> None:
+    def move_to_corner(
+        self,
+        *,
+        animate: bool = True,
+        slide_duration: float | None = None,
+    ) -> None:
         """Slide back to the configured screen corner. Used when the user
         switches to a non-engagement app."""
         if self._window is None:
@@ -1255,7 +1304,7 @@ class PokemonOverlay:
         x, y = _position_for(
             self._corner, screen.visibleFrame(), self._size, self._margin,
         )
-        self.move_to(x, y, animate=animate)
+        self.move_to(x, y, animate=animate, slide_duration=slide_duration)
 
     def _reposition_claude_badge(self, *, animate: bool) -> None:
         """Pin the claude-active badge to the sprite's current frame.

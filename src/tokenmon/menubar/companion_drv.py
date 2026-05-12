@@ -187,7 +187,9 @@ def on_active_app_changed(app, _bundle_id: str | None) -> None:
         log.exception("orientation tick after app change failed")
 
 
-def dock_to_focused_window(app, *, force: bool = False) -> None:
+def dock_to_focused_window(
+    app, *, force: bool = False, slide_duration: float | None = None,
+) -> None:
     """Slide the overlay to the bottom-RIGHT of the focused window —
     a fixed anchor that doesn't move between engaged and idle
     states. Engagement is communicated by sprite orientation
@@ -225,13 +227,13 @@ def dock_to_focused_window(app, *, force: bool = False) -> None:
     pid = frontmost_pid()
     if pid is None:
         if app._last_dock_rect is not None or force:
-            app._overlay.move_to_corner(animate=True)
+            app._overlay.move_to_corner(animate=True, slide_duration=slide_duration)
             app._last_dock_rect = None
         return
     rect = focused_window_bounds(pid)
     if rect is None:
         if app._last_dock_rect is not None or force:
-            app._overlay.move_to_corner(animate=True)
+            app._overlay.move_to_corner(animate=True, slide_duration=slide_duration)
             app._last_dock_rect = None
         return
     if not force and rect == app._last_dock_rect:
@@ -250,7 +252,7 @@ def dock_to_focused_window(app, *, force: bool = False) -> None:
             "dock target (%s, %s) is off all screens; falling back to corner",
             target_x, target_y,
         )
-        app._overlay.move_to_corner(animate=True)
+        app._overlay.move_to_corner(animate=True, slide_duration=slide_duration)
         app._last_dock_rect = None
         return
     try:
@@ -258,5 +260,12 @@ def dock_to_focused_window(app, *, force: bool = False) -> None:
     except Exception:
         current_screen = None
     animate = (current_screen is not None and current_screen == target_screen)
-    app._overlay.move_to(target_x, target_y, animate=animate)
+    # Cross-screen moves disable animation entirely (see docstring), so the
+    # slide_duration override only kicks in for same-screen moves — which is
+    # the common case anyway when handing off from a closing chat panel.
+    app._overlay.move_to(
+        target_x, target_y,
+        animate=animate,
+        slide_duration=slide_duration if animate else None,
+    )
     app._last_dock_rect = rect
